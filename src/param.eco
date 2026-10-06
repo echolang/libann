@@ -1,0 +1,82 @@
+/**
+ * A trainable tensor and the gradient training accumulates for it. A class
+ * on purpose: the layer, the optimizer and the serializer all hold the
+ * same object, so nothing is copied back after a step.
+ */
+
+namespace ann;
+
+public class Param
+{
+    /**
+     * Local to the owning layer, `weight` or `bias`. Weight files record it
+     * so a load into the wrong architecture is caught.
+     */
+    public string $name;
+
+    public Tensor $value;
+
+    /**
+     * d(loss)/d(value), summed until the next `zeroGrad`.
+     */
+    public Tensor $grad;
+
+    public constructor(string $name, const array<usize>& $shape)
+    {
+        $this->name = $name;
+        $this->value = Tensor($shape);
+        $this->grad = Tensor($shape);
+    }
+
+    public const function size() : usize
+    {
+        return $this->value->size();
+    }
+
+    /**
+     * True when `$name` and `$value`'s shape match this param. Every weight
+     * transfer checks this before touching anything.
+     */
+    public const function like(const string& $name, const Tensor& $value) : bool
+    {
+        return $name->equals($this->name) && $value->sameShape($this->value);
+    }
+
+    public function zeroGrad() : void
+    {
+        $this->grad->fill(0.0);
+    }
+
+    /**
+     * Global L2 of every gradient in `$params` taken together.
+     */
+    public static function norm(const array<Param>& $params) : float64
+    {
+        float64 $squares = 0.0;
+
+        foreach ($params as $p) {
+            $squares = $squares + $p->grad->dot($p->grad);
+        }
+
+        return std::math::sqrt($squares);
+    }
+
+    /**
+     * Scales every gradient so the global L2 is at most `$limit`. Already
+     * inside the limit: left alone.
+     */
+    public static function clip(const array<Param>& $params, float64 $limit) : void
+    {
+        float64 $norm = Param::norm($params);
+
+        if ($norm <= $limit) {
+            return;
+        }
+
+        float64 $factor = $limit / $norm;
+
+        foreach ($params as $p) {
+            $p->grad = $p->grad->scale($factor);
+        }
+    }
+}

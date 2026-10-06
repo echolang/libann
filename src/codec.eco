@@ -1,0 +1,279 @@
+/**
+ * Byte level of the model format: little-endian integers, float64 as its
+ * exact bits, length-prefixed text, shaped tensors.
+ *
+ * Layers only ever see these two classes. `encode` writes config through
+ * an `Encoder`; a registered decoder reads it back through a `Decoder`.
+ * A custom layer gets the same format for free.
+ */
+
+namespace ann;
+
+public class Encoder
+{
+    private string $buffer = '';
+
+    public const function bytes() : string
+    {
+        return $this->buffer;
+    }
+
+    /**
+     * Append `$raw` as-is, no length in front. Used for magics.
+     */
+    public function raw(const string& $raw) : void
+    {
+        $this->buffer->append($raw);
+    }
+
+    public function u8(uint8 $v) : void
+    {
+        $this->buffer->push($v);
+    }
+
+    public function u32(uint32 $v) : void
+    {
+        $this->little($v as uint64, 4);
+    }
+
+    public function u64(uint64 $v) : void
+    {
+        $this->little($v, 8);
+    }
+
+    /**
+     * A count or an extent, always 64 bits.
+     */
+    public function size(usize $v) : void
+    {
+        $this->little($v as uint64, 8);
+    }
+
+    public function flag(bool $v) : void
+    {
+        if ($v) {
+            $this->buffer->push(1 as uint8);
+            return;
+        }
+
+        $this->buffer->push(0 as uint8);
+    }
+
+    /**
+     * float64 as its exact bits, so a round trip is lossless.
+     */
+    public function f64(float64 $v) : void
+    {
+        $this->little(mem::bit_cast<uint64, float64>($v), 8);
+    }
+
+    /**
+     * Text with its byte length in front.
+     */
+    public function text(const string& $v) : void
+    {
+        $this->u32($v->size() as uint32);
+        $this->buffer->append($v);
+    }
+
+    /**
+     * Rank, extents, then values.
+     */
+    public function tensor(const Tensor& $t) : void
+    {
+        $this->u32($t->shape->count() as uint32);
+
+        foreach ($t->shape as $extent) {
+            usize $e = $extent;
+            $this->size($e);
+        }
+
+        foreach ($t->data as $value) {
+            float64 $v = $value;
+            $this->f64($v);
+        }
+    }
+
+    /**
+     * Registry kind, then whatever `encode` writes. Composites call this
+     * for each child.
+     */
+    public function layer(Layer $layer) : void
+    {
+        $this->text($layer->kind());
+        $layer->encode($this);
+    }
+
+    private function little(uint64 $v, usize $bytes) : void
+    {
+        for (usize $i = 0; $i < $bytes; $i++) {
+            $this->buffer->push((($v >> (($i * 8) as uint64)) & 255) as uint8);
+        }
+    }
+}
+
+public class Decoder
+{
+    private string $buffer;
+    private usize $at;
+
+    public constructor(string $bytes)
+    {
+        $this->buffer = $bytes;
+        $this->at = 0;
+    }
+
+    public const function remaining() : usize
+    {
+        return $this->buffer->size() - $this->at;
+    }
+
+    /**
+     * Consume `$magic` or fail with `badMagic`.
+     */
+    public function expect(const string& $magic) : status<ModelError>
+    {
+        if ($this->remaining() < $magic->size()) {
+            return .error(.badMagic);
+        }
+
+        for (usize $i = 0; $i < $magic->size(); $i++) {
+            if ($this->buffer->byte($this->at + $i) != $magic->byte($i)) {
+                return .error(.badMagic);
+            }
+        }
+
+        $this->at = $this->at + $magic->size();
+        return .ok;
+    }
+
+    public function u8() : result<uint8, ModelError>
+    {
+        if ($this->remaining() < 1) {
+            return .error(.truncated);
+        }
+
+        uint8 $v = $this->buffer->byte($this->at);
+        $this->at = $this->at + 1;
+        return .ok($v);
+    }
+
+    public function u32() : result<uint32, ModelError>
+    {
+        uint64 $v = guard $this->little(4) else ($e) {
+            return .error($e);
+        }
+
+        return .ok($v as uint32);
+    }
+
+    public function u64() : result<uint64, ModelError>
+    {
+        return $this->little(8);
+    }
+
+    public function size() : result<usize, ModelError>
+    {
+        uint64 $v = guard $this->little(8) else ($e) {
+            return .error($e);
+        }
+
+        return .ok($v as usize);
+    }
+
+    public function flag() : result<bool, ModelError>
+    {
+        uint8 $v = guard $this->u8() else ($e) {
+            return .error($e);
+        }
+
+        if ($v > 1) {
+            return .error(.badValue($v as uint64));
+        }
+
+        return .ok($v == 1);
+    }
+
+    public function f64() : result<float64, ModelError>
+    {
+        uint64 $bits = guard $this->little(8) else ($e) {
+            return .error($e);
+        }
+
+        return .ok(mem::bit_cast<float64, uint64>($bits));
+    }
+
+    public function text() : result<string, ModelError>
+    {
+        uint32 $length = guard $this->u32() else ($e) {
+            return .error($e);
+        }
+
+        usize $n = $length as usize;
+
+        if ($this->remaining() < $n) {
+            return .error(.truncated);
+        }
+
+        string $v = $this->buffer->sub($this->at, $n);
+        $this->at = $this->at + $n;
+        return .ok($v);
+    }
+
+    public function tensor() : result<Tensor, ModelError>
+    {
+        uint32 $rank = guard $this->u32() else ($e) {
+            return .error($e);
+        }
+
+        if ($rank > 16) {
+            return .error(.badValue($rank as uint64));
+        }
+
+        array<usize> $shape = arr::room<usize>($rank as usize);
+
+        for (uint32 $i = 0; $i < $rank; $i++) {
+            usize $extent = guard $this->size() else ($e) {
+                return .error($e);
+            }
+
+            $shape[] = $extent;
+        }
+
+        // a corrupt extent must not become a giant allocation
+        usize $volume = Tensor::volume($shape);
+
+        if ($volume > $this->remaining() / 8) {
+            return .error(.truncated);
+        }
+
+        array<float64> $data = arr::room<float64>($volume);
+
+        for (usize $i = 0; $i < $volume; $i++) {
+            float64 $v = guard $this->f64() else ($e) {
+                return .error($e);
+            }
+
+            $data[] = $v;
+        }
+
+        return .ok(Tensor($shape, $data));
+    }
+
+    private function little(usize $bytes) : result<uint64, ModelError>
+    {
+        if ($this->remaining() < $bytes) {
+            return .error(.truncated);
+        }
+
+        uint64 $v = 0;
+
+        for (usize $i = 0; $i < $bytes; $i++) {
+            uint64 $b = $this->buffer->byte($this->at + $i) as uint64;
+            $v = $v | ($b << (($i * 8) as uint64));
+        }
+
+        $this->at = $this->at + $bytes;
+        return .ok($v);
+    }
+}

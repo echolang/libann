@@ -1,0 +1,57 @@
+// ppo on cartpole: reuse each 1024-step rollout for several minibatch
+// epochs, clipped so the policy cannot drift far
+//
+//   echoc run -m . examples/cartpole_ppo.eco
+
+use ann::{Act, Adam, Dense, Model, Random, Sequential};
+use ann::rl::{CartPole, Choice, Policy, Ppo, Report, Rollout, Runner};
+
+internal function net(usize $outputs) : Sequential
+{
+    return Sequential()
+        ->add(Dense(4, 64))
+        ->add(Act(.tanh))
+        ->add(Dense(64, 64))
+        ->add(Act(.tanh))
+        ->add(Dense(64, $outputs));
+}
+
+$runner = Runner(CartPole($seed: 1));
+$policy = Policy(Model(net(2), $seed: 1));
+$agent = Ppo($policy, Model(net(1), $seed: 2), Adam(0.0003), Adam(0.001), $epochs: 10, $batchSize: 64, $entropy: 0.0);
+$rollout = Rollout();
+$rng = Random(1);
+
+for (int32 $round = 1; $round <= 100; $round++) {
+    for (int32 $i = 0; $i < 1024; $i++) {
+        Choice $c = $policy->act($runner->observation, $rng);
+        $rollout->add($runner->step($c->action), $c->logProb);
+    }
+
+    Report $r = $agent->update($rollout);
+    $rollout->clear();
+    echo "round {$round}: {$runner->episodes->count()} episodes, mean return {$runner->mean(20):.1f}, surrogate {$r->policy:.4f}, value {$r->value:.3f}, entropy {$r->entropy:.3f}";
+
+    if ($runner->episodes->count() >= 20 && $runner->mean(20) >= 450.0) {
+        echo "solved in round {$round} after {$runner->episodes->count()} episodes";
+        break;
+    }
+}
+
+guard $policy->model->save('cartpole-ppo.ann') else ($e) {
+    die("save failed: {$e}");
+}
+
+Model $loaded = guard Model::load('cartpole-ppo.ann') else ($e) {
+    die("load failed: {$e}");
+}
+
+$greedy = Policy($loaded);
+$check = Runner(CartPole($seed: 99));
+
+while ($check->episodes->count() < 10) {
+    $check->step($greedy->greedy($check->observation));
+}
+
+echo "loaded policy, greedy over 10 episodes: mean return {$check->mean(10):.1f}";
+std::io::remove('cartpole-ppo.ann');

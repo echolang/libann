@@ -1,0 +1,87 @@
+// three interleaved spirals: residual, layer norm, dropout, adamw,
+// validation split, lr schedule. then weights to a file and back
+//
+//   echoc run -m . examples/spiral.eco
+
+use ann::{Act, Adam, CrossEntropy, Dataset, Dense, Dropout, EpochReport, Evaluation, LayerNorm, Model, Random, Residual, Sequential, Tensor, Trainer};
+
+const CLASSES = 3;
+const PER_CLASS = 100;
+
+// one arm per class is plenty; two would be harder still
+internal function spirals(uint64 $seed) : Dataset
+{
+    $rng = Random($seed);
+    array<array<float64>> $points = array<array<float64>>();
+    array<usize> $labels = array<usize>();
+
+    for (usize $c = 0; $c < CLASSES; $c++) {
+        for (usize $i = 0; $i < PER_CLASS; $i++) {
+            float64 $r = ($i as float64) / (PER_CLASS as float64);
+            float64 $angle = ($c as float64) * 4.0 + $r * 4.0 + $rng->normal(0.0, 0.2);
+            array<float64> $point = [$r * std::math::sin($angle), $r * std::math::cos($angle)];
+            $points[] = $point;
+            $labels[] = $c;
+        }
+    }
+
+    return Dataset(Tensor(rows: $points), Tensor(oneHot: $labels, classes: CLASSES));
+}
+
+internal function network() : Sequential
+{
+    $block = Sequential()
+        ->add(Dense(32, 32, .he))
+        ->add(LayerNorm(32))
+        ->add(Act(.gelu));
+
+    return Sequential()
+        ->add(Dense(2, 32, .he))
+        ->add(Act(.gelu))
+        ->add(Residual($block))
+        ->add(Dropout(0.1))
+        ->add(Dense(32, CLASSES));
+}
+
+$split = spirals(42)->split(0.2, $seed: 7);
+$model = Model(network(), $seed: 1);
+echo $model->summary();
+
+$adam = Adam(0.01, $weightDecay: 0.0001);
+$trainer = Trainer(
+    $epochs: 150,
+    $batchSize: 32,
+    $metric: .accuracy,
+    $clip: 5.0,
+    $validation: $split->holdout,
+    $onEpoch: function(EpochReport $r) : void {
+        // step decay: halve the rate every 50 epochs
+        if ($r->epoch % 50 == 0) {
+            $adam->rate = $adam->rate * 0.5;
+        }
+
+        if ($r->epoch % 25 == 0) {
+            Evaluation $v = $r->validation ?? $r->train;
+            echo "epoch {$r->epoch}: loss {$r->train->loss:.4f}, accuracy {$r->train->metric:.3f}, validation {$v->metric:.3f}";
+        }
+    },
+);
+$trainer->fit($model, CrossEntropy(), $adam, $split->train);
+
+$path = 'spiral.weights';
+
+guard $model->saveWeights($path) else ($e) {
+    die("saveWeights failed: {$e}");
+}
+
+$fresh = Model(network(), $seed: 1234);
+$before = $fresh->evaluate($split->holdout, CrossEntropy(), .accuracy);
+
+guard $fresh->loadWeights($path) else ($e) {
+    die("loadWeights failed: {$e}");
+}
+
+$after = $fresh->evaluate($split->holdout, CrossEntropy(), .accuracy);
+echo "fresh network: validation accuracy {$before->metric:.3f} before loading, {$after->metric:.3f} after";
+
+std::io::remove($path);

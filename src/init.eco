@@ -1,0 +1,61 @@
+/**
+ * How weights start. Pick by the activation that follows: `xavier` for
+ * tanh and sigmoid, `he` for the ReLU family.
+ */
+
+namespace ann;
+
+public enum Init : uint8
+{
+    /**
+     * All zeros. Right for biases, wrong for weights: every unit would
+     * learn the same thing.
+     */
+    case zeros = 0;
+
+    /**
+     * All ones. Starting scale of a normalisation layer.
+     */
+    case ones = 1;
+
+    /**
+     * Uniform in [-0.05, 0.05], independent of layer size.
+     */
+    case uniform = 2;
+
+    /**
+     * Glorot uniform, limit sqrt(6 / (fanIn + fanOut)). Keeps variance
+     * steady through tanh and sigmoid.
+     */
+    case xavier = 3;
+
+    /**
+     * He normal, deviation sqrt(2 / fanIn). The usual pick before ReLU.
+     */
+    case he = 4;
+
+    /**
+     * LeCun normal, deviation sqrt(1 / fanIn). Suits SELU-style and GELU.
+     */
+    case lecun = 5;
+
+    /**
+     * Fill `$t` for a layer with `$fanIn` inputs and `$fanOut` outputs.
+     */
+    public const function fill(Tensor& $t, usize $fanIn, usize $fanOut, Random& $rng) : void
+    {
+        float64 $in = std::math::max($fanIn as float64, 1.0);
+        float64 $out = std::math::max($fanOut as float64, 1.0);
+
+        foreach (0 .. $t->data->count() as $i) {
+            $t->data[$i] = match ($this) {
+                .zeros => 0.0,
+                .ones => 1.0,
+                .uniform => $rng->uniform(-0.05, 0.05),
+                .xavier => $rng->uniform(-1.0, 1.0) * std::math::sqrt(6.0 / ($in + $out)),
+                .he => $rng->normal(0.0, std::math::sqrt(2.0 / $in)),
+                .lecun => $rng->normal(0.0, std::math::sqrt(1.0 / $in)),
+            };
+        }
+    }
+}

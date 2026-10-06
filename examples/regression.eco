@@ -1,0 +1,50 @@
+// fit sin(x) on [-pi, pi] with a small relu network
+//
+//   echoc run -m . examples/regression.eco
+
+use ann::{Act, Adam, Dataset, Dense, EpochReport, Evaluation, MeanSquaredError, Model, Sequential, Tensor, Trainer};
+
+array<float64> $xs = array<float64>();
+array<float64> $ys = array<float64>();
+
+for (int32 $i = 0; $i < 200; $i++) {
+    float64 $x = -std::math::PI + 2.0 * std::math::PI * ($i as float64) / 199.0;
+    $xs[] = $x;
+    $ys[] = std::math::sin($x);
+}
+
+$data = Dataset(Tensor(column: $xs), Tensor(column: $ys));
+$split = $data->split(0.2, $seed: 1);
+
+$net = Sequential()
+    ->add(Dense(1, 32, .he))
+    ->add(Act(.relu))
+    ->add(Dense(32, 32, .he))
+    ->add(Act(.relu))
+    ->add(Dense(32, 1));
+
+$model = Model($net, $seed: 3);
+echo $model->summary();
+
+$adam = Adam(0.01);
+$trainer = Trainer(
+    $epochs: 300,
+    $batchSize: 16,
+    $metric: .rmse,
+    $validation: $split->holdout,
+    $onEpoch: function(EpochReport $r) : void {
+        if ($r->epoch % 50 == 0) {
+            Evaluation $v = $r->validation ?? $r->train;
+            echo "epoch {$r->epoch}: train rmse {$r->train->metric:.4f}, validation rmse {$v->metric:.4f}";
+        }
+    },
+);
+$trainer->fit($model, MeanSquaredError(), $adam, $split->train);
+
+array<float64> $probe = [-2.0, -1.0, 0.0, 0.5, 1.5, 3.0];
+$out = $model->predict(Tensor(column: $probe));
+
+foreach ($probe as $i => $x) {
+    float64 $want = std::math::sin($x);
+    echo "sin({$x:.1f}) = {$want:.4f}, network says {$out->data[$i]:.4f}";
+}

@@ -1,0 +1,180 @@
+use ann::{Act, Activation, Dense, Dropout, Init, Layer, LayerNorm, Random, Residual, Sequential, Softmax, Tensor};
+
+const GRADIENT_TOLERANCE = 0.000001;
+
+#[group: "layers"]
+test dense_gradients_match_finite_differences
+{
+    Layer $layer = initialized(Dense(3, 4));
+    assert(gradientError($layer, noise(shape(5, 3), 1)) < GRADIENT_TOLERANCE);
+}
+
+#[group: "layers"]
+test dense_flattens_higher_rank_input
+{
+    Layer $layer = initialized(Dense(6, 2));
+    array<usize> $s = [4, 2, 3];
+    $x = noise($s, 2);
+    $out = $layer->forward($x, .train);
+    assert($out->rows() == 4 && $out->cols() == 2);
+    $back = $layer->backward($out);
+    assert($back->sameShape($x));
+}
+
+#[group: "layers"]
+test every_activation_has_matching_gradients
+{
+    for (int32 $code = 0; $code <= 8; $code++) {
+        Activation $a = guard Activation::from($code as uint8) else {
+            assert(false, 'activation codes are contiguous');
+            return;
+        }
+
+        Layer $layer = Act($a);
+        assert(gradientError($layer, noise(shape(4, 5), 3)) < GRADIENT_TOLERANCE);
+    }
+}
+
+#[group: "layers"]
+test activation_map_and_slope_match_the_scalar_forms
+{
+    Tensor $x = noise(shape(7, 9), 41)->scale(4.0);
+    Tensor $g = noise(shape(7, 9), 42);
+
+    for (int32 $code = 0; $code <= 8; $code++) {
+        Activation $a = guard Activation::from($code as uint8) else {
+            assert(false, 'activation codes are contiguous');
+            return;
+        }
+
+        Tensor $y = $a->map($x);
+        Tensor $s = $a->slope($x, $y, $g);
+
+        foreach (0 .. $x->data->count() as $i) {
+            assert($y->data[$i] == $a->apply($x->data[$i]));
+            assert($s->data[$i] == $g->data[$i] * $a->derive($x->data[$i], $y->data[$i]));
+        }
+    }
+}
+
+#[group: "layers"]
+test softmax_gradients_match_finite_differences
+{
+    Layer $layer = Softmax();
+    assert(gradientError($layer, noise(shape(3, 4), 4)) < GRADIENT_TOLERANCE);
+}
+
+#[group: "layers"]
+test layernorm_gradients_match_finite_differences
+{
+    $norm = LayerNorm(5);
+    Layer $layer = initialized($norm);
+    // move gamma and beta off their defaults so their gradients matter
+    $norm->gamma->value = noise(shape(1, 5), 6);
+    $norm->beta->value = noise(shape(1, 5), 7);
+    assert(gradientError($layer, noise(shape(4, 5), 5)) < GRADIENT_TOLERANCE);
+}
+
+#[group: "layers"]
+test layernorm_normalizes_each_row
+{
+    Layer $layer = initialized(LayerNorm(4));
+    $out = $layer->forward(noise(shape(3, 4), 8)->scale(10.0), .infer);
+
+    for (usize $r = 0; $r < 3; $r++) {
+        float64 $mean = 0.0;
+        float64 $square = 0.0;
+
+        for (usize $c = 0; $c < 4; $c++) {
+            $mean = $mean + $out->at($r, $c) / 4.0;
+            $square = $square + $out->at($r, $c) * $out->at($r, $c) / 4.0;
+        }
+
+        assert(near($mean, 0.0, 0.000001));
+        assert(near($square, 1.0, 0.001));
+    }
+}
+
+#[group: "layers"]
+test sequential_chains_gradients
+{
+    Layer $net = Sequential()
+        ->add(Dense(3, 6, .he))
+        ->add(Act(.gelu))
+        ->add(Dense(6, 2))
+        ->add(Act(.tanh));
+    initialized($net);
+    assert(gradientError($net, noise(shape(4, 3), 9)) < GRADIENT_TOLERANCE);
+    assert($net->params()->count() == 4);
+}
+
+#[group: "layers"]
+test residual_adds_the_skip_gradient
+{
+    Layer $block = Sequential()
+        ->add(Dense(4, 4))
+        ->add(Act(.tanh))
+        ->add(LayerNorm(4));
+    Layer $layer = initialized(Residual($block));
+    assert(gradientError($layer, noise(shape(3, 4), 10)) < GRADIENT_TOLERANCE);
+}
+
+#[group: "layers"]
+test dropout_is_identity_at_inference
+{
+    Layer $layer = initialized(Dropout(0.5));
+    $x = noise(shape(4, 4), 11);
+    $out = $layer->forward($x, .infer);
+    assert(identical($out, $x));
+}
+
+#[group: "layers"]
+test dropout_masks_and_rescales_in_training
+{
+    Layer $layer = initialized(Dropout(0.5));
+    array<usize> $s = [100, 10];
+    $x = Tensor($s, fill: 1.0);
+    $out = $layer->forward($x, .train);
+    usize $kept = 0;
+
+    foreach ($out->data as $v) {
+        float64 $value = $v;
+        assert($value == 0.0 || $value == 2.0);
+
+        if ($value == 2.0) {
+            $kept = $kept + 1;
+        }
+    }
+
+    // a fair coin over 1000 values lands far inside this band
+    assert($kept > 400 && $kept < 600);
+
+    // gradient goes through the same mask
+    $back = $layer->backward($x);
+    assert(identical($back, $out));
+}
+
+#[group: "layers"]
+test custom_layer_gradients_match_finite_differences
+{
+    Layer $layer = initialized(Scale(3));
+    assert(gradientError($layer, noise(shape(4, 3), 12)) < GRADIENT_TOLERANCE);
+}
+
+#[group: "layers"]
+test initializers_respect_their_scale
+{
+    array<usize> $s = [200, 100];
+    $t = Tensor($s);
+    $rng = Random(1);
+    Init::xavier->fill($t, 200, 100, $rng);
+    float64 $limit = std::math::sqrt(6.0 / 300.0);
+
+    foreach ($t->data as $v) {
+        float64 $value = $v;
+        assert($value >= -$limit && $value <= $limit);
+    }
+
+    Init::ones->fill($t, 200, 100, $rng);
+    assert($t->mean() == 1.0);
+}

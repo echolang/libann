@@ -1,0 +1,131 @@
+/**
+ * Scores reported next to the loss. Training never optimises these; they
+ * say how good the network is in terms that mean something for the task.
+ */
+
+namespace ann;
+
+public enum Metric : uint8
+{
+    /**
+     * Only the loss is reported.
+     */
+    case none = 0;
+
+    /**
+     * Share of samples whose largest output is the target class. Target is
+     * one-hot rows or a `[n, 1]` column of class indices.
+     */
+    case accuracy = 1;
+
+    /**
+     * Share of values on the same side of 0.5 as their target. For sigmoid
+     * outputs.
+     */
+    case binaryAccuracy = 2;
+
+    case mae = 3;
+
+    /**
+     * Root of the mean squared error, in the units of the target.
+     */
+    case rmse = 4;
+
+    /**
+     * Score `$prediction` against `$target`. Run the prediction through
+     * `Loss::predict` first, so a `CrossEntropy` network is scored on
+     * probabilities.
+     */
+    public const function score(const Tensor& $prediction, const Tensor& $target) : float64
+    {
+        return match ($this) {
+            .none => 0.0,
+            .accuracy => Metric::classAccuracy($prediction, $target),
+            .binaryAccuracy => Metric::thresholdAccuracy($prediction, $target),
+            .mae => Metric::meanAbsolute($prediction, $target),
+            .rmse => std::math::sqrt(Metric::meanSquared($prediction, $target)),
+        };
+    }
+
+    private static function classAccuracy(const Tensor& $prediction, const Tensor& $target) : float64
+    {
+        array<usize> $predicted = $prediction->argmax();
+        array<usize> $wanted = Metric::classes($target);
+        usize $hits = 0;
+
+        foreach ($predicted as $r => $class) {
+            if ($class == $wanted[$r]) {
+                $hits = $hits + 1;
+            }
+        }
+
+        return Metric::share($hits, $predicted->count());
+    }
+
+    /**
+     * Class of every row of `$target`: the index a `[n, 1]` column holds,
+     * or the hot column of a one-hot row.
+     */
+    private static function classes(const Tensor& $target) : array<usize>
+    {
+        if ($target->cols() != 1) {
+            return $target->argmax();
+        }
+
+        array<usize> $out = arr::room<usize>($target->rows());
+
+        foreach ($target->data as $v) {
+            $out[] = $v as usize;
+        }
+
+        return $out;
+    }
+
+    private static function thresholdAccuracy(const Tensor& $prediction, const Tensor& $target) : float64
+    {
+        $prediction->expectSize($target, 'binaryAccuracy');
+        usize $hits = 0;
+
+        foreach (0 .. $prediction->data->count() as $i) {
+            if (($prediction->data[$i] >= 0.5) == ($target->data[$i] >= 0.5)) {
+                $hits = $hits + 1;
+            }
+        }
+
+        return Metric::share($hits, $prediction->size());
+    }
+
+    private static function meanAbsolute(const Tensor& $prediction, const Tensor& $target) : float64
+    {
+        $prediction->expectSize($target, 'mae');
+        float64 $total = 0.0;
+
+        foreach (0 .. $prediction->data->count() as $i) {
+            $total = $total + std::math::abs($prediction->data[$i] - $target->data[$i]);
+        }
+
+        return $total / std::math::max($prediction->size() as float64, 1.0);
+    }
+
+    private static function meanSquared(const Tensor& $prediction, const Tensor& $target) : float64
+    {
+        $prediction->expectSize($target, 'rmse');
+        float64 $total = 0.0;
+
+        foreach (0 .. $prediction->data->count() as $i) {
+            float64 $d = $prediction->data[$i] - $target->data[$i];
+            $total = $total + $d * $d;
+        }
+
+        return $total / std::math::max($prediction->size() as float64, 1.0);
+    }
+
+    private static function share(usize $hits, usize $count) : float64
+    {
+        if ($count == 0) {
+            return 0.0;
+        }
+
+        return ($hits as float64) / ($count as float64);
+    }
+}

@@ -1,0 +1,159 @@
+/**
+ * A network estimates the value of every action, and learns from replay
+ * to match reward plus discounted value of the best next action.
+ *
+ * `online` acts and learns. `target` only supplies next-state values, and
+ * follows in jumps (`sync`) or smoothly (`tau`). With `double` on, online
+ * picks the next action and target values it, which removes most of
+ * Q-learning's optimism.
+ *
+ *     $dqn = Dqn(Model(qnet(), $seed: 1), Model(qnet()), Adam(0.0005));
+ *     $replay->add($runner->step($dqn->act($runner->observation, $epsilon, $rng)));
+ *     Report $r = $dqn->update($replay->sample(64, $rng));
+ */
+
+namespace ann::rl;
+
+use ann::{Dataset, Huber, Loss, Model, Optimizer, Random, Tensor};
+
+public class Dqn
+{
+    /**
+     * Acts and learns: observations in, one value per action out.
+     */
+    public Model $online;
+
+    /**
+     * Lags behind `online`. Overwritten with the online weights on
+     * construction.
+     */
+    public Model $target;
+
+    public Optimizer $optimizer;
+
+    /**
+     * Discount: how much a reward one step later is worth now.
+     */
+    public float64 $gamma = 0.99;
+
+    /**
+     * Choose the next action with `online`, value it with `target`.
+     */
+    public bool $double = true;
+
+    /**
+     * Copy `online` into `target` every this many updates. Ignored when
+     * `tau` is above zero.
+     */
+    public usize $sync = 500;
+
+    /**
+     * When above zero, blend this fraction of `online` into `target` after
+     * every update instead of copying every `sync` updates.
+     */
+    public float64 $tau = 0.0;
+
+    /**
+     * Global gradient-norm cap. 0 is none.
+     */
+    public float64 $clip = 10.0;
+
+    /**
+     * TD loss on the value of the action taken.
+     */
+    public Loss $loss = Huber();
+
+    private usize $updates;
+
+    init
+    {
+        guard $this->target->copy($this->online) else ($e) {
+            die("ann::rl::Dqn: the target network must have the online network's architecture: {$e}");
+        }
+
+        $this->updates = 0;
+    }
+
+    /**
+     * Value of every action in each of `$states`.
+     */
+    public function values(const Tensor& $states) : Tensor
+    {
+        return $this->online->predict($states);
+    }
+
+    /**
+     * Epsilon-greedy: with probability `$epsilon` a uniformly random
+     * action, otherwise the highest-value action in `$state`.
+     */
+    public function act(const Tensor& $state, float64 $epsilon, Random& $rng) : usize
+    {
+        Tensor $q = $this->online->predict($state);
+
+        if ($rng->chance($epsilon)) {
+            return $rng->below($q->cols());
+        }
+
+        array<usize> $best = $q->argmax();
+        return $best[0];
+    }
+
+    /**
+     * One gradient step on `$batch` towards the TD targets, then the
+     * target-network update. The report's `value` is the TD loss.
+     */
+    public function update(const Transitions& $batch) : Report
+    {
+        Tensor $next = $this->target->predict($batch->next);
+        Tensor $bootstrap = $next->pick($this->choose($next, $batch));
+        Tensor $y = $batch->rewards;
+
+        foreach (0 .. $y->data->count() as $i) {
+            $y->data[$i] = $y->data[$i] + $this->gamma * (1.0 - $batch->terminal->data[$i]) * $bootstrap->data[$i];
+        }
+
+        Tensor $out = $this->online->forward($batch->states, .train);
+        Tensor $chosen = $out->pick($batch->actions);
+        $td = Dataset($batch->states, $y);
+        Report $report = Report();
+        $report->value = $td->loss($this->loss, $chosen);
+
+        // only the taken action's value gets a gradient
+        Tensor $g = $td->gradient($this->loss, $chosen);
+        $this->online->backward(Tensor(oneHot: $batch->actions, classes: $out->cols())->weigh($g));
+        $this->online->step($this->optimizer, $this->clip);
+        $this->updates = $this->updates + 1;
+        $this->follow();
+        return $report;
+    }
+
+    /**
+     * Next action each sample bootstraps from: target's best in `$next`,
+     * or with `double` on, online's.
+     */
+    private function choose(const Tensor& $next, const Transitions& $batch) : array<usize>
+    {
+        if ($this->double) {
+            return $this->online->predict($batch->next)->argmax();
+        }
+
+        return $next->argmax();
+    }
+
+    private function follow() : void
+    {
+        if ($this->tau > 0.0) {
+            guard $this->target->blend($this->online, $this->tau) else ($e) {
+                die("ann::rl::Dqn: {$e}");
+            }
+
+            return;
+        }
+
+        if ($this->sync > 0 && $this->updates % $this->sync == 0) {
+            guard $this->target->copy($this->online) else ($e) {
+                die("ann::rl::Dqn: {$e}");
+            }
+        }
+    }
+}

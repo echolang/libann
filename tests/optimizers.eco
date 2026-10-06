@@ -1,0 +1,60 @@
+use ann::{Adam, Param, Sgd};
+
+internal function single(float64 $value, float64 $grad) : array<Param>
+{
+    array<usize> $s = [1, 1];
+    $p = Param('w', $s);
+    $p->value->data[0] = $value;
+    $p->grad->data[0] = $grad;
+    array<Param> $all = [$p];
+    return $all;
+}
+
+#[group: "optimizers"]
+test sgd_steps_against_the_gradient
+{
+    $params = single(1.0, 0.5);
+    Sgd(0.1)->step($params);
+    assert(near($params[0]->value->data[0], 0.95));
+}
+
+#[group: "optimizers"]
+test sgd_momentum_builds_velocity
+{
+    $params = single(1.0, 1.0);
+    $sgd = Sgd(0.1, $momentum: 0.9);
+    $sgd->step($params);
+    // v = 1, w = 0.9
+    $sgd->step($params);
+    // v = 0.9 + 1 = 1.9, w = 0.9 - 0.19
+    assert(near($params[0]->value->data[0], 0.71));
+}
+
+#[group: "optimizers"]
+test adam_first_step_is_about_the_rate
+{
+    $params = single(1.0, 123.0);
+    Adam(0.01)->step($params);
+    // bias correction makes the first step rate * g / |g|
+    assert(near($params[0]->value->data[0], 0.99, 0.0000001));
+}
+
+#[group: "optimizers"]
+test adamw_decays_weights_without_gradient
+{
+    $params = single(2.0, 0.0);
+    Adam(0.1, $weightDecay: 0.5)->step($params);
+    assert(near($params[0]->value->data[0], 1.9, 0.0000001));
+}
+
+#[group: "optimizers"]
+test clipping_bounds_the_global_norm
+{
+    $params = single(0.0, 3.0);
+    $more = single(0.0, 4.0);
+    $params->extend($more);
+    assert(Param::norm($params) == 5.0);
+    Param::clip($params, 1.0);
+    assert(near($params[0]->grad->data[0], 0.6));
+    assert(near($params[1]->grad->data[0], 0.8));
+}

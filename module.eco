@@ -1,0 +1,21 @@
+/*
+ * libann: a small artificial neural network library for Echo.
+ *
+ * Tensors, layers, losses, optimizers and a trainer, plus a binary format
+ * for whole models and for weights alone. Pure Echo, no C. Layers, losses
+ * and optimizers are interfaces, so new architectures plug in from outside.
+ *
+ * `ann::rl` builds reinforcement learning on top: environments, replay and
+ * rollout buffers, and DQN, REINFORCE, actor-critic and PPO updates.
+ */
+
+#[module: "libann"]
+#[version: "0.2.0"] // x-release-please-version
+#[epm::license: "MIT"]
+#[epm::description: "A small artificial neural network trainer & runner library for echo."]
+
+#[sources: "src/**/*.eco"]
+
+#[target: test] {
+    #[sources: "tests/*.eco"]
+}

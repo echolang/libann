@@ -1,0 +1,162 @@
+// hot paths: tensor kernels a dense layer runs, activations, optimizer
+// step, whole training steps. release builds only; the jit's debug
+// checks would measure themselves
+//
+//   echoc build -m . --optimize whole -o /tmp/annbench examples/bench.eco && /tmp/annbench
+
+use std::time;
+use ann::{Act, Activation, Adam, Dataset, Dense, MeanSquaredError, Model, Param, Random, Sequential, Tensor};
+
+internal function noise(Random& $rng, usize $rows, usize $cols) : Tensor
+{
+    array<usize> $shape = [$rows, $cols];
+    Tensor $t = Tensor($shape);
+
+    foreach (0 .. $t->data->count() as $i) {
+        $t->data[$i] = $rng->uniform(-1.0, 1.0);
+    }
+
+    return $t;
+}
+
+// microseconds per call, and the rate when the call does `$flop` flops
+internal function report(const string& $name, time::instant $start, int32 $reps, float64 $flop = 0.0) : void
+{
+    float64 $secs = $start->elapsed()->as_float_secs();
+    float64 $us = $secs * 1000000.0 / ($reps as float64);
+
+    if ($flop > 0.0) {
+        float64 $gflops = $flop / $us / 1000.0;
+        echo "{$name} {$us} us  ({$gflops} GFLOP/s)";
+        return;
+    }
+
+    echo "{$name} {$us} us";
+}
+
+internal function step(const string& $name, usize $in, usize $hidden, usize $out, usize $batch, int32 $reps) : float64
+{
+    $rng = Random(3);
+    $net = Sequential()
+        ->add(Dense($in, $hidden, .he))
+        ->add(Act(.relu))
+        ->add(Dense($hidden, $hidden, .he))
+        ->add(Act(.relu))
+        ->add(Dense($hidden, $out));
+    $model = Model($net, $seed: 1);
+    $data = Dataset(noise($rng, $batch, $in), noise($rng, $batch, $out));
+    $loss = MeanSquaredError();
+    $adam = Adam();
+    float64 $sum = 0.0;
+    float64 $flop = 6.0 * ($batch as float64) * (($in * $hidden + $hidden * $hidden + $hidden * $out) as float64);
+
+    time::instant $t = time::instant::now();
+
+    for (int32 $r = 0; $r < $reps; $r++) {
+        $sum = $sum + $model->learn($data, $loss, $adam);
+    }
+
+    report($name, $t, $reps, $flop);
+    return $sum;
+}
+
+$rng = Random(9);
+Tensor $x = noise($rng, 64, 256);
+Tensor $w = noise($rng, 256, 256);
+Tensor $g = noise($rng, 64, 256);
+Tensor $bias = noise($rng, 1, 256);
+Tensor $sparse = Act(.relu)->forward($x, .infer);
+float64 $flop = 2.0 * 64.0 * 256.0 * 256.0;
+int32 $heavy = 300;
+int32 $light = 3000;
+float64 $check = 0.0;
+
+echo 'kernels, [64, 256] batch through a [256, 256] weight';
+
+time::instant $t = time::instant::now();
+for (int32 $r = 0; $r < $heavy; $r++) {
+    $check = $check + $x->matmul($w)->data[7];
+}
+report('  matmul                  ', $t, $heavy, $flop);
+
+$t = time::instant::now();
+for (int32 $r = 0; $r < $heavy; $r++) {
+    $check = $check + $sparse->matmul($w)->data[7];
+}
+report('  matmul, ReLU-sparse left', $t, $heavy, $flop);
+
+$t = time::instant::now();
+for (int32 $r = 0; $r < $heavy; $r++) {
+    $check = $check + $g->matmul(transposed: $w)->data[7];
+}
+report('  matmul(transposed:)     ', $t, $heavy, $flop);
+
+array<usize> $square = [256, 256];
+Tensor $grad = Tensor($square);
+$t = time::instant::now();
+for (int32 $r = 0; $r < $heavy; $r++) {
+    $grad->accumulate(outer: $x, $g);
+}
+$check = $check + $grad->data[7];
+report('  accumulate(outer:)      ', $t, $heavy, $flop);
+
+$t = time::instant::now();
+for (int32 $r = 0; $r < $light; $r++) {
+    $check = $check + $g->addRow($bias)->data[7];
+}
+report('  addRow                  ', $t, $light);
+
+$t = time::instant::now();
+for (int32 $r = 0; $r < $light; $r++) {
+    $check = $check + $g->sumRows()->data[7];
+}
+report('  sumRows                 ', $t, $light);
+
+echo 'activations, [64, 256]';
+
+array<Activation> $kinds = [Activation::relu, Activation::tanh, Activation::gelu];
+
+foreach ($kinds as $kind) {
+    Act $act = Act($kind);
+    string $label = str::from($kind);
+
+    $t = time::instant::now();
+    for (int32 $r = 0; $r < $light; $r++) {
+        $check = $check + $act->forward($g, .train)->data[7];
+    }
+    report("  {$label} forward", $t, $light);
+
+    $t = time::instant::now();
+    for (int32 $r = 0; $r < $light; $r++) {
+        $check = $check + $act->backward($g)->data[7];
+    }
+    report("  {$label} backward", $t, $light);
+}
+
+echo 'optimizer, one [256, 256] param';
+
+Param $param = Param('weight', $square);
+$param->grad = $w;
+array<Param> $params = [$param];
+Adam $adam = Adam();
+
+$t = time::instant::now();
+for (int32 $r = 0; $r < $light; $r++) {
+    $adam->step($params);
+}
+report('  Adam step               ', $t, $light);
+
+$t = time::instant::now();
+for (int32 $r = 0; $r < $light; $r++) {
+    $check = $check + Param::norm($params);
+}
+report('  Param::norm             ', $t, $light);
+
+echo 'learn(), relu MLP with two hidden layers and Adam';
+
+$check = $check + step('  tiny  4 -> 64 -> 64 -> 2, batch 32     ', 4, 64, 2, 32, 20000);
+$check = $check + step('  small 32 -> 32 -> 32 -> 3, batch 32    ', 32, 32, 3, 32, 20000);
+$check = $check + step('  large 256 -> 256 -> 256 -> 10, batch 64', 256, 256, 10, 64, 300);
+
+// printed so the optimizer cannot drop the work
+echo "checksum {$check}";

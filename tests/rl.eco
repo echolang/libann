@@ -1,0 +1,322 @@
+use ann::{Act, Adam, Dense, Model, Param, Random, Sequential, Tensor};
+use ann::rl::{ActorCritic, CartPole, Choice, Dqn, Environment, Outcome, Policy, Ppo, Reinforce, Replay, Rollout, Runner, Schedule, Step, Transition, Transitions};
+
+/**
+ * Five-cell corridor. Start at the left; stepping right off the far end
+ * pays 1 and ends the episode, every other step costs 0.01. Cut off after
+ * 20 steps. Always going right is optimal, and fast to learn.
+ */
+internal class Corridor : Environment
+{
+    public usize $cells = 5;
+    private usize $at;
+    private usize $elapsed;
+
+    init
+    {
+        $this->at = 0;
+        $this->elapsed = 0;
+    }
+
+    public function reset() : Tensor
+    {
+        $this->at = 0;
+        $this->elapsed = 0;
+        return $this->observe();
+    }
+
+    public function step(usize $action) : Step
+    {
+        $this->elapsed = $this->elapsed + 1;
+
+        if ($action == 1) {
+            if ($this->at + 1 == $this->cells) {
+                return Step($this->observe(), 1.0, .terminated);
+            }
+
+            $this->at = $this->at + 1;
+        } else if ($this->at > 0) {
+            $this->at = $this->at - 1;
+        }
+
+        Outcome $outcome = .running;
+
+        if ($this->elapsed >= 20) {
+            $outcome = .truncated;
+        }
+
+        return Step($this->observe(), -0.01, $outcome);
+    }
+
+    public const function observations() : usize
+    {
+        return $this->cells;
+    }
+
+    public const function actions() : usize
+    {
+        return 2;
+    }
+
+    public const function cell(usize $at) : Tensor
+    {
+        array<usize> $where = [$at];
+        return Tensor(oneHot: $where, classes: $this->cells);
+    }
+
+    private const function observe() : Tensor
+    {
+        return $this->cell($this->at);
+    }
+}
+
+internal function scalar(float64 $v) : Tensor
+{
+    array<array<float64>> $row = [[$v]];
+    return Tensor(rows: $row);
+}
+
+internal function step(float64 $state, float64 $reward, float64 $next, Outcome $outcome) : Transition
+{
+    return Transition(scalar($state), 0, $reward, scalar($next), $outcome);
+}
+
+internal function policyNet(uint64 $seed) : Model
+{
+    return Model(Sequential()->add(Dense(5, 16))->add(Act(.tanh))->add(Dense(16, 2)), $seed: $seed);
+}
+
+internal function criticNet(uint64 $seed) : Model
+{
+    return Model(Sequential()->add(Dense(5, 16))->add(Act(.tanh))->add(Dense(16, 1)), $seed: $seed);
+}
+
+// probability the policy gives "right" in the worst corridor cell
+internal function worstRight(Policy $policy, const Corridor& $env) : float64
+{
+    float64 $worst = 1.0;
+
+    for (usize $c = 0; $c < 5; $c++) {
+        $p = $policy->probabilities($env->cell($c));
+        $worst = std::math::min($worst, $p->data[1]);
+    }
+
+    return $worst;
+}
+
+// one rollout of `$steps` steps, policy sampling
+internal function collect(Runner $runner, Policy $policy, usize $steps, Random& $rng) : Rollout
+{
+    $rollout = Rollout();
+
+    for (usize $i = 0; $i < $steps; $i++) {
+        Choice $c = $policy->act($runner->observation, $rng);
+        $rollout->add($runner->step($c->action), $c->logProb);
+    }
+
+    return $rollout;
+}
+
+#[group: "rl"]
+test policy_gradient_matches_finite_differences
+{
+    $logits = noise(shape(3, 4), 21);
+    array<usize> $actions = [2, 0, 3];
+    array<float64> $c = [1.5, -0.7, 0.3];
+    $coefficients = Tensor(column: $c);
+    float64 $beta = 0.2;
+    $analytic = Policy::gradient($logits, $actions, $coefficients, $beta);
+
+    // the objective Policy::gradient differentiates
+    $objective = function(const Tensor $z) : float64 {
+        $taken = $z->logSoftmax()->pick($actions);
+        return -$taken->mul($coefficients)->sum() / 3.0 - $beta * Policy::entropy($z);
+    };
+
+    float64 $h = 0.000001;
+    float64 $worst = 0.0;
+
+    foreach (0 .. $logits->data->count() as $i) {
+        Tensor $up = $logits;
+        Tensor $down = $logits;
+        $up->data[$i] = $logits->data[$i] + $h;
+        $down->data[$i] = $logits->data[$i] - $h;
+        float64 $numeric = ($objective($up) - $objective($down)) / (2.0 * $h);
+        $worst = std::math::max($worst, relativeError($numeric, $analytic->data[$i]));
+    }
+
+    assert($worst < 0.000001);
+}
+
+#[group: "rl"]
+test returns_and_gae_follow_the_outcomes
+{
+    // two episodes: one terminated after two steps, one truncated after two
+    $rollout = Rollout();
+    $rollout->add(step(1.0, 1.0, 2.0, .running));
+    $rollout->add(step(2.0, 2.0, 3.0, .terminated));
+    $rollout->add(step(10.0, 3.0, 11.0, .running));
+    $rollout->add(step(11.0, 4.0, 12.0, .truncated));
+
+    $returns = $rollout->returns(0.5);
+    assert($returns->data[0] == 2.0 && $returns->data[1] == 2.0);
+    assert($returns->data[2] == 5.0 && $returns->data[3] == 4.0);
+
+    // a critic that values a state at exactly its observation
+    $critic = Model(Sequential()->add(Dense(1, 1)));
+    array<Param> $p = $critic->params();
+    $weight = $p[0];
+    $weight->value->data[0] = 1.0;
+
+    $estimate = $rollout->estimate($critic, 0.5, 0.5);
+    // truncated: 4 + 0.5 * V(12) - 11 = -1; then 3 + 0.5 * 11 - 10 + 0.25 * -1
+    // terminated: 2 - 2 = 0, no bootstrap; then 1 + 0.5 * 2 - 1 = 1, no trace across
+    assert($estimate->advantages->data[0] == 1.0);
+    assert($estimate->advantages->data[1] == 0.0);
+    assert($estimate->advantages->data[2] == -1.75);
+    assert($estimate->advantages->data[3] == -1.0);
+    assert($estimate->returns->data[0] == 2.0 && $estimate->returns->data[2] == 8.25);
+
+    $rollout->clear();
+    assert($rollout->count() == 0);
+}
+
+#[group: "rl"]
+test replay_keeps_the_newest
+{
+    $replay = Replay(3);
+
+    for (int32 $i = 0; $i < 5; $i++) {
+        $replay->add(step(0.0, $i as float64, 0.0, .running));
+    }
+
+    assert($replay->count() == 3);
+    $rng = Random(2);
+    Transitions $batch = $replay->sample(50, $rng);
+    assert($batch->count() == 50 && $batch->states->rows() == 50 && $batch->rewards->cols() == 1);
+
+    foreach ($batch->rewards->data as $r) {
+        float64 $reward = $r;
+        assert($reward >= 2.0);
+    }
+}
+
+#[group: "rl"]
+test terminal_marks_only_real_endings
+{
+    array<Transition> $items = [step(0.0, 0.0, 0.0, .running), step(0.0, 0.0, 0.0, .terminated), step(0.0, 0.0, 0.0, .truncated)];
+    $batch = Transitions($items);
+    assert($batch->terminal->data[0] == 0.0 && $batch->terminal->data[1] == 1.0 && $batch->terminal->data[2] == 0.0);
+}
+
+#[group: "rl"]
+test cartpole_falls_and_is_cut_off
+{
+    $runner = Runner(CartPole($seed: 3));
+
+    // always pushing right tips the pole over well before the limit
+    while ($runner->episodes->count() == 0) {
+        Transition $t = $runner->step(1);
+        assert($t->reward == 1.0);
+        assert($runner->steps < 500);
+    }
+
+    assert($runner->episodes[0] == ($runner->steps as float64));
+
+    // alternating pushes keep it up for the five steps of a short limit
+    $short = Runner(CartPole($seed: 3, $limit: 5));
+    Outcome $last = .running;
+
+    for (usize $i = 0; $i < 5; $i++) {
+        $last = $short->step($i % 2)->outcome;
+    }
+
+    assert($last == Outcome::truncated);
+    assert($short->mean(10) == 5.0);
+}
+
+#[group: "rl"]
+test schedule_decays_then_holds
+{
+    $s = Schedule(from: 1.0, to: 0.1, over: 10);
+    assert($s->at(0) == 1.0);
+    assert(near($s->at(5), 0.55));
+    assert($s->at(10) == 0.1 && $s->at(1000) == 0.1);
+}
+
+#[group: "rl"]
+test dqn_learns_the_corridor
+{
+    $env = Corridor();
+    $runner = Runner($env);
+    $q = Model(Sequential()->add(Dense(5, 16))->add(Act(.relu))->add(Dense(16, 2)), $seed: 1);
+    $dqn = Dqn($q, Model(Sequential()->add(Dense(5, 16))->add(Act(.relu))->add(Dense(16, 2))), Adam(0.01), $gamma: 0.9, $sync: 50);
+    $replay = Replay(2000);
+    $epsilon = Schedule(from: 1.0, to: 0.05, over: 1000);
+    $rng = Random(7);
+
+    for (usize $i = 0; $i < 1500; $i++) {
+        $replay->add($runner->step($dqn->act($runner->observation, $epsilon->at($i), $rng)));
+
+        if ($replay->count() >= 64) {
+            $dqn->update($replay->sample(32, $rng));
+        }
+    }
+
+    for (usize $c = 0; $c < 5; $c++) {
+        $values = $dqn->values($env->cell($c));
+        assert($values->data[1] > $values->data[0]);
+    }
+
+    // going right from the last cell is worth the reward itself
+    assert(near($dqn->values($env->cell(4))->data[1], 1.0, 0.1));
+}
+
+#[group: "rl"]
+test reinforce_learns_the_corridor
+{
+    $env = Corridor();
+    $runner = Runner($env);
+    $policy = Policy(policyNet(2));
+    $agent = Reinforce($policy, Adam(0.02), $gamma: 0.9);
+    $rng = Random(3);
+
+    for (int32 $round = 0; $round < 40; $round++) {
+        $agent->update(collect($runner, $policy, 100, $rng));
+    }
+
+    assert(worstRight($policy, $env) > 0.9);
+}
+
+#[group: "rl"]
+test actor_critic_learns_the_corridor
+{
+    $env = Corridor();
+    $runner = Runner($env);
+    $policy = Policy(policyNet(4));
+    $agent = ActorCritic($policy, criticNet(5), Adam(0.02), Adam(0.02), $gamma: 0.9);
+    $rng = Random(5);
+
+    for (int32 $round = 0; $round < 40; $round++) {
+        $agent->update(collect($runner, $policy, 100, $rng));
+    }
+
+    assert(worstRight($policy, $env) > 0.9);
+}
+
+#[group: "rl"]
+test ppo_learns_the_corridor
+{
+    $env = Corridor();
+    $runner = Runner($env);
+    $policy = Policy(policyNet(6));
+    $agent = Ppo($policy, criticNet(7), Adam(0.01), Adam(0.01), $gamma: 0.9, $batchSize: 50);
+    $rng = Random(9);
+
+    for (int32 $round = 0; $round < 20; $round++) {
+        $report = $agent->update(collect($runner, $policy, 200, $rng));
+        assert($report->entropy >= 0.0);
+    }
+
+    assert(worstRight($policy, $env) > 0.9);
+}

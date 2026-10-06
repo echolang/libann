@@ -1,0 +1,88 @@
+/**
+ * Failures reading or writing a model, or moving weights between networks.
+ *
+ * Payloads are plain data. echoc 0.7.0 fails to link a namespaced enum with
+ * three or more payload cases when one of them owns a string, so the
+ * unknown kind and the offending field stay out of the enum; `message()`
+ * says what to look for.
+ */
+
+namespace ann;
+
+public enum ModelError
+{
+    case io(std::io::ioerror $cause);
+
+    /**
+     * Bytes do not start with the expected magic: wrong file kind, or not
+     * a libann file at all.
+     */
+    case badMagic;
+
+    /**
+     * Written by a format version this build cannot read.
+     */
+    case unsupportedVersion(uint32 $version);
+
+    /**
+     * Bytes end in the middle of a value.
+     */
+    case truncated;
+
+    /**
+     * The architecture names a kind the registry has no decoder for.
+     * `Registry::add` before loading.
+     */
+    case unknownLayer;
+
+    /**
+     * A config field is out of range (unknown activation code, and so on).
+     * Floats are reported as their bits.
+     */
+    case badValue(uint64 $value);
+
+    /**
+     * Source holds a different number of params than this network.
+     */
+    case paramCount(usize $expected, usize $got);
+
+    /**
+     * Param `$index` in the source has a different name or shape than this
+     * network's param at the same position.
+     */
+    case shapeMismatch(usize $index);
+
+    public const function message() : string
+    {
+        return match ($this) {
+            .io($cause) => $cause->message(),
+            .badMagic => 'not a libann file of the expected kind',
+            .unsupportedVersion($version) => ModelError::versionMessage($version),
+            .truncated => 'the data ends in the middle of a value',
+            .unknownLayer => 'the architecture names a layer kind with no registered decoder, register custom layers with Registry::add',
+            .badValue($value) => ModelError::valueMessage($value),
+            .paramCount($expected, $got) => ModelError::countMessage($expected, $got),
+            .shapeMismatch($index) => ModelError::shapeMessage($index),
+        };
+    }
+
+    private static function versionMessage(uint32 $version) : string
+    {
+        return "format version {$version} is not supported";
+    }
+
+    private static function valueMessage(uint64 $value) : string
+    {
+        return "a config field holds {$value}, which is out of range";
+    }
+
+    private static function countMessage(usize $expected, usize $got) : string
+    {
+        return "the network has {$expected} params but the source holds {$got}";
+    }
+
+    private static function shapeMessage(usize $index) : string
+    {
+        return "param #{$index} of the source does not match the network's param in name or shape";
+    }
+}

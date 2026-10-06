@@ -1,0 +1,164 @@
+/**
+ * Mini-batch gradient descent over a `Dataset`. Every batch is one
+ * `Model::learn`; a loop of your own (RL, say) calls that directly.
+ *
+ *     $history = Trainer($epochs: 200, $batchSize: 16, $metric: .accuracy)
+ *         ->fit($model, CrossEntropy(), Adam(), $data);
+ */
+
+namespace ann;
+
+/**
+ * Loss and metric over a whole dataset.
+ */
+public struct Evaluation
+{
+    public float64 $loss;
+
+    /**
+     * Zero when the metric is `Metric::none`.
+     */
+    public float64 $metric;
+}
+
+/**
+ * What one epoch achieved.
+ */
+public struct EpochReport
+{
+    /**
+     * Starts at 1.
+     */
+    public usize $epoch;
+
+    /**
+     * Mean batch loss in training mode (dropout is on), plus the metric
+     * over the whole training set after the epoch.
+     */
+    public Evaluation $train;
+
+    /**
+     * Same numbers on the validation set, when the trainer has one.
+     */
+    public Evaluation? $validation;
+}
+
+/**
+ * Every epoch's report, in order.
+ */
+public struct History
+{
+    public array<EpochReport> $epochs = array<EpochReport>();
+
+    /**
+     * Final epoch, null before any training.
+     */
+    public const function last() : EpochReport?
+    {
+        if ($this->epochs->count() == 0) {
+            return null;
+        }
+
+        return $this->epochs[$this->epochs->count() - 1];
+    }
+}
+
+public struct Trainer
+{
+    /**
+     * Passes over the whole training set.
+     */
+    public usize $epochs = 100;
+
+    /**
+     * Samples per gradient step. Last batch of an epoch may be smaller.
+     */
+    public usize $batchSize = 32;
+
+    /**
+     * Reorder samples before every epoch.
+     */
+    public bool $shuffle = true;
+
+    /**
+     * Seed for shuffling, so a run reproduces.
+     */
+    public uint64 $seed = 1;
+
+    public Metric $metric = .none;
+
+    /**
+     * Cap on the global L2 of the gradients. 0 leaves them alone.
+     */
+    public float64 $clip = 0.0;
+
+    /**
+     * Evaluated after every epoch, never trained on.
+     */
+    public Dataset? $validation = null;
+
+    /**
+     * After every epoch. Logging, schedules and checkpoints live here.
+     */
+    public function<void(EpochReport)>? $onEpoch = null;
+
+    /**
+     * Train `$model` on `$data`. Returns every epoch's report.
+     */
+    public function fit(Model $model, Loss $loss, Optimizer $optimizer, const Dataset& $data) : History
+    {
+        usize $n = $data->count();
+
+        if ($n == 0) {
+            die('ann::Trainer: the dataset is empty');
+        }
+
+        $batches = Batches($n, $this->batchSize);
+        $rng = Random($this->seed);
+        $model->zeroGrad();
+        $history = History();
+
+        for (usize $epoch = 1; $epoch <= $this->epochs; $epoch++) {
+            if ($this->shuffle) {
+                $batches->shuffle($rng);
+            }
+
+            float64 $total = 0.0;
+
+            foreach ($batches->all() as $indices) {
+                Dataset $batch = $data->batch($indices);
+                $total = $total + $model->learn($batch, $loss, $optimizer, $this->clip) * ($indices->count() as float64);
+            }
+
+            Evaluation $train = Evaluation($total / ($n as float64), 0.0);
+
+            if ($this->metric != Metric::none) {
+                $train->metric = $this->metric->score($loss->predict($model->predict($data->inputs)), $data->targets);
+            }
+
+            EpochReport $report = EpochReport($epoch, $train, $this->validate($model, $loss));
+            $history->epochs[] = $report;
+            $this->notify($report);
+        }
+
+        return $history;
+    }
+
+    private const function validate(Model $model, Loss $loss) : Evaluation?
+    {
+        Dataset $held = guard $this->validation else {
+            return null;
+        }
+
+        return $model->evaluate($held, $loss, $this->metric);
+    }
+
+    private const function notify(EpochReport $report) : void
+    {
+        function<void(EpochReport)> $hook = guard $this->onEpoch else {
+            return;
+        }
+
+        $hook($report);
+    }
+}

@@ -1,0 +1,996 @@
+/**
+ * A shaped block of float64, row-major. Batches go first: 32 samples of 4
+ * features is `[32, 4]`. Layers treat everything after the first axis as
+ * one row, so `[batch, n]` code still works on extra axes.
+ */
+
+namespace ann;
+
+public struct Tensor
+{
+    /**
+     * Extent of every axis, outermost first.
+     */
+    public array<usize> $shape;
+
+    /**
+     * Last axis varying fastest.
+     */
+    public array<float64> $data;
+
+    /**
+     * Zeros of `$shape`.
+     */
+    public constructor(const array<usize>& $shape)
+    {
+        $this->shape = $shape;
+        $this->data = Tensor::filled(Tensor::volume($shape), 0.0);
+    }
+
+    /**
+     * `$shape`, every value `$value`.
+     */
+    public constructor(const array<usize>& $shape, fill: float64 $value)
+    {
+        $this->shape = $shape;
+        $this->data = Tensor::filled(Tensor::volume($shape), $value);
+    }
+
+    /**
+     * `$shape` over existing values. Count must match the shape; anything
+     * else is a bug in the caller and stops the program.
+     */
+    public constructor(const array<usize>& $shape, const array<float64>& $data)
+    {
+        if (Tensor::volume($shape) != $data->count()) {
+            $wanted = Tensor::describe($shape);
+            die("ann::Tensor: {$data->count()} values do not fill the shape {$wanted}");
+        }
+
+        $this->shape = $shape;
+        $this->data = $data;
+    }
+
+    /**
+     * `[rows, cols]` from nested rows, the readable way to write a dataset
+     * by hand. Every row must be as long as the first.
+     */
+    public constructor(rows: const array<array<float64>>& $rows)
+    {
+        usize $cols = 0;
+
+        if ($rows->count() > 0) {
+            $cols = $rows[0]->count();
+        }
+
+        array<float64> $data = arr::room<float64>($rows->count() * $cols);
+
+        foreach ($rows as $row) {
+            if ($row->count() != $cols) {
+                die("ann::Tensor: ragged rows, expected {$cols} values per row and got {$row->count()}");
+            }
+
+            $data->extend($row);
+        }
+
+        array<usize> $shape = [$rows->count(), $cols];
+        $this->shape = $shape;
+        $this->data = mv $data;
+    }
+
+    /**
+     * `[n, 1]` column, a single regression target per sample.
+     */
+    public constructor(column: const array<float64>& $values)
+    {
+        array<usize> $shape = [$values->count(), 1];
+        $this->shape = $shape;
+        $this->data = $values;
+    }
+
+    /**
+     * `[n, classes]` one-hot from class labels. The target shape
+     * `CrossEntropy` expects.
+     */
+    public constructor(oneHot: const array<usize>& $labels, classes: usize $classes)
+    {
+        array<usize> $shape = [$labels->count(), $classes];
+        $this->shape = $shape;
+        $this->data = Tensor::filled($labels->count() * $classes, 0.0);
+
+        foreach ($labels as $i => $label) {
+            usize $class = $label;
+
+            if ($class >= $classes) {
+                die("ann::Tensor: label {$class} is outside {$classes} classes");
+            }
+
+            $this->data[$i * $classes + $class] = 1.0;
+        }
+    }
+
+    /**
+     * Samples stacked along the first axis. Every sample must match the
+     * first: `[1, 4]` stacks to `[n, 4]`, and so does `[4]`.
+     */
+    public constructor(stack: const array<Tensor>& $samples)
+    {
+        if ($samples->count() == 0) {
+            die('ann::Tensor: cannot stack zero samples');
+        }
+
+        Tensor $first = $samples[0];
+        array<usize> $shape = array<usize>();
+        $shape[] = 0;
+
+        if ($first->shape->count() > 0 && $first->shape[0] == 1) {
+            for (usize $i = 1; $i < $first->shape->count(); $i++) {
+                $shape[] = $first->shape[$i];
+            }
+        } else {
+            $shape->extend($first->shape);
+        }
+
+        array<float64> $data = arr::room<float64>($samples->count() * $first->size());
+
+        foreach ($samples as $sample) {
+            if (!$sample->sameShape($first)) {
+                $want = Tensor::describe($first->shape);
+                $got = Tensor::describe($sample->shape);
+                die("ann::Tensor: cannot stack {$got} onto samples of {$want}");
+            }
+
+            $data->extend($sample->data);
+        }
+
+        $shape[0] = $samples->count();
+        $this->shape = $shape;
+        $this->data = mv $data;
+    }
+
+    /**
+     * How many values `$shape` holds.
+     */
+    public static function volume(const array<usize>& $shape) : usize
+    {
+        usize $n = 1;
+
+        foreach ($shape as $extent) {
+            $n = $n * $extent;
+        }
+
+        return $n;
+    }
+
+    /**
+     * Shape as this library prints it, `[32, 4]`.
+     */
+    public static function describe(const array<usize>& $shape) : string
+    {
+        string $out = '[';
+
+        foreach ($shape as $i => $extent) {
+            if ($i > 0) {
+                $out->append(', ');
+            }
+
+            $out->append(str::from($extent));
+        }
+
+        $out->append(']');
+        return $out;
+    }
+
+    private static function filled(usize $count, float64 $value) : array<float64>
+    {
+        array<float64> $data = arr::room<float64>($count);
+
+        for (usize $i = 0; $i < $count; $i++) {
+            $data[] = $value;
+        }
+
+        return $data;
+    }
+
+    public const function rank() : usize
+    {
+        return $this->shape->count();
+    }
+
+    public const function size() : usize
+    {
+        return $this->data->count();
+    }
+
+    /**
+     * First axis: samples in a batch.
+     */
+    public const function rows() : usize
+    {
+        if ($this->shape->count() == 0) {
+            return 1;
+        }
+
+        return $this->shape[0];
+    }
+
+    /**
+     * Every axis after the first, flattened: values per sample.
+     */
+    public const function cols() : usize
+    {
+        usize $rows = $this->rows();
+
+        if ($rows == 0) {
+            return 0;
+        }
+
+        return $this->data->count() / $rows;
+    }
+
+    /**
+     * Value at row `$r`, column `$c` of the flattened matrix view.
+     */
+    public const function at(usize $r, usize $c) : float64
+    {
+        return $this->data[$r * $this->cols() + $c];
+    }
+
+    public function set(usize $r, usize $c, float64 $value) : void
+    {
+        $this->data[$r * $this->cols() + $c] = $value;
+    }
+
+    public const function sameShape(const Tensor& $other) : bool
+    {
+        if ($this->shape->count() != $other->shape->count()) {
+            return false;
+        }
+
+        foreach ($this->shape as $i => $extent) {
+            usize $mine = $extent;
+
+            if ($mine != $other->shape[$i]) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Same values, another shape of the same volume.
+     */
+    public const function reshape(const array<usize>& $shape) : Tensor
+    {
+        return Tensor($shape, $this->data);
+    }
+
+    /**
+     * Rows named by `$indices`, in that order, as a new batch.
+     */
+    public const function gather(const array<usize>& $indices) : Tensor
+    {
+        usize $cols = $this->cols();
+        array<usize> $shape = $this->shape;
+
+        if ($shape->count() == 0) {
+            die('ann::Tensor: gather needs at least one axis');
+        }
+
+        $shape[0] = $indices->count();
+        Tensor $out = Tensor($shape);
+
+        foreach ($indices as $r => $index) {
+            usize $from = $index * $cols;
+            usize $to = $r * $cols;
+
+            for (usize $c = 0; $c < $cols; $c++) {
+                $out->data[$to + $c] = $this->data[$from + $c];
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Sample `$r` on its own, first axis set to one: row 2 of `[32, 4]` is
+     * `[1, 4]`.
+     */
+    public const function row(usize $r) : Tensor
+    {
+        array<usize> $indices = [$r];
+        return $this->gather($indices);
+    }
+
+    /**
+     * Overwrite sample `$r` with `$sample`, which must hold exactly one
+     * sample's worth.
+     */
+    public function put(usize $r, const Tensor& $sample) : void
+    {
+        usize $cols = $this->cols();
+
+        if ($sample->size() != $cols) {
+            die("ann::Tensor: a sample of {$sample->size()} values does not fit a row of {$cols}");
+        }
+
+        foreach (0 .. $cols as $c) {
+            $this->data[$r * $cols + $c] = $sample->data[$c];
+        }
+    }
+
+    /**
+     * `[rows, 1]`: one value per row, from the column `$cols` names for
+     * that row. The Q of the action each sample took.
+     * `Tensor(oneHot: $cols, classes: n)->weigh($column)` puts a column
+     * back.
+     */
+    public const function pick(const array<usize>& $cols) : Tensor
+    {
+        usize $rows = $this->rows();
+        usize $width = $this->cols();
+
+        if ($cols->count() != $rows) {
+            die("ann::Tensor: pick needs one column per row, got {$cols->count()} for {$rows} rows");
+        }
+
+        array<usize> $shape = [$rows, 1];
+        Tensor $out = Tensor($shape);
+
+        foreach ($cols as $r => $col) {
+            usize $c = $col;
+
+            if ($c >= $width) {
+                die("ann::Tensor: column {$c} is outside {$width} columns");
+            }
+
+            $out->data[$r] = $this->data[$r * $width + $c];
+        }
+
+        return $out;
+    }
+
+    /**
+     * Each row times its own factor from the `[rows, 1]` column `$factors`.
+     * How per-sample weights reach a gradient.
+     */
+    public const function weigh(const Tensor& $factors) : Tensor
+    {
+        usize $rows = $this->rows();
+
+        if ($factors->size() != $rows) {
+            die("ann::Tensor: weigh needs one factor per row, got {$factors->size()} for {$rows} rows");
+        }
+
+        usize $cols = $this->cols();
+        Tensor $out = $this;
+
+        for (usize $r = 0; $r < $rows; $r++) {
+            usize $base = $r * $cols;
+            float64 $factor = $factors->data[$r];
+
+            for (usize $c = 0; $c < $cols; $c++) {
+                $out->data[$base + $c] = $out->data[$base + $c] * $factor;
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * `[n, k]` view times `[k, m]` view of `$other`, as `[n, m]`.
+     */
+    public const function matmul(const Tensor& $other) : Tensor
+    {
+        usize $n = $this->rows();
+        usize $k = $this->cols();
+        usize $m = $other->cols();
+
+        if ($other->rows() != $k) {
+            $left = Tensor::describe($this->shape);
+            $right = Tensor::describe($other->shape);
+            die("ann::Tensor: cannot multiply {$left} by {$right}");
+        }
+
+        array<usize> $shape = [$n, $m];
+        Tensor $out = Tensor($shape);
+        ptr<const float64> $left = $this->data->data();
+        $out->product($left:$, $k, 1, $other, $n, $k, $m);
+        return $out;
+    }
+
+    /**
+     * `[n, k]` view times the transpose of `$other`'s `[m, k]` view, as
+     * `[n, m]`. Same as `matmul($other->transpose())` without building the
+     * transpose: every output is the dot of two contiguous rows.
+     */
+    public const function matmul(transposed: const Tensor& $other) : Tensor
+    {
+        usize $n = $this->rows();
+        usize $k = $this->cols();
+        usize $m = $other->rows();
+
+        if ($other->cols() != $k) {
+            $left = Tensor::describe($this->shape);
+            $right = Tensor::describe($other->shape);
+            die("ann::Tensor: cannot multiply {$left} by the transpose of {$right}");
+        }
+
+        array<usize> $shape = [$n, $m];
+        Tensor $out = Tensor($shape);
+        $out->dots($this, $other, $n, $k, $m);
+        return $out;
+    }
+
+    /**
+     * Add `A · B` into this `[n, m]`. `B` is `$right`'s `[depth, m]` view;
+     * `A` is `[n, depth]`, read through `$left` with the given strides, so
+     * one kernel serves a plain and a transposed left side.
+     */
+    private function product(ptr<const float64> $left, usize $rowStride, usize $depthStride, const Tensor& $right, usize $n, usize $depth, usize $m) : void
+    {
+        usize $rows = $n - $n % 4;
+        usize $cols = $m - $m % 4;
+
+        for (usize $i = 0; $i < $rows; $i = $i + 4) {
+            for (usize $j = 0; $j < $cols; $j = $j + 4) {
+                $this->tile($left:$, $rowStride, $depthStride, $right, $i, $j, $depth, $m);
+            }
+        }
+
+        // what the 4 x 4 tiles leave over: right edge, then bottom rows
+        $this->span($left:$, $rowStride, $depthStride, $right, 0, $rows, $cols, $m, $depth, $m);
+        $this->span($left:$, $rowStride, $depthStride, $right, $rows, $n, 0, $m, $depth, $m);
+    }
+
+    /**
+     * Add the 4 x 4 block of `A · B` at row `$i`, column `$j`. The block
+     * lives in eight two-lane registers for the whole walk along `depth`,
+     * so each value of `B` is loaded once per block, not once per output
+     * row.
+     */
+    private function tile(ptr<const float64> $left, usize $rowStride, usize $depthStride, const Tensor& $right, usize $i, usize $j, usize $depth, usize $m) : void
+    {
+        ptr<const float64> $b = $right->data->data();
+        ptr<float64> $out = $this->data->data();
+        usize $r0 = $i * $rowStride;
+        usize $r1 = $r0 + $rowStride;
+        usize $r2 = $r1 + $rowStride;
+        usize $r3 = $r2 + $rowStride;
+        simd<float64, 2> $c00 = simd::splat<float64, 2>(0.0);
+        simd<float64, 2> $c01 = $c00;
+        simd<float64, 2> $c10 = $c00;
+        simd<float64, 2> $c11 = $c00;
+        simd<float64, 2> $c20 = $c00;
+        simd<float64, 2> $c21 = $c00;
+        simd<float64, 2> $c30 = $c00;
+        simd<float64, 2> $c31 = $c00;
+
+        for (usize $p = 0; $p < $depth; $p++) {
+            ptr<const float64> $src = $b:$ + ($p * $m + $j);
+            simd<float64, 2> $b0 = simd::load<float64, 2>($src:$);
+            simd<float64, 2> $b1 = simd::load<float64, 2>($src:$ + 2);
+            usize $at = $p * $depthStride;
+            simd<float64, 2> $a0 = simd::splat<float64, 2>($left:$[$r0 + $at]);
+            simd<float64, 2> $a1 = simd::splat<float64, 2>($left:$[$r1 + $at]);
+            simd<float64, 2> $a2 = simd::splat<float64, 2>($left:$[$r2 + $at]);
+            simd<float64, 2> $a3 = simd::splat<float64, 2>($left:$[$r3 + $at]);
+            $c00 = $c00 + $a0 * $b0;
+            $c01 = $c01 + $a0 * $b1;
+            $c10 = $c10 + $a1 * $b0;
+            $c11 = $c11 + $a1 * $b1;
+            $c20 = $c20 + $a2 * $b0;
+            $c21 = $c21 + $a2 * $b1;
+            $c30 = $c30 + $a3 * $b0;
+            $c31 = $c31 + $a3 * $b1;
+        }
+
+        ptr<float64> $d0 = $out:$ + ($i * $m + $j);
+        ptr<float64> $d1 = $d0:$ + $m;
+        ptr<float64> $d2 = $d1:$ + $m;
+        ptr<float64> $d3 = $d2:$ + $m;
+        Tensor::deposit($d0:$, $c00);
+        Tensor::deposit($d0:$ + 2, $c01);
+        Tensor::deposit($d1:$, $c10);
+        Tensor::deposit($d1:$ + 2, $c11);
+        Tensor::deposit($d2:$, $c20);
+        Tensor::deposit($d2:$ + 2, $c21);
+        Tensor::deposit($d3:$, $c30);
+        Tensor::deposit($d3:$ + 2, $c31);
+    }
+
+    /**
+     * Add rows `$fromRow`..`$toRow`, columns `$fromCol`..`$toCol` of
+     * `A · B` one value at a time: tile leftovers, and products too small
+     * to tile. Zero values of `A` (common after ReLU) are skipped.
+     */
+    private function span(ptr<const float64> $left, usize $rowStride, usize $depthStride, const Tensor& $right, usize $fromRow, usize $toRow, usize $fromCol, usize $toCol, usize $depth, usize $m) : void
+    {
+        // i-k-j walks both right-hand rows and the output contiguously
+        for (usize $i = $fromRow; $i < $toRow; $i++) {
+            usize $outRow = $i * $m;
+
+            for (usize $p = 0; $p < $depth; $p++) {
+                float64 $a = $left:$[$i * $rowStride + $p * $depthStride];
+
+                if ($a == 0.0) {
+                    continue;
+                }
+
+                usize $rightRow = $p * $m;
+
+                for (usize $j = $fromCol; $j < $toCol; $j++) {
+                    $this->data[$outRow + $j] = $this->data[$outRow + $j] + $a * $right->data[$rightRow + $j];
+                }
+            }
+        }
+    }
+
+    /**
+     * Fill this `[n, m]` with row-dots of `$left` `[n, k]` against `$right`
+     * `[m, k]`, four left rows against two right rows at a time.
+     */
+    private function dots(const Tensor& $left, const Tensor& $right, usize $n, usize $k, usize $m) : void
+    {
+        ptr<const float64> $a = $left->data->data();
+        ptr<const float64> $b = $right->data->data();
+        usize $rows = $n - $n % 4;
+        usize $cols = $m - $m % 2;
+        usize $even = $k - $k % 2;
+
+        for (usize $i = 0; $i < $rows; $i = $i + 4) {
+            ptr<const float64> $x0 = $a:$ + $i * $k;
+            ptr<const float64> $x1 = $x0:$ + $k;
+            ptr<const float64> $x2 = $x1:$ + $k;
+            ptr<const float64> $x3 = $x2:$ + $k;
+
+            for (usize $j = 0; $j < $cols; $j = $j + 2) {
+                ptr<const float64> $y0 = $b:$ + $j * $k;
+                ptr<const float64> $y1 = $y0:$ + $k;
+                simd<float64, 2> $s00 = simd::splat<float64, 2>(0.0);
+                simd<float64, 2> $s01 = $s00;
+                simd<float64, 2> $s10 = $s00;
+                simd<float64, 2> $s11 = $s00;
+                simd<float64, 2> $s20 = $s00;
+                simd<float64, 2> $s21 = $s00;
+                simd<float64, 2> $s30 = $s00;
+                simd<float64, 2> $s31 = $s00;
+
+                for (usize $p = 0; $p < $even; $p = $p + 2) {
+                    simd<float64, 2> $u0 = simd::load<float64, 2>($x0:$ + $p);
+                    simd<float64, 2> $u1 = simd::load<float64, 2>($x1:$ + $p);
+                    simd<float64, 2> $u2 = simd::load<float64, 2>($x2:$ + $p);
+                    simd<float64, 2> $u3 = simd::load<float64, 2>($x3:$ + $p);
+                    simd<float64, 2> $v0 = simd::load<float64, 2>($y0:$ + $p);
+                    simd<float64, 2> $v1 = simd::load<float64, 2>($y1:$ + $p);
+                    $s00 = $s00 + $u0 * $v0;
+                    $s01 = $s01 + $u0 * $v1;
+                    $s10 = $s10 + $u1 * $v0;
+                    $s11 = $s11 + $u1 * $v1;
+                    $s20 = $s20 + $u2 * $v0;
+                    $s21 = $s21 + $u2 * $v1;
+                    $s30 = $s30 + $u3 * $v0;
+                    $s31 = $s31 + $u3 * $v1;
+                }
+
+                usize $at = $i * $m + $j;
+                $this->data[$at] = Tensor::close($s00, $x0:$, $y0:$, $even, $k);
+                $this->data[$at + 1] = Tensor::close($s01, $x0:$, $y1:$, $even, $k);
+                $this->data[$at + $m] = Tensor::close($s10, $x1:$, $y0:$, $even, $k);
+                $this->data[$at + $m + 1] = Tensor::close($s11, $x1:$, $y1:$, $even, $k);
+                $this->data[$at + 2 * $m] = Tensor::close($s20, $x2:$, $y0:$, $even, $k);
+                $this->data[$at + 2 * $m + 1] = Tensor::close($s21, $x2:$, $y1:$, $even, $k);
+                $this->data[$at + 3 * $m] = Tensor::close($s30, $x3:$, $y0:$, $even, $k);
+                $this->data[$at + 3 * $m + 1] = Tensor::close($s31, $x3:$, $y1:$, $even, $k);
+            }
+        }
+
+        // odd right row of each block, then the rows below the blocks
+        for (usize $i = 0; $i < $n; $i++) {
+            usize $from = $cols;
+
+            if ($i >= $rows) {
+                $from = 0;
+            }
+
+            for (usize $j = $from; $j < $m; $j++) {
+                $this->data[$i * $m + $j] = Tensor::inner($a:$ + $i * $k, $b:$ + $j * $k, $k);
+            }
+        }
+    }
+
+    /**
+     * Dot of `$count` values at `$x` and `$y`, summed in four independent
+     * pairs of lanes so the adds do not wait on each other.
+     */
+    private static function inner(ptr<const float64> $x, ptr<const float64> $y, usize $count) : float64
+    {
+        simd<float64, 2> $s0 = simd::splat<float64, 2>(0.0);
+        simd<float64, 2> $s1 = $s0;
+        simd<float64, 2> $s2 = $s0;
+        simd<float64, 2> $s3 = $s0;
+        usize $p = 0;
+
+        while ($p + 8 <= $count) {
+            $s0 = $s0 + simd::load<float64, 2>($x:$ + $p) * simd::load<float64, 2>($y:$ + $p);
+            $s1 = $s1 + simd::load<float64, 2>($x:$ + ($p + 2)) * simd::load<float64, 2>($y:$ + ($p + 2));
+            $s2 = $s2 + simd::load<float64, 2>($x:$ + ($p + 4)) * simd::load<float64, 2>($y:$ + ($p + 4));
+            $s3 = $s3 + simd::load<float64, 2>($x:$ + ($p + 6)) * simd::load<float64, 2>($y:$ + ($p + 6));
+            $p = $p + 8;
+        }
+
+        return Tensor::close(($s0 + $s1) + ($s2 + $s3), $x:$, $y:$, $p, $count);
+    }
+
+    /**
+     * Both lanes of `$sum`, plus the products `$from`..`$to` at `$x` and
+     * `$y` that no vector covered.
+     */
+    private static function close(simd<float64, 2> $sum, ptr<const float64> $x, ptr<const float64> $y, usize $from, usize $to) : float64
+    {
+        float64[2] $lanes = simd::to_array<float64, 2>($sum);
+        float64 $total = $lanes[0] + $lanes[1];
+
+        for (usize $p = $from; $p < $to; $p++) {
+            $total = $total + $x:$[$p] * $y:$[$p];
+        }
+
+        return $total;
+    }
+
+    /**
+     * Add both lanes of `$v` into the two values at `$at`.
+     */
+    private static function deposit(ptr<float64> $at, simd<float64, 2> $v) : void
+    {
+        simd<float64, 2> $was = simd::load<float64, 2>($at:$ as ptr<const float64>);
+        simd::store<float64, 2>($at:$, $was + $v);
+    }
+
+    /**
+     * `[cols, rows]` transpose of the matrix view.
+     */
+    public const function transpose() : Tensor
+    {
+        usize $n = $this->rows();
+        usize $m = $this->cols();
+        array<usize> $shape = [$m, $n];
+        Tensor $out = Tensor($shape);
+
+        for (usize $i = 0; $i < $n; $i++) {
+            for (usize $j = 0; $j < $m; $j++) {
+                $out->data[$j * $n + $i] = $this->data[$i * $m + $j];
+            }
+        }
+
+        return $out;
+    }
+
+    public const function add(const Tensor& $other) : Tensor
+    {
+        $this->expectSize($other, 'add');
+        Tensor $out = $this;
+
+        foreach (0 .. $out->data->count() as $i) {
+            $out->data[$i] = $out->data[$i] + $other->data[$i];
+        }
+
+        return $out;
+    }
+
+    public const function sub(const Tensor& $other) : Tensor
+    {
+        $this->expectSize($other, 'sub');
+        Tensor $out = $this;
+
+        foreach (0 .. $out->data->count() as $i) {
+            $out->data[$i] = $out->data[$i] - $other->data[$i];
+        }
+
+        return $out;
+    }
+
+    /**
+     * Elementwise (Hadamard) product.
+     */
+    public const function mul(const Tensor& $other) : Tensor
+    {
+        $this->expectSize($other, 'mul');
+        Tensor $out = $this;
+
+        foreach (0 .. $out->data->count() as $i) {
+            $out->data[$i] = $out->data[$i] * $other->data[$i];
+        }
+
+        return $out;
+    }
+
+    public const function scale(float64 $factor) : Tensor
+    {
+        Tensor $out = $this;
+
+        foreach (0 .. $out->data->count() as $i) {
+            $out->data[$i] = $out->data[$i] * $factor;
+        }
+
+        return $out;
+    }
+
+    public const function map(function<float64(float64)> $f) : Tensor
+    {
+        Tensor $out = $this;
+
+        foreach (0 .. $out->data->count() as $i) {
+            $out->data[$i] = $f($out->data[$i]);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Add the `[1, cols]` row `$row` to every row. How a bias reaches a
+     * whole batch.
+     */
+    public const function addRow(const Tensor& $row) : Tensor
+    {
+        usize $cols = $this->cols();
+
+        if ($row->size() != $cols) {
+            die("ann::Tensor: a row of {$row->size()} values cannot broadcast over {$cols} columns");
+        }
+
+        usize $rows = $this->rows();
+        Tensor $out = $this;
+
+        // row by row rather than `$i % $cols` per value, so the loop vectorizes
+        for (usize $r = 0; $r < $rows; $r++) {
+            usize $base = $r * $cols;
+
+            for (usize $c = 0; $c < $cols; $c++) {
+                $out->data[$base + $c] = $out->data[$base + $c] + $row->data[$c];
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Column sums as one `[1, cols]` row, the reverse of `addRow`.
+     */
+    public const function sumRows() : Tensor
+    {
+        usize $rows = $this->rows();
+        usize $cols = $this->cols();
+        array<usize> $shape = [1, $cols];
+        Tensor $out = Tensor($shape);
+
+        for (usize $r = 0; $r < $rows; $r++) {
+            usize $base = $r * $cols;
+
+            for (usize $c = 0; $c < $cols; $c++) {
+                $out->data[$c] = $out->data[$c] + $this->data[$base + $c];
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Numerically stable softmax over each row.
+     */
+    public const function softmax() : Tensor
+    {
+        usize $rows = $this->rows();
+        usize $cols = $this->cols();
+        Tensor $out = $this;
+
+        for (usize $r = 0; $r < $rows; $r++) {
+            usize $base = $r * $cols;
+            float64 $peak = $this->peak($base, $cols);
+            float64 $total = 0.0;
+
+            for (usize $c = 0; $c < $cols; $c++) {
+                float64 $e = std::math::exp($this->data[$base + $c] - $peak);
+                $out->data[$base + $c] = $e;
+                $total = $total + $e;
+            }
+
+            for (usize $c = 0; $c < $cols; $c++) {
+                $out->data[$base + $c] = $out->data[$base + $c] / $total;
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * log of the softmax over each row:
+     * `x - max - log(sum(exp(x - max)))`, so no probability underflows to
+     * a log of zero. What a policy needs.
+     */
+    public const function logSoftmax() : Tensor
+    {
+        usize $rows = $this->rows();
+        usize $cols = $this->cols();
+        Tensor $out = $this;
+
+        for (usize $r = 0; $r < $rows; $r++) {
+            usize $base = $r * $cols;
+            float64 $peak = $this->peak($base, $cols);
+            float64 $total = 0.0;
+
+            for (usize $c = 0; $c < $cols; $c++) {
+                $total = $total + std::math::exp($this->data[$base + $c] - $peak);
+            }
+
+            float64 $shift = $peak + std::math::log($total);
+
+            for (usize $c = 0; $c < $cols; $c++) {
+                $out->data[$base + $c] = $this->data[$base + $c] - $shift;
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Largest of the `$cols` values from `$base`. What a row's softmax
+     * subtracts before exponentiating, so nothing overflows.
+     */
+    private const function peak(usize $base, usize $cols) : float64
+    {
+        float64 $peak = $this->data[$base];
+
+        for (usize $c = 1; $c < $cols; $c++) {
+            $peak = std::math::max($peak, $this->data[$base + $c]);
+        }
+
+        return $peak;
+    }
+
+    /**
+     * One column drawn per row, row values as probabilities. The actions a
+     * stochastic policy takes. Values should be non-negative and sum to
+     * one per row; rounding slack falls to the last column.
+     */
+    public const function sample(Random& $rng) : array<usize>
+    {
+        usize $rows = $this->rows();
+        usize $cols = $this->cols();
+        array<usize> $out = arr::room<usize>($rows);
+
+        for (usize $r = 0; $r < $rows; $r++) {
+            usize $base = $r * $cols;
+            float64 $draw = $rng->uniform();
+            usize $pick = $cols - 1;
+
+            for (usize $c = 0; $c < $cols; $c++) {
+                $draw = $draw - $this->data[$base + $c];
+
+                if ($draw < 0.0) {
+                    $pick = $c;
+                    break;
+                }
+            }
+
+            $out[] = $pick;
+        }
+
+        return $out;
+    }
+
+    /**
+     * Column of the largest value in each row: predicted class per sample.
+     */
+    public const function argmax() : array<usize>
+    {
+        usize $rows = $this->rows();
+        usize $cols = $this->cols();
+        array<usize> $out = arr::room<usize>($rows);
+
+        for (usize $r = 0; $r < $rows; $r++) {
+            usize $best = 0;
+            usize $base = $r * $cols;
+
+            for (usize $c = 1; $c < $cols; $c++) {
+                if ($this->data[$base + $c] > $this->data[$base + $best]) {
+                    $best = $c;
+                }
+            }
+
+            $out[] = $best;
+        }
+
+        return $out;
+    }
+
+    public const function sum() : float64
+    {
+        float64 $total = 0.0;
+
+        foreach ($this->data as $v) {
+            $total = $total + $v;
+        }
+
+        return $total;
+    }
+
+    /**
+     * Sum of the elementwise products. `$t->dot($t)` is the squared L2.
+     */
+    public const function dot(const Tensor& $other) : float64
+    {
+        $this->expectSize($other, 'dot');
+        ptr<const float64> $x = $this->data->data();
+        ptr<const float64> $y = $other->data->data();
+        return Tensor::inner($x:$, $y:$, $this->size());
+    }
+
+    /**
+     * Mean of every value, zero for an empty tensor.
+     */
+    public const function mean() : float64
+    {
+        if ($this->data->count() == 0) {
+            return 0.0;
+        }
+
+        return $this->sum() / ($this->data->count() as float64);
+    }
+
+    public function fill(float64 $value) : void
+    {
+        foreach (0 .. $this->data->count() as $i) {
+            $this->data[$i] = $value;
+        }
+    }
+
+    /**
+     * Add `$other` in place. Layers use it to sum gradients into params.
+     */
+    public function accumulate(const Tensor& $other) : void
+    {
+        $this->expectSize($other, 'accumulate');
+
+        foreach (0 .. $this->data->count() as $i) {
+            $this->data[$i] = $this->data[$i] + $other->data[$i];
+        }
+    }
+
+    /**
+     * Add transpose(`$left` `[n, k]`) times `$right` `[n, m]` into this
+     * `[k, m]`, in place. How a dense layer sums its weight gradient over
+     * a batch, without building the transpose or the product on the side.
+     */
+    public function accumulate(outer: const Tensor& $left, const Tensor& $right) : void
+    {
+        usize $n = $left->rows();
+        usize $k = $left->cols();
+        usize $m = $right->cols();
+
+        if ($right->rows() != $n || $this->size() != $k * $m) {
+            $l = Tensor::describe($left->shape);
+            $r = Tensor::describe($right->shape);
+            $mine = Tensor::describe($this->shape);
+            die("ann::Tensor: cannot accumulate the transpose of {$l} times {$r} into {$mine}");
+        }
+
+        // transpose is only a choice of strides: a row of it steps through $left by one
+        ptr<const float64> $a = $left->data->data();
+        $this->product($a:$, 1, $k, $right, $k, $n, $m);
+    }
+
+    /**
+     * Stop unless `$other` holds as many values as this tensor. `$op` names
+     * the operation in the message.
+     */
+    internal const function expectSize(const Tensor& $other, string $op) : void
+    {
+        if ($this->data->count() != $other->data->count()) {
+            $left = Tensor::describe($this->shape);
+            $right = Tensor::describe($other->shape);
+            die("ann::Tensor: {$op} needs equal sizes, got {$left} and {$right}");
+        }
+    }
+}

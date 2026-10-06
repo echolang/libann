@@ -1,0 +1,82 @@
+/**
+ * The world an agent acts in. Observations are `[1, features]`, actions
+ * are a fixed discrete set, and each step answers with a reward and
+ * whether the episode goes on.
+ *
+ * Everything in `ann::rl` talks through this. A game, a simulator or a
+ * business process plugs in by implementing four methods. Randomness
+ * belongs to the environment: seed it on construction so runs reproduce.
+ */
+
+namespace ann::rl;
+
+use ann::Tensor;
+
+/**
+ * How an episode stands after a step. After `terminated` there is no
+ * future to bootstrap from. After `truncated` there is; the clock just
+ * ran out.
+ */
+public enum Outcome
+{
+    case running;
+
+    /**
+     * A real end: pole fell, goal reached. The state after is worth
+     * nothing.
+     */
+    case terminated;
+
+    /**
+     * Cut off from outside, usually a step limit. The state after still
+     * has a value.
+     */
+    case truncated;
+
+    /**
+     * True for either ending.
+     */
+    public const function done() : bool
+    {
+        return $this != Outcome::running;
+    }
+}
+
+/**
+ * What an environment answers to an action.
+ */
+public struct Step
+{
+    /**
+     * After the action, `[1, features]`.
+     */
+    public Tensor $observation;
+
+    public float64 $reward;
+
+    public Outcome $outcome;
+}
+
+public interface Environment
+{
+    /**
+     * Start a new episode. Returns its first observation.
+     */
+    function reset() : Tensor;
+
+    /**
+     * Apply `$action`, one of `[0, actions())`. Only between a `reset` and
+     * the step whose outcome is done.
+     */
+    function step(usize $action) : Step;
+
+    /**
+     * Values per observation.
+     */
+    const function observations() : usize;
+
+    /**
+     * Number of discrete actions.
+     */
+    const function actions() : usize;
+}

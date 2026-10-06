@@ -1,0 +1,75 @@
+/**
+ * An `Activation` on every value. No params.
+ */
+
+namespace ann;
+
+public class Act : Layer
+{
+    public const Activation $activation;
+
+    private Tensor $input;
+    private Tensor $output;
+
+    init
+    {
+        array<usize> $empty = [0];
+        $this->input = Tensor($empty);
+        $this->output = Tensor($empty);
+    }
+
+    public static function decode(Decoder $in, Registry $registry) : result<Layer, ModelError>
+    {
+        uint8 $code = guard $in->u8() else ($e) {
+            return .error($e);
+        }
+
+        Activation $activation = guard Activation::from($code) else {
+            return .error(.badValue($code as uint64));
+        }
+
+        Layer $layer = Act($activation);
+        return .ok($layer);
+    }
+
+    public function forward(const Tensor& $input, Mode $mode) : Tensor
+    {
+        Tensor $out = $this->activation->map($input);
+
+        if ($mode == Mode::train) {
+            $this->input = $input;
+            $this->output = $out;
+        }
+
+        return $out;
+    }
+
+    public function backward(const Tensor& $gradient) : Tensor
+    {
+        return $this->activation->slope($this->input, $this->output, $gradient);
+    }
+
+    public const function params() : array<Param>
+    {
+        return array<Param>();
+    }
+
+    public function initialize(Random& $rng) : void
+    {
+    }
+
+    public const function kind() : string
+    {
+        return 'act';
+    }
+
+    public const function encode(Encoder $out) : void
+    {
+        $out->u8($this->activation->value());
+    }
+
+    public const function summary() : string
+    {
+        return "act {$this->activation}";
+    }
+}

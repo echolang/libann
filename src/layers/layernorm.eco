@@ -1,0 +1,180 @@
+/**
+ * Per sample: zero mean, unit variance over features, then learned
+ * `gamma` and `beta`. Same in train and infer, unlike batch norm. The
+ * normalisation of transformer blocks.
+ */
+
+namespace ann;
+
+public class LayerNorm : Layer
+{
+    /**
+     * Values per sample.
+     */
+    public const usize $features;
+
+    /**
+     * Added to the variance before the square root, so a constant sample
+     * stays finite.
+     */
+    public const float64 $epsilon = 0.00001;
+
+    /**
+     * Learned `[1, features]` scale, starts at one.
+     */
+    public Param $gamma;
+
+    /**
+     * Learned `[1, features]` shift, starts at zero.
+     */
+    public Param $beta;
+
+    private Tensor $normalized;
+    private array<float64> $inverseDeviation;
+
+    init
+    {
+        array<usize> $shape = [1, $this->features];
+        array<usize> $empty = [0, $this->features];
+
+        $this->gamma = Param('gamma', $shape);
+        $this->beta = Param('beta', $shape);
+        $this->gamma->value->fill(1.0);
+        $this->normalized = Tensor($empty);
+        $this->inverseDeviation = array<float64>();
+    }
+
+    public static function decode(Decoder $in, Registry $registry) : result<Layer, ModelError>
+    {
+        usize $features = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        float64 $epsilon = guard $in->f64() else ($e) {
+            return .error($e);
+        }
+
+        Layer $layer = LayerNorm($features, $epsilon);
+        return .ok($layer);
+    }
+
+    public function forward(const Tensor& $input, Mode $mode) : Tensor
+    {
+        usize $rows = $input->rows();
+        usize $cols = $input->cols();
+
+        if ($cols != $this->features) {
+            die("ann::LayerNorm: expected {$this->features} values per sample, got {$cols}");
+        }
+
+        float64 $n = $cols as float64;
+        bool $train = $mode == Mode::train;
+        Tensor $out = $input;
+
+        // caches for backward are only kept, and only built, while training
+        if ($train) {
+            $this->normalized = $input;
+            $this->inverseDeviation = arr::room<float64>($rows);
+        }
+
+        for (usize $r = 0; $r < $rows; $r++) {
+            usize $base = $r * $cols;
+            float64 $mean = 0.0;
+
+            for (usize $c = 0; $c < $cols; $c++) {
+                $mean = $mean + $input->data[$base + $c];
+            }
+
+            $mean = $mean / $n;
+            float64 $variance = 0.0;
+
+            for (usize $c = 0; $c < $cols; $c++) {
+                float64 $d = $input->data[$base + $c] - $mean;
+                $variance = $variance + $d * $d;
+            }
+
+            float64 $inv = 1.0 / std::math::sqrt($variance / $n + $this->epsilon);
+
+            if ($train) {
+                $this->inverseDeviation[] = $inv;
+            }
+
+            for (usize $c = 0; $c < $cols; $c++) {
+                float64 $x = ($input->data[$base + $c] - $mean) * $inv;
+                $out->data[$base + $c] = $x * $this->gamma->value->data[$c] + $this->beta->value->data[$c];
+
+                if ($train) {
+                    $this->normalized->data[$base + $c] = $x;
+                }
+            }
+        }
+
+        return $out;
+    }
+
+    public function backward(const Tensor& $gradient) : Tensor
+    {
+        usize $rows = $gradient->rows();
+        usize $cols = $gradient->cols();
+        float64 $n = $cols as float64;
+        Tensor $out = $gradient;
+
+        for (usize $r = 0; $r < $rows; $r++) {
+            usize $base = $r * $cols;
+            float64 $meanSlope = 0.0;
+            float64 $meanSlopeX = 0.0;
+
+            for (usize $c = 0; $c < $cols; $c++) {
+                float64 $g = $gradient->data[$base + $c];
+                float64 $x = $this->normalized->data[$base + $c];
+                float64 $slope = $g * $this->gamma->value->data[$c];
+
+                $this->gamma->grad->data[$c] = $this->gamma->grad->data[$c] + $g * $x;
+                $this->beta->grad->data[$c] = $this->beta->grad->data[$c] + $g;
+                $meanSlope = $meanSlope + $slope;
+                $meanSlopeX = $meanSlopeX + $slope * $x;
+            }
+
+            $meanSlope = $meanSlope / $n;
+            $meanSlopeX = $meanSlopeX / $n;
+            float64 $inv = $this->inverseDeviation[$r];
+
+            for (usize $c = 0; $c < $cols; $c++) {
+                float64 $x = $this->normalized->data[$base + $c];
+                float64 $slope = $gradient->data[$base + $c] * $this->gamma->value->data[$c];
+                $out->data[$base + $c] = $inv * ($slope - $meanSlope - $x * $meanSlopeX);
+            }
+        }
+
+        return $out;
+    }
+
+    public const function params() : array<Param>
+    {
+        array<Param> $all = [$this->gamma, $this->beta];
+        return $all;
+    }
+
+    public function initialize(Random& $rng) : void
+    {
+        $this->gamma->value->fill(1.0);
+        $this->beta->value->fill(0.0);
+    }
+
+    public const function kind() : string
+    {
+        return 'layernorm';
+    }
+
+    public const function encode(Encoder $out) : void
+    {
+        $out->size($this->features);
+        $out->f64($this->epsilon);
+    }
+
+    public const function summary() : string
+    {
+        usize $count = 2 * $this->features;
+        return "layernorm {$this->features} ({$count} params)";
+    }
+}

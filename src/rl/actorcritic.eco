@@ -1,0 +1,125 @@
+/**
+ * Policy gradient: raise the probability of actions that turned out
+ * better than expected, lower the rest.
+ *
+ * `Reinforce` measures "better" by the discounted return, policy only.
+ * `ActorCritic` measures it against a critic with GAE: faster, for the
+ * price of a second network. Both learn from a `Rollout` of the current
+ * policy and expect it cleared afterwards.
+ */
+
+namespace ann::rl;
+
+use ann::{Dataset, MeanSquaredError, Model, Optimizer, Standardizer, Tensor};
+
+public class Reinforce
+{
+    public Policy $policy;
+
+    public Optimizer $optimizer;
+
+    /**
+     * Discount: how much a reward one step later is worth now.
+     */
+    public float64 $gamma = 0.99;
+
+    /**
+     * Weight of the entropy bonus that keeps the policy exploring.
+     */
+    public float64 $entropy = 0.0;
+
+    /**
+     * Standardise returns over the rollout first. Cheap baseline that
+     * takes out most of REINFORCE's variance.
+     */
+    public bool $normalize = true;
+
+    /**
+     * Global gradient-norm cap. 0 is none.
+     */
+    public float64 $clip = 0.0;
+
+    /**
+     * One policy gradient step on everything in `$rollout`.
+     */
+    public function update(const Rollout& $rollout) : Report
+    {
+        Tensor $returns = $rollout->returns($this->gamma);
+
+        if ($this->normalize) {
+            $returns = standardize($returns);
+        }
+
+        return $this->policy->improve($rollout->transitions(), $returns, $this->entropy, $this->optimizer, $this->clip);
+    }
+}
+
+public class ActorCritic
+{
+    /**
+     * The actor.
+     */
+    public Policy $policy;
+
+    /**
+     * Observations in, one value out: what the rest of the episode is
+     * worth.
+     */
+    public Model $critic;
+
+    public Optimizer $policyOptimizer;
+
+    public Optimizer $criticOptimizer;
+
+    /**
+     * Discount: how much a reward one step later is worth now.
+     */
+    public float64 $gamma = 0.99;
+
+    /**
+     * GAE trade-off: 0 trusts the critic after one step, 1 uses the whole
+     * return (REINFORCE with a learned baseline).
+     */
+    public float64 $lambda = 0.95;
+
+    /**
+     * Weight of the entropy bonus that keeps the policy exploring.
+     */
+    public float64 $entropy = 0.01;
+
+    /**
+     * Standardise advantages over the rollout.
+     */
+    public bool $normalize = true;
+
+    /**
+     * Global gradient-norm cap for both networks. 0 is none.
+     */
+    public float64 $clip = 0.5;
+
+    /**
+     * One step for the policy and one for the critic on `$rollout`.
+     */
+    public function update(const Rollout& $rollout) : Report
+    {
+        Transitions $batch = $rollout->transitions();
+        Estimate $estimate = $rollout->estimate($batch, $this->critic, $this->gamma, $this->lambda);
+        Tensor $advantages = $estimate->advantages;
+
+        if ($this->normalize) {
+            $advantages = standardize($advantages);
+        }
+
+        Report $report = $this->policy->improve($batch, $advantages, $this->entropy, $this->policyOptimizer, $this->clip);
+        $report->value = $this->critic->learn(Dataset($batch->states, $estimate->returns), MeanSquaredError(), $this->criticOptimizer, $this->clip);
+        return $report;
+    }
+}
+
+/**
+ * `$column` to zero mean, unit deviation.
+ */
+internal function standardize(const Tensor& $column) : Tensor
+{
+    return Standardizer(fit: $column)->transform($column);
+}

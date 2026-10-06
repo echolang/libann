@@ -1,0 +1,127 @@
+/**
+ * A chain of layers, itself a `Layer`, so chains nest.
+ *
+ *     $net = Sequential()
+ *         ->add(Dense(2, 8))
+ *         ->add(Act(.tanh))
+ *         ->add(Dense(8, 1))
+ *         ->add(Act(.sigmoid));
+ */
+
+namespace ann;
+
+public class Sequential : Layer
+{
+    /**
+     * In run order. Append with `add`, or pass them at construction:
+     * `Sequential($layers: [$dense, $act])`.
+     */
+    public array<Layer> $layers = array<Layer>();
+
+    public static function decode(Decoder $in, Registry $registry) : result<Layer, ModelError>
+    {
+        usize $count = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        $chain = Sequential();
+
+        for (usize $i = 0; $i < $count; $i++) {
+            Layer $child = guard $registry->decode($in) else ($e) {
+                return .error($e);
+            }
+
+            $chain->add($child);
+        }
+
+        Layer $layer = $chain;
+        return .ok($layer);
+    }
+
+    /**
+     * Append `$layer`. Returns `$this` so calls chain.
+     */
+    public function add(Layer $layer) : Sequential
+    {
+        $this->layers[] = $layer;
+        return $this;
+    }
+
+    public function forward(const Tensor& $input, Mode $mode) : Tensor
+    {
+        if ($this->layers->count() == 0) {
+            return $input;
+        }
+
+        Tensor $x = $this->layers[0]->forward($input, $mode);
+
+        for (usize $i = 1; $i < $this->layers->count(); $i++) {
+            $x = $this->layers[$i]->forward($x, $mode);
+        }
+
+        return $x;
+    }
+
+    public function backward(const Tensor& $gradient) : Tensor
+    {
+        usize $i = $this->layers->count();
+
+        if ($i == 0) {
+            return $gradient;
+        }
+
+        $i = $i - 1;
+        Tensor $g = $this->layers[$i]->backward($gradient);
+
+        while ($i > 0) {
+            $i = $i - 1;
+            $g = $this->layers[$i]->backward($g);
+        }
+
+        return $g;
+    }
+
+    public const function params() : array<Param>
+    {
+        array<Param> $all = array<Param>();
+
+        foreach ($this->layers as $layer) {
+            $all->extend($layer->params());
+        }
+
+        return $all;
+    }
+
+    public function initialize(Random& $rng) : void
+    {
+        foreach ($this->layers as $layer) {
+            $layer->initialize($rng);
+        }
+    }
+
+    public const function kind() : string
+    {
+        return 'sequential';
+    }
+
+    public const function encode(Encoder $out) : void
+    {
+        $out->size($this->layers->count());
+
+        foreach ($this->layers as $layer) {
+            $out->layer($layer);
+        }
+    }
+
+    public const function summary() : string
+    {
+        string $out = 'sequential';
+
+        foreach ($this->layers as $layer) {
+            $out->append("\n");
+            $out->append(indent($layer->summary()));
+        }
+
+        return $out;
+    }
+}

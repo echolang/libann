@@ -1,0 +1,229 @@
+/**
+ * Samples, targets and per-sample weights, kept side by side so shuffle,
+ * batch and split never pull them apart.
+ *
+ * This is also where a batch's loss is reduced: `loss` and `gradient`
+ * weight each sample and average over rows. Default weight is 1, the
+ * plain batch mean. Other weights are how RL talks to a loss: an
+ * advantage per sample, an importance weight for prioritised replay.
+ */
+
+namespace ann;
+
+public struct Dataset
+{
+    /**
+     * One sample per row.
+     */
+    public Tensor $inputs;
+
+    /**
+     * One target per row, same order as `inputs`.
+     */
+    public Tensor $targets;
+
+    /**
+     * `[rows, 1]`. Any real number: negative weights push a sample's loss
+     * up instead of down.
+     */
+    public Tensor $weights;
+
+    /**
+     * Pair `$inputs` with `$targets`, every sample weighted one. Both must
+     * have the same number of rows.
+     */
+    public constructor(const Tensor& $inputs, const Tensor& $targets)
+    {
+        if ($inputs->rows() != $targets->rows()) {
+            die("ann::Dataset: {$inputs->rows()} inputs but {$targets->rows()} targets");
+        }
+
+        array<usize> $shape = [$inputs->rows(), 1];
+        $this->inputs = $inputs;
+        $this->targets = $targets;
+        $this->weights = Tensor($shape, fill: 1.0);
+    }
+
+    /**
+     * Same pairing, each sample weighted by the matching row of `$weights`.
+     */
+    public constructor(const Tensor& $inputs, const Tensor& $targets, weights: const Tensor& $weights)
+    {
+        if ($inputs->rows() != $targets->rows()) {
+            die("ann::Dataset: {$inputs->rows()} inputs but {$targets->rows()} targets");
+        }
+
+        if ($weights->size() != $inputs->rows()) {
+            die("ann::Dataset: {$inputs->rows()} inputs but {$weights->size()} weights");
+        }
+
+        array<usize> $shape = [$inputs->rows(), 1];
+        $this->inputs = $inputs;
+        $this->targets = $targets;
+        $this->weights = $weights->reshape($shape);
+    }
+
+    private constructor(Tensor $inputs, Tensor $targets, Tensor $weights)
+    {
+        $this->inputs = mv $inputs;
+        $this->targets = mv $targets;
+        $this->weights = mv $weights;
+    }
+
+    public const function count() : usize
+    {
+        return $this->inputs->rows();
+    }
+
+    /**
+     * Samples at `$indices`, in that order.
+     */
+    public const function batch(const array<usize>& $indices) : Dataset
+    {
+        return Dataset($this->inputs->gather($indices), $this->targets->gather($indices), $this->weights->gather($indices));
+    }
+
+    /**
+     * Weighted mean loss: `sum(weight * loss) / rows`. Mean is over rows,
+     * not over the weights, so advantages that cancel still mean something.
+     */
+    public const function loss(Loss $loss, const Tensor& $output) : float64
+    {
+        $this->expectRows($output);
+        float64 $total = $loss->losses($output, $this->targets)->mul($this->weights)->sum();
+        return $total / std::math::max($output->rows() as float64, 1.0);
+    }
+
+    /**
+     * d(loss)/d(output), the tensor a backward pass starts from.
+     */
+    public const function gradient(Loss $loss, const Tensor& $output) : Tensor
+    {
+        $this->expectRows($output);
+        float64 $rows = std::math::max($output->rows() as float64, 1.0);
+        return $loss->gradients($output, $this->targets)->weigh($this->weights)->scale(1.0 / $rows);
+    }
+
+    /**
+     * Shuffled split: `$fraction` of the samples go to `holdout`, the rest
+     * to `train`.
+     */
+    public const function split(float64 $fraction, uint64 $seed = 1) : DatasetSplit
+    {
+        $rng = Random($seed);
+        $order = Batches($this->count());
+        $order->shuffle($rng);
+
+        usize $held = (($this->count() as float64) * $fraction) as usize;
+        array<usize> $holdout = arr::room<usize>($held);
+        array<usize> $train = arr::room<usize>($this->count() - $held);
+
+        foreach ($order->order as $i => $index) {
+            usize $sample = $index;
+
+            if ($i < $held) {
+                $holdout[] = $sample;
+            } else {
+                $train[] = $sample;
+            }
+        }
+
+        return DatasetSplit($this->batch($train), $this->batch($holdout));
+    }
+
+    private const function expectRows(const Tensor& $output) : void
+    {
+        if ($output->rows() != $this->count()) {
+            die("ann::Dataset: an output of {$output->rows()} rows for {$this->count()} samples");
+        }
+    }
+}
+
+/**
+ * The two halves `Dataset::split` hands back.
+ */
+public struct DatasetSplit
+{
+    public Dataset $train;
+
+    public Dataset $holdout;
+}
+
+/**
+ * Zero mean, unit deviation per column. Fit on training data, then apply
+ * unchanged to everything else.
+ */
+public struct Standardizer
+{
+    /**
+     * `[1, cols]` column means.
+     */
+    public Tensor $mean;
+
+    /**
+     * `[1, cols]` column deviations, never zero.
+     */
+    public Tensor $deviation;
+
+    /**
+     * Learn the column statistics of `$data`.
+     */
+    public constructor(fit: const Tensor& $data)
+    {
+        float64 $rows = std::math::max($data->rows() as float64, 1.0);
+        Tensor $mean = $data->sumRows()->scale(1.0 / $rows);
+        Tensor $deviation = Tensor($mean->shape);
+        usize $cols = $data->cols();
+
+        foreach (0 .. $data->data->count() as $i) {
+            usize $c = $i % $cols;
+            float64 $d = $data->data[$i] - $mean->data[$c];
+            $deviation->data[$c] = $deviation->data[$c] + $d * $d;
+        }
+
+        foreach (0 .. $cols as $c) {
+            float64 $sd = std::math::sqrt($deviation->data[$c] / $rows);
+
+            if ($sd < 0.000000001) {
+                $sd = 1.0;
+            }
+
+            $deviation->data[$c] = $sd;
+        }
+
+        $this->mean = $mean;
+        $this->deviation = $deviation;
+    }
+
+    /**
+     * Scale `$data` with the learned statistics.
+     */
+    public const function transform(const Tensor& $data) : Tensor
+    {
+        usize $cols = $this->mean->size();
+        Tensor $out = $data;
+
+        foreach (0 .. $out->data->count() as $i) {
+            usize $c = $i % $cols;
+            $out->data[$i] = ($data->data[$i] - $this->mean->data[$c]) / $this->deviation->data[$c];
+        }
+
+        return $out;
+    }
+
+    /**
+     * Inverse of `transform`, back to the original units.
+     */
+    public const function restore(const Tensor& $data) : Tensor
+    {
+        usize $cols = $this->mean->size();
+        Tensor $out = $data;
+
+        foreach (0 .. $out->data->count() as $i) {
+            usize $c = $i % $cols;
+            $out->data[$i] = $data->data[$i] * $this->deviation->data[$c] + $this->mean->data[$c];
+        }
+
+        return $out;
+    }
+}

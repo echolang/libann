@@ -1,0 +1,220 @@
+use ann::{Act, Dense, Dropout, LayerNorm, Model, Registry, Residual, Sequential, Softmax, Tensor};
+
+internal function deepNet() : Sequential
+{
+    $block = Sequential()
+        ->add(Dense(8, 8))
+        ->add(LayerNorm(8))
+        ->add(Act(.gelu));
+
+    return Sequential()
+        ->add(Dense(3, 8, .he))
+        ->add(Act(.relu))
+        ->add(Residual($block))
+        ->add(Dropout(0.2))
+        ->add(Dense(8, 4))
+        ->add(Softmax());
+}
+
+internal function samePredictions(Model $a, Model $b, const Tensor& $x) : bool
+{
+    return identical($a->predict($x), $b->predict($x));
+}
+
+#[group: "persistence"]
+test model_round_trips_bit_identically
+{
+    $model = Model(deepNet(), $seed: 5);
+    $bytes = $model->encode();
+
+    Model $back = guard Model::decode($bytes) else ($e) {
+        assert(false, 'decode failed');
+        return;
+    }
+
+    assert(samePredictions($model, $back, noise(shape(6, 3), 1)));
+    assert($back->summary() == $model->summary());
+    assert($back->encode() == $bytes);
+}
+
+#[group: "persistence"]
+test weights_load_into_a_fresh_network
+{
+    $trained = Model(deepNet(), $seed: 5);
+    $fresh = Model(deepNet(), $seed: 99);
+    $x = noise(shape(4, 3), 2);
+    assert(!samePredictions($trained, $fresh, $x));
+
+    guard $fresh->restore($trained->weights()) else ($e) {
+        assert(false, 'restore failed');
+        return;
+    }
+
+    assert(samePredictions($trained, $fresh, $x));
+}
+
+#[group: "persistence"]
+test files_round_trip
+{
+    $dir = std::env::tmp();
+    $modelPath = "{$dir}/libann-test-model.ann";
+    $weightsPath = "{$dir}/libann-test-weights.ann";
+    $model = Model(deepNet(), $seed: 8);
+
+    guard $model->save($modelPath) else ($e) {
+        assert(false, 'save failed');
+        return;
+    }
+
+    guard $model->saveWeights($weightsPath) else ($e) {
+        assert(false, 'saveWeights failed');
+        return;
+    }
+
+    Model $loaded = guard Model::load($modelPath) else ($e) {
+        assert(false, 'load failed');
+        return;
+    }
+
+    $other = Model(deepNet(), $seed: 1);
+
+    guard $other->loadWeights($weightsPath) else ($e) {
+        assert(false, 'loadWeights failed');
+        return;
+    }
+
+    $x = noise(shape(3, 3), 3);
+    assert(samePredictions($model, $loaded, $x));
+    assert(samePredictions($model, $other, $x));
+
+    std::io::remove($modelPath);
+    std::io::remove($weightsPath);
+}
+
+#[group: "persistence"]
+test loading_refuses_the_wrong_architecture
+{
+    $model = Model(deepNet());
+    $wider = Model(Sequential()->add(Dense(3, 9))->add(Dense(9, 4)));
+    $smaller = Model(Sequential()->add(Dense(3, 4)));
+
+    $mismatch = $wider->restore($model->weights());
+    assert($mismatch->failed() && tag($mismatch->failure()) == 'paramCount');
+
+    $sameCount = Model(Sequential()->add(Dense(3, 4))->add(Dense(4, 4)));
+    $shaped = Model(Sequential()->add(Dense(3, 5))->add(Dense(5, 4)));
+    $wrongShape = $shaped->restore($sameCount->weights());
+    assert($wrongShape->failed() && tag($wrongShape->failure()) == 'shapeMismatch');
+
+    // a refused load leaves the weights alone
+    $before = $smaller->weights();
+    $smaller->restore($model->weights());
+    assert($smaller->weights() == $before);
+}
+
+#[group: "persistence"]
+test loading_refuses_bad_bytes
+{
+    $model = Model(deepNet());
+    $bytes = $model->encode();
+
+    $asWeights = $model->restore($bytes);
+    assert($asWeights->failed() && tag($asWeights->failure()) == 'badMagic');
+
+    $asModel = Model::decode($model->weights());
+    assert($asModel->failed() && tag($asModel->failure()) == 'badMagic');
+
+    $cut = Model::decode($bytes->sub(0, $bytes->size() - 5));
+    assert($cut->failed() && tag($cut->failure()) == 'truncated');
+
+    string $future = $bytes->sub(0, 4);
+    $future->push(9 as uint8);
+    $future->append($bytes->sub(5, $bytes->size() - 5));
+    $versioned = Model::decode($future);
+    assert($versioned->failed() && tag($versioned->failure()) == 'unsupportedVersion');
+
+    $missing = Model::load('/nonexistent/libann/model.ann');
+    assert($missing->failed() && tag($missing->failure()) == 'io');
+}
+
+#[group: "persistence"]
+test custom_layers_need_registering
+{
+    $net = Sequential()->add(Dense(2, 3))->add(Scale(3))->add(Dense(3, 1));
+    $model = Model($net, $seed: 4);
+    $bytes = $model->encode();
+
+    $unknown = Model::decode($bytes);
+    assert($unknown->failed() && tag($unknown->failure()) == 'unknownLayer');
+
+    Model $back = guard Model::decode($bytes, scaleRegistry()) else ($e) {
+        assert(false, 'decode with the custom registry failed');
+        return;
+    }
+
+    assert(samePredictions($model, $back, noise(shape(5, 2), 4)));
+    assert(scaleRegistry()->has('scale') && !Registry()->has('scale'));
+}
+
+#[group: "persistence"]
+test copy_makes_a_target_network
+{
+    $online = Model(deepNet(), $seed: 5);
+    $target = Model(deepNet(), $seed: 6);
+    $x = noise(shape(4, 3), 5);
+    assert(!samePredictions($online, $target, $x));
+
+    guard $target->copy($online) else ($e) {
+        assert(false, 'copy failed');
+        return;
+    }
+
+    assert(samePredictions($online, $target, $x));
+
+    // a copy, not a share: changing the source leaves the target alone
+    $first = $online->params()[0];
+    $first->value->data[0] = 42.0;
+    assert($target->params()[0]->value->data[0] != 42.0);
+
+    $wrong = Model(Sequential()->add(Dense(3, 4)));
+    $refused = $wrong->copy($online);
+    assert($refused->failed() && tag($refused->failure()) == 'paramCount');
+}
+
+#[group: "persistence"]
+test blend_moves_part_of_the_way
+{
+    $a = Model(Sequential()->add(Dense(2, 2)), $seed: 1);
+    $b = Model(Sequential()->add(Dense(2, 2)), $seed: 2);
+    float64 $before = $a->params()[0]->value->data[0];
+    float64 $towards = $b->params()[0]->value->data[0];
+
+    guard $a->blend($b, 0.25) else ($e) {
+        assert(false, 'blend failed');
+        return;
+    }
+
+    float64 $after = $a->params()[0]->value->data[0];
+    assert(near($after, 0.75 * $before + 0.25 * $towards));
+
+    $shaped = Model(Sequential()->add(Dense(2, 3)));
+    $refused = $shaped->blend($a, 0.5);
+    assert($refused->failed() && tag($refused->failure()) == 'shapeMismatch');
+}
+
+#[group: "persistence"]
+test clone_is_independent
+{
+    $model = Model(deepNet(), $seed: 5);
+
+    Model $twin = guard $model->clone() else ($e) {
+        assert(false, 'clone failed');
+        return;
+    }
+
+    $x = noise(shape(3, 3), 6);
+    assert(samePredictions($model, $twin, $x));
+    $first = $twin->params()[0];
+    $first->value->data[0] = 42.0;
+    assert(!samePredictions($model, $twin, $x));
+}

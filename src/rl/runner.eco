@@ -1,0 +1,96 @@
+/**
+ * Drives an environment one step at a time: current observation,
+ * automatic resets, return of every finished episode.
+ *
+ *     $runner = Runner(CartPole());
+ *
+ *     for (usize $i = 0; $i < 10000; $i++) {
+ *         Transition $t = $runner->step($agent->act($runner->observation, $epsilon, $rng));
+ *         $replay->add($t);
+ *     }
+ *
+ *     echo "last 20 episodes: {$runner->mean(20)}";
+ */
+
+namespace ann::rl;
+
+use ann::Tensor;
+
+public class Runner
+{
+    public Environment $environment;
+
+    /**
+     * Total reward of every finished episode, oldest first.
+     */
+    public array<float64> $episodes = array<float64>();
+
+    /**
+     * Steps taken so far, over all episodes.
+     */
+    public usize $steps = 0;
+
+    /**
+     * Observation the next action should be chosen from, `[1, features]`.
+     * `step` writes it; everyone else reads it.
+     */
+    public Tensor $observation;
+
+    private float64 $running;
+
+    init
+    {
+        $this->observation = $this->environment->reset();
+        $this->running = 0.0;
+    }
+
+    /**
+     * Apply `$action`. When the step ends the episode, the return is
+     * recorded and the environment reset, so the next `observation` is the
+     * first of a new episode.
+     */
+    public function step(usize $action) : Transition
+    {
+        Step $s = $this->environment->step($action);
+        $t = Transition($this->observation, $action, $s->reward, $s->observation, $s->outcome);
+        $this->steps = $this->steps + 1;
+        $this->running = $this->running + $s->reward;
+
+        if ($s->outcome->done()) {
+            $this->episodes[] = $this->running;
+            $this->running = 0.0;
+            $this->observation = $this->environment->reset();
+        } else {
+            $this->observation = $s->observation;
+        }
+
+        return $t;
+    }
+
+    /**
+     * Mean return of the last `$last` finished episodes (fewer if fewer
+     * have finished). Zero before the first.
+     */
+    public const function mean(usize $last) : float64
+    {
+        usize $n = $this->episodes->count();
+
+        if ($n == 0 || $last == 0) {
+            return 0.0;
+        }
+
+        usize $from = 0;
+
+        if ($n > $last) {
+            $from = $n - $last;
+        }
+
+        float64 $total = 0.0;
+
+        for (usize $i = $from; $i < $n; $i++) {
+            $total = $total + $this->episodes[$i];
+        }
+
+        return $total / (($n - $from) as float64);
+    }
+}

@@ -1,0 +1,235 @@
+use ann::{Decoder, Encoder, Layer, Loss, Mode, ModelError, Param, Random, Registry, Tensor};
+
+internal function noise(const array<usize>& $shape, uint64 $seed) : Tensor
+{
+    $t = Tensor($shape);
+    $rng = Random($seed);
+
+    foreach (0 .. $t->data->count() as $i) {
+        $t->data[$i] = $rng->uniform(-1.0, 1.0);
+    }
+
+    return $t;
+}
+
+internal function near(float64 $a, float64 $b, float64 $tolerance = 0.000000001) : bool
+{
+    return std::math::abs($a - $b) <= $tolerance;
+}
+
+// tensors compared value by value; arrays have no ==
+internal function identical(const Tensor& $a, const Tensor& $b, float64 $tolerance = 0.0) : bool
+{
+    if (!$a->sameShape($b)) {
+        return false;
+    }
+
+    foreach (0 .. $a->data->count() as $i) {
+        if (!near($a->data[$i], $b->data[$i], $tolerance)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+internal function relativeError(float64 $a, float64 $b) : float64
+{
+    return std::math::abs($a - $b) / std::math::max(1.0, std::math::abs($a) + std::math::abs($b));
+}
+
+// scalar sum(forward(x) * r); its gradient w.r.t. the output is r
+internal function probe(Layer $layer, const Tensor& $x, const Tensor& $r) : float64
+{
+    return $layer->forward($x, .train)->mul($r)->sum();
+}
+
+/**
+ * Worst relative error between what `backward` reports (input and every
+ * param) and central finite differences of the forward pass.
+ */
+internal function gradientError(Layer $layer, const Tensor& $x) : float64
+{
+    float64 $h = 0.000001;
+    Tensor $out = $layer->forward($x, .train);
+    Tensor $r = noise($out->shape, 99);
+    array<Param> $params = $layer->params();
+
+    foreach ($params as $p) {
+        $p->zeroGrad();
+    }
+
+    $layer->forward($x, .train);
+    Tensor $dx = $layer->backward($r);
+    float64 $worst = 0.0;
+
+    foreach (0 .. $x->data->count() as $i) {
+        Tensor $up = $x;
+        Tensor $down = $x;
+        $up->data[$i] = $x->data[$i] + $h;
+        $down->data[$i] = $x->data[$i] - $h;
+        float64 $numeric = (probe($layer, $up, $r) - probe($layer, $down, $r)) / (2.0 * $h);
+        $worst = std::math::max($worst, relativeError($numeric, $dx->data[$i]));
+    }
+
+    foreach ($params as $param) {
+        Param $p = $param;
+
+        for (usize $i = 0; $i < $p->size(); $i++) {
+            float64 $held = $p->value->data[$i];
+            $p->value->data[$i] = $held + $h;
+            float64 $plus = probe($layer, $x, $r);
+            $p->value->data[$i] = $held - $h;
+            float64 $minus = probe($layer, $x, $r);
+            $p->value->data[$i] = $held;
+            float64 $numeric = ($plus - $minus) / (2.0 * $h);
+            $worst = std::math::max($worst, relativeError($numeric, $p->grad->data[$i]));
+        }
+    }
+
+    return $worst;
+}
+
+/**
+ * Worst relative error between a loss's per-sample gradients and central
+ * finite differences of the per-sample losses. Each sample's loss only
+ * depends on its own outputs, so the sum of all losses checks every
+ * gradient at once.
+ */
+internal function lossGradientError(Loss $loss, const Tensor& $output, const Tensor& $target) : float64
+{
+    float64 $h = 0.000001;
+    Tensor $analytic = $loss->gradients($output, $target);
+    float64 $worst = 0.0;
+
+    foreach (0 .. $output->data->count() as $i) {
+        Tensor $up = $output;
+        Tensor $down = $output;
+        $up->data[$i] = $output->data[$i] + $h;
+        $down->data[$i] = $output->data[$i] - $h;
+        float64 $numeric = ($loss->losses($up, $target)->sum() - $loss->losses($down, $target)->sum()) / (2.0 * $h);
+        $worst = std::math::max($worst, relativeError($numeric, $analytic->data[$i]));
+    }
+
+    return $worst;
+}
+
+internal function initialized(Layer $layer, uint64 $seed = 3) : Layer
+{
+    $rng = Random($seed);
+    $layer->initialize($rng);
+    return $layer;
+}
+
+internal function shape(usize $rows, usize $cols) : array<usize>
+{
+    array<usize> $s = [$rows, $cols];
+    return $s;
+}
+
+// payload enums have no ==, so tests compare a tag
+internal function tag(const ModelError& $e) : string
+{
+    return match ($e) {
+        .io($cause) => 'io',
+        .badMagic => 'badMagic',
+        .unsupportedVersion($version) => 'unsupportedVersion',
+        .truncated => 'truncated',
+        .unknownLayer => 'unknownLayer',
+        .badValue($value) => 'badValue',
+        .paramCount($expected, $got) => 'paramCount',
+        .shapeMismatch($index) => 'shapeMismatch',
+    };
+}
+
+/**
+ * A layer the library knows nothing about: one learned scalar per
+ * feature. Proves the extension point.
+ */
+internal class Scale : Layer
+{
+    public const usize $features;
+    public Param $factor;
+    private Tensor $input;
+
+    init
+    {
+        array<usize> $s = [1, $this->features];
+        array<usize> $empty = [0, $this->features];
+        $this->factor = Param('factor', $s);
+        $this->input = Tensor($empty);
+    }
+
+    public static function decode(Decoder $in, Registry $registry) : result<Layer, ModelError>
+    {
+        usize $features = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        Layer $layer = Scale($features);
+        return .ok($layer);
+    }
+
+    public function forward(const Tensor& $input, Mode $mode) : Tensor
+    {
+        if ($mode == Mode::train) {
+            $this->input = $input;
+        }
+
+        Tensor $out = $input;
+
+        foreach (0 .. $out->data->count() as $i) {
+            $out->data[$i] = $input->data[$i] * $this->factor->value->data[$i % $this->features];
+        }
+
+        return $out;
+    }
+
+    public function backward(const Tensor& $gradient) : Tensor
+    {
+        Tensor $out = $gradient;
+
+        foreach (0 .. $out->data->count() as $i) {
+            usize $c = $i % $this->features;
+            $this->factor->grad->data[$c] = $this->factor->grad->data[$c] + $gradient->data[$i] * $this->input->data[$i];
+            $out->data[$i] = $gradient->data[$i] * $this->factor->value->data[$c];
+        }
+
+        return $out;
+    }
+
+    public const function params() : array<Param>
+    {
+        array<Param> $all = [$this->factor];
+        return $all;
+    }
+
+    public function initialize(Random& $rng) : void
+    {
+        foreach (0 .. $this->features as $c) {
+            $this->factor->value->data[$c] = $rng->uniform(0.5, 1.5);
+        }
+    }
+
+    public const function kind() : string
+    {
+        return 'scale';
+    }
+
+    public const function encode(Encoder $out) : void
+    {
+        $out->size($this->features);
+    }
+
+    public const function summary() : string
+    {
+        return "scale {$this->features}";
+    }
+}
+
+internal function scaleRegistry() : Registry
+{
+    return Registry()->add('scale', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
+        return Scale::decode($in, $r);
+    });
+}

@@ -1,0 +1,115 @@
+/**
+ * xoshiro256** seeded from splitmix64. Not for cryptography. Same seed,
+ * same network: weight init, shuffle and dropout all go through here.
+ */
+
+namespace ann;
+
+public struct Random
+{
+    private uint64 $s0;
+    private uint64 $s1;
+    private uint64 $s2;
+    private uint64 $s3;
+
+    /**
+     * Every seed, zero included, gives a usable state.
+     */
+    public constructor(uint64 $seed = 1)
+    {
+        uint64 $x = $seed;
+        $x = $x + 11400714819323198485;
+        $this->s0 = Random::mix($x);
+        $x = $x + 11400714819323198485;
+        $this->s1 = Random::mix($x);
+        $x = $x + 11400714819323198485;
+        $this->s2 = Random::mix($x);
+        $x = $x + 11400714819323198485;
+        $this->s3 = Random::mix($x);
+    }
+
+    private static function mix(uint64 $z) : uint64
+    {
+        uint64 $v = $z;
+        $v = ($v ^ ($v >> 30)) * 13787848793156543929;
+        $v = ($v ^ ($v >> 27)) * 10723151780598845931;
+        return $v ^ ($v >> 31);
+    }
+
+    private static function rotl(uint64 $x, uint64 $k) : uint64
+    {
+        return ($x << $k) | ($x >> (64 - $k));
+    }
+
+    /**
+     * Next 64 random bits.
+     */
+    public function next() : uint64
+    {
+        uint64 $out = Random::rotl($this->s1 * 5, 7) * 9;
+        uint64 $t = $this->s1 << 17;
+
+        $this->s2 = $this->s2 ^ $this->s0;
+        $this->s3 = $this->s3 ^ $this->s1;
+        $this->s1 = $this->s1 ^ $this->s2;
+        $this->s0 = $this->s0 ^ $this->s3;
+        $this->s2 = $this->s2 ^ $t;
+        $this->s3 = Random::rotl($this->s3, 45);
+
+        return $out;
+    }
+
+    /**
+     * Drawn evenly from `[$low, $high)`.
+     */
+    public function uniform(float64 $low = 0.0, float64 $high = 1.0) : float64
+    {
+        // the top 53 bits are exactly what a float64 mantissa can hold
+        float64 $unit = (($this->next() >> 11) as float64) * 0.00000000000000011102230246251565;
+        return $low + ($high - $low) * $unit;
+    }
+
+    /**
+     * Normal distribution, Box-Muller.
+     */
+    public function normal(float64 $mean = 0.0, float64 $deviation = 1.0) : float64
+    {
+        // 1 - uniform() is in (0, 1], so the log never sees zero
+        float64 $u1 = 1.0 - $this->uniform();
+        float64 $u2 = $this->uniform();
+        float64 $radius = std::math::sqrt(-2.0 * std::math::log($u1));
+        return $mean + $deviation * $radius * std::math::cos(std::math::TAU * $u2);
+    }
+
+    /**
+     * Integer from `[0, $bound)`. `$bound` must be at least one.
+     */
+    public function below(usize $bound) : usize
+    {
+        return ($this->next() % ($bound as uint64)) as usize;
+    }
+
+    /**
+     * True with probability `$p`.
+     */
+    public function chance(float64 $p) : bool
+    {
+        return $this->uniform() < $p;
+    }
+
+    /**
+     * Shuffle `$items` in place (Fisher-Yates).
+     */
+    public function shuffle(array<usize>& $items) : void
+    {
+        usize $i = $items->count();
+
+        while ($i > 1) {
+            usize $j = $this->below($i);
+            $i = $i - 1;
+            usize $held = $items[$i];
+            $items[$i] = $items[$j];
+            $items[$j] = $held;
+        }
+    }
+}

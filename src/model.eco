@@ -1,0 +1,446 @@
+/**
+ * A root `Layer` plus everything that works on the network as a whole.
+ * Supervised step is `learn`. When the gradient comes from somewhere else
+ * (a policy gradient, a TD error), do it by hand:
+ *
+ *     Tensor $out = $model->forward($inputs, .train);
+ *     $model->backward($gradientOfTheObjective);
+ *     $model->step($optimizer, $clip: 0.5);
+ *
+ * `copy`, `blend` and `clone` keep a second network in sync, the way DQN
+ * keeps its target. Two file kinds: a **model** (`save` / `load`) is
+ * architecture plus weights, rebuilt from a `Registry`; **weights**
+ * (`saveWeights` / `loadWeights`) load into a network you built in code,
+ * after checking every name and shape.
+ */
+
+namespace ann;
+
+public const MODEL_MAGIC = 'ANNM';
+public const WEIGHTS_MAGIC = 'ANNW';
+public const FORMAT_VERSION = 1;
+
+public class Model
+{
+    public Layer $root;
+
+    /**
+     * Wrap `$root` and initialize every param from `$seed`. Same
+     * architecture and seed always start from the same weights.
+     */
+    public constructor(Layer $root, uint64 $seed = 1)
+    {
+        $this->root = $root;
+        $rng = Random($seed);
+        $root->initialize($rng);
+    }
+
+    private constructor(restored: Layer $root)
+    {
+        $this->root = $root;
+    }
+
+    public function forward(const Tensor& $input, Mode $mode) : Tensor
+    {
+        return $this->root->forward($input, $mode);
+    }
+
+    /**
+     * Back-propagate `$gradient` through the network. Param gradients
+     * accumulate.
+     */
+    public function backward(const Tensor& $gradient) : Tensor
+    {
+        return $this->root->backward($gradient);
+    }
+
+    public const function params() : array<Param>
+    {
+        return $this->root->params();
+    }
+
+    public function zeroGrad() : void
+    {
+        foreach ($this->root->params() as $p) {
+            $p->zeroGrad();
+        }
+    }
+
+    /**
+     * Clip to global L2 `$clip` when that is above zero, let `$optimizer`
+     * move every param, then clear gradients. Several `backward`s before
+     * one `step` add up.
+     */
+    public function step(Optimizer $optimizer, float64 $clip = 0.0) : void
+    {
+        array<Param> $params = $this->root->params();
+
+        if ($clip > 0.0) {
+            Param::clip($params, $clip);
+        }
+
+        $optimizer->step($params);
+
+        foreach ($params as $p) {
+            $p->zeroGrad();
+        }
+    }
+
+    /**
+     * One supervised step: train-forward, weighted loss, backward, `step`.
+     * Returns the batch's loss as it was before the step.
+     */
+    public function learn(const Dataset& $batch, Loss $loss, Optimizer $optimizer, float64 $clip = 0.0) : float64
+    {
+        Tensor $output = $this->root->forward($batch->inputs, .train);
+        float64 $value = $batch->loss($loss, $output);
+        $this->root->backward($batch->gradient($loss, $output));
+        $this->step($optimizer, $clip);
+        return $value;
+    }
+
+    /**
+     * Global L2 of the gradients so far, before clipping. Worth logging
+     * when an update misbehaves.
+     */
+    public const function gradientNorm() : float64
+    {
+        return Param::norm($this->root->params());
+    }
+
+    /**
+     * Hard update: overwrite every param from `$from`. Same architecture;
+     * nothing changes unless every name and shape matches.
+     */
+    public function copy(const Model& $from) : status<ModelError>
+    {
+        array<Param> $source = guard $this->paired($from) else ($e) {
+            return .error($e);
+        }
+
+        array<Param> $params = $this->root->params();
+
+        foreach (0 .. $params->count() as $i) {
+            Param $p = $params[$i];
+            $p->value = $source[$i]->value;
+        }
+
+        return .ok;
+    }
+
+    /**
+     * Soft (Polyak) update: `w = (1 - rate) * w + rate * w'`. Rate of one
+     * is `copy`.
+     */
+    public function blend(const Model& $from, float64 $rate) : status<ModelError>
+    {
+        array<Param> $source = guard $this->paired($from) else ($e) {
+            return .error($e);
+        }
+
+        array<Param> $params = $this->root->params();
+
+        foreach (0 .. $params->count() as $i) {
+            Param $p = $params[$i];
+            Param $q = $source[$i];
+
+            foreach (0 .. $p->value->data->count() as $j) {
+                $p->value->data[$j] = (1.0 - $rate) * $p->value->data[$j] + $rate * $q->value->data[$j];
+            }
+        }
+
+        return .ok;
+    }
+
+    /**
+     * Independent copy, same architecture and weights. Goes through the
+     * model format, so custom layers need their decoders in `$registry`.
+     */
+    public const function clone(Registry $registry = Registry()) : result<Model, ModelError>
+    {
+        return Model::decode($this->encode(), $registry);
+    }
+
+    public const function parameterCount() : usize
+    {
+        usize $n = 0;
+
+        foreach ($this->root->params() as $p) {
+            $n = $n + $p->size();
+        }
+
+        return $n;
+    }
+
+    /**
+     * Inference-mode output. Raw: a `CrossEntropy` network gives logits.
+     * `CrossEntropy::predict` or `Tensor::softmax` turns them into
+     * probabilities.
+     */
+    public function predict(const Tensor& $input) : Tensor
+    {
+        return $this->root->forward($input, .infer);
+    }
+
+    /**
+     * Predicted class of each sample: largest output, or 1 when a single
+     * sigmoid output is at least 0.5.
+     */
+    public function classify(const Tensor& $input) : array<usize>
+    {
+        Tensor $out = $this->predict($input);
+
+        if ($out->cols() != 1) {
+            return $out->argmax();
+        }
+
+        array<usize> $classes = arr::room<usize>($out->rows());
+
+        foreach ($out->data as $v) {
+            float64 $p = $v;
+            usize $class = 0;
+
+            if ($p >= 0.5) {
+                $class = 1;
+            }
+
+            $classes[] = $class;
+        }
+
+        return $classes;
+    }
+
+    /**
+     * Loss and metric over a whole dataset, inference mode.
+     */
+    public function evaluate(const Dataset& $data, Loss $loss, Metric $metric = .none) : Evaluation
+    {
+        Tensor $out = $this->predict($data->inputs);
+        Evaluation $result = Evaluation($data->loss($loss, $out), 0.0);
+
+        if ($metric != Metric::none) {
+            $result->metric = $metric->score($loss->predict($out), $data->targets);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Layer tree, one layer per line, plus the param total.
+     */
+    public const function summary() : string
+    {
+        string $out = $this->root->summary();
+        usize $count = $this->parameterCount();
+        $out->append("\ntotal {$count} params");
+        return $out;
+    }
+
+    /**
+     * Architecture and weights, as bytes.
+     */
+    public const function encode() : string
+    {
+        $out = Model::header(MODEL_MAGIC);
+        $out->layer($this->root);
+        $this->writeWeights($out);
+        return $out->bytes();
+    }
+
+    /**
+     * Rebuild from `encode` bytes. Layer kinds come from `$registry`; add
+     * custom layers there if the model has any.
+     */
+    public static function decode(const string& $bytes, Registry $registry = Registry()) : result<Model, ModelError>
+    {
+        Decoder $in = guard Model::open($bytes, MODEL_MAGIC) else ($e) {
+            return .error($e);
+        }
+
+        Layer $root = guard $registry->decode($in) else ($e) {
+            return .error($e);
+        }
+
+        $model = Model(restored: $root);
+
+        guard $model->readWeights($in) else ($e) {
+            return .error($e);
+        }
+
+        return .ok($model);
+    }
+
+    public const function save(const string& $path) : status<ModelError>
+    {
+        return Model::write($path, $this->encode());
+    }
+
+    public static function load(const string& $path, Registry $registry = Registry()) : result<Model, ModelError>
+    {
+        string $bytes = guard Model::read($path) else ($e) {
+            return .error($e);
+        }
+
+        return Model::decode($bytes, $registry);
+    }
+
+    /**
+     * Weights only, as bytes.
+     */
+    public const function weights() : string
+    {
+        $out = Model::header(WEIGHTS_MAGIC);
+        $this->writeWeights($out);
+        return $out->bytes();
+    }
+
+    /**
+     * Replace every param from `weights` bytes. Nothing changes unless
+     * every name and shape matches.
+     */
+    public function restore(const string& $bytes) : status<ModelError>
+    {
+        Decoder $in = guard Model::open($bytes, WEIGHTS_MAGIC) else ($e) {
+            return .error($e);
+        }
+
+        return $this->readWeights($in);
+    }
+
+    public const function saveWeights(const string& $path) : status<ModelError>
+    {
+        return Model::write($path, $this->weights());
+    }
+
+    public function loadWeights(const string& $path) : status<ModelError>
+    {
+        string $bytes = guard Model::read($path) else ($e) {
+            return .error($e);
+        }
+
+        return $this->restore($bytes);
+    }
+
+    /**
+     * Encoder with the header of file kind `$magic` already written.
+     */
+    private static function header(string $magic) : Encoder
+    {
+        $out = Encoder();
+        $out->raw($magic);
+        $out->u32(FORMAT_VERSION as uint32);
+        return $out;
+    }
+
+    /**
+     * Decoder over `$bytes` past the header, once that names file kind
+     * `$magic` and this format version.
+     */
+    private static function open(const string& $bytes, string $magic) : result<Decoder, ModelError>
+    {
+        $in = Decoder($bytes);
+
+        guard $in->expect($magic) else ($e) {
+            return .error($e);
+        }
+
+        uint32 $version = guard $in->u32() else ($e) {
+            return .error($e);
+        }
+
+        if ($version != (FORMAT_VERSION as uint32)) {
+            return .error(.unsupportedVersion($version));
+        }
+
+        return .ok($in);
+    }
+
+    private static function write(const string& $path, const string& $bytes) : status<ModelError>
+    {
+        guard std::io::writefile($path, $bytes) else ($e) {
+            return .error(.io($e));
+        }
+
+        return .ok;
+    }
+
+    private static function read(const string& $path) : result<string, ModelError>
+    {
+        string $bytes = guard std::io::readfile($path) else ($e) {
+            return .error(.io($e));
+        }
+
+        return .ok($bytes);
+    }
+
+    private const function writeWeights(Encoder $out) : void
+    {
+        array<Param> $params = $this->root->params();
+        $out->size($params->count());
+
+        foreach ($params as $p) {
+            $out->text($p->name);
+            $out->tensor($p->value);
+        }
+    }
+
+    private function readWeights(Decoder $in) : status<ModelError>
+    {
+        usize $count = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        array<Param> $params = $this->root->params();
+
+        if ($count != $params->count()) {
+            return .error(.paramCount($params->count(), $count));
+        }
+
+        // check everything before touching a single param
+        array<Tensor> $values = arr::room<Tensor>($count);
+
+        for (usize $i = 0; $i < $count; $i++) {
+            string $name = guard $in->text() else ($e) {
+                return .error($e);
+            }
+
+            Tensor $value = guard $in->tensor() else ($e) {
+                return .error($e);
+            }
+
+            if (!$params[$i]->like($name, $value)) {
+                return .error(.shapeMismatch($i));
+            }
+
+            $values[] = $value;
+        }
+
+        for (usize $i = 0; $i < $count; $i++) {
+            Param $p = $params[$i];
+            $p->value = $values[$i];
+        }
+
+        return .ok;
+    }
+
+    /**
+     * Params of `$from`, once they line up one for one: count, names, shapes.
+     */
+    private const function paired(const Model& $from) : result<array<Param>, ModelError>
+    {
+        array<Param> $other = $from->params();
+        array<Param> $params = $this->root->params();
+
+        if ($other->count() != $params->count()) {
+            return .error(.paramCount($params->count(), $other->count()));
+        }
+
+        foreach (0 .. $params->count() as $i) {
+            if (!$params[$i]->like($other[$i]->name, $other[$i]->value)) {
+                return .error(.shapeMismatch($i));
+            }
+        }
+
+        return .ok($other);
+    }
+}

@@ -1,0 +1,24 @@
+/**
+ * What one update of any `ann::rl` algorithm measured.
+ */
+
+namespace ann::rl;
+
+public struct Report
+{
+    /**
+     * Policy objective's loss (the surrogate for PPO). Zero for DQN.
+     */
+    public float64 $policy = 0.0;
+
+    /**
+     * Critic's squared error, or DQN's TD loss.
+     */
+    public float64 $value = 0.0;
+
+    /**
+     * Mean entropy of the policy over the batch. Zero for DQN. Entropy
+     * collapsing early means the policy has stopped exploring.
+     */
+    public float64 $entropy = 0.0;
+}

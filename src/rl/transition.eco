@@ -1,0 +1,119 @@
+/**
+ * One step of one episode, and the batch form the update rules learn from.
+ */
+
+namespace ann::rl;
+
+use ann::Tensor;
+
+/**
+ * In `state` the agent took `action`, earned `reward`, ended up in `next`.
+ */
+public struct Transition
+{
+    /**
+     * Observation the action was chosen from, `[1, features]`.
+     */
+    public Tensor $state;
+
+    public usize $action;
+
+    public float64 $reward;
+
+    /**
+     * After the action, `[1, features]`. If the episode ended this is the
+     * final observation, not the next episode's first.
+     */
+    public Tensor $next;
+
+    public Outcome $outcome;
+}
+
+/**
+ * Many transitions as batch tensors, ready for a network.
+ */
+public struct Transitions
+{
+    /**
+     * `[n, features]`.
+     */
+    public Tensor $states;
+
+    public array<usize> $actions;
+
+    /**
+     * `[n, 1]`.
+     */
+    public Tensor $rewards;
+
+    /**
+     * `[n, features]`.
+     */
+    public Tensor $next;
+
+    /**
+     * `[n, 1]`: 1 where the step terminated and nothing should be
+     * bootstrapped from `next`, 0 everywhere else, truncation included.
+     */
+    public Tensor $terminal;
+
+    /**
+     * Stack `$items` in order. There must be at least one.
+     */
+    public constructor(const array<Transition>& $items)
+    {
+        usize $n = $items->count();
+        array<Tensor> $states = arr::room<Tensor>($n);
+        array<Tensor> $next = arr::room<Tensor>($n);
+        array<usize> $actions = arr::room<usize>($n);
+        array<float64> $rewards = arr::room<float64>($n);
+        array<float64> $terminal = arr::room<float64>($n);
+
+        foreach ($items as $t) {
+            $states[] = $t->state;
+            $next[] = $t->next;
+            $actions[] = $t->action;
+            $rewards[] = $t->reward;
+
+            if ($t->outcome == Outcome::terminated) {
+                $terminal[] = 1.0;
+            } else {
+                $terminal[] = 0.0;
+            }
+        }
+
+        $this->states = Tensor(stack: $states);
+        $this->actions = $actions;
+        $this->rewards = Tensor(column: $rewards);
+        $this->next = Tensor(stack: $next);
+        $this->terminal = Tensor(column: $terminal);
+    }
+
+    private constructor(Tensor $states, array<usize> $actions, Tensor $rewards, Tensor $next, Tensor $terminal)
+    {
+        $this->states = mv $states;
+        $this->actions = mv $actions;
+        $this->rewards = mv $rewards;
+        $this->next = mv $next;
+        $this->terminal = mv $terminal;
+    }
+
+    public const function count() : usize
+    {
+        return $this->actions->count();
+    }
+
+    /**
+     * Transitions at `$indices`, in that order.
+     */
+    public const function gather(const array<usize>& $indices) : Transitions
+    {
+        array<usize> $actions = arr::room<usize>($indices->count());
+
+        foreach ($indices as $i) {
+            $actions[] = $this->actions[$i];
+        }
+
+        return Transitions($this->states->gather($indices), $actions, $this->rewards->gather($indices), $this->next->gather($indices), $this->terminal->gather($indices));
+    }
+}

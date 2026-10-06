@@ -1,0 +1,68 @@
+// double dqn on cartpole: replay, lagging target, decaying epsilon
+//
+//   echoc run -m . examples/cartpole_dqn.eco
+
+use ann::{Act, Adam, Dense, MeanSquaredError, Model, Random, Sequential};
+use ann::rl::{CartPole, Dqn, Replay, Report, Runner, Schedule};
+
+internal function qnet() : Sequential
+{
+    return Sequential()
+        ->add(Dense(4, 64, .he))
+        ->add(Act(.relu))
+        ->add(Dense(64, 64, .he))
+        ->add(Act(.relu))
+        ->add(Dense(64, 2));
+}
+
+// mean return of greedy episodes, no exploration
+internal function play(Model $q, usize $episodes) : float64
+{
+    $runner = Runner(CartPole($seed: 99));
+
+    while ($runner->episodes->count() < $episodes) {
+        array<usize> $best = $q->predict($runner->observation)->argmax();
+        $runner->step($best[0]);
+    }
+
+    return $runner->mean($episodes);
+}
+
+$runner = Runner(CartPole($seed: 1));
+// rewards here are small and steady, so squared TD error learns faster
+// than Huber; the target trails by 0.5% a step
+$dqn = Dqn(Model(qnet(), $seed: 1), Model(qnet()), Adam(0.001), $tau: 0.005, $loss: MeanSquaredError());
+$replay = Replay(50000);
+$epsilon = Schedule(from: 1.0, to: 0.02, over: 10000);
+$rng = Random(1);
+usize $reported = 0;
+
+for (usize $i = 0; $i < 60000; $i++) {
+    $replay->add($runner->step($dqn->act($runner->observation, $epsilon->at($i), $rng)));
+
+    if ($replay->count() >= 1000) {
+        Report $r = $dqn->update($replay->sample(64, $rng));
+
+        if ($runner->episodes->count() >= $reported + 25) {
+            $reported = $runner->episodes->count();
+            echo "step {$i}: episode {$reported}, mean return {$runner->mean(20):.1f}, td loss {$r->value:.4f}";
+        }
+    }
+
+    if ($runner->episodes->count() >= 20 && $runner->mean(20) >= 450.0) {
+        echo "solved at step {$i} after {$runner->episodes->count()} episodes: mean return {$runner->mean(20):.1f}";
+        break;
+    }
+}
+
+guard $dqn->online->save('cartpole-dqn.ann') else ($e) {
+    die("save failed: {$e}");
+}
+
+Model $loaded = guard Model::load('cartpole-dqn.ann') else ($e) {
+    die("load failed: {$e}");
+}
+
+float64 $score = play($loaded, 10);
+echo "loaded network, greedy over 10 episodes: mean return {$score:.1f}";
+std::io::remove('cartpole-dqn.ann');

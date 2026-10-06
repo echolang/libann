@@ -1,0 +1,76 @@
+/**
+ * Kind name to decoder. `Registry()` already knows the built-ins. A custom
+ * layer is one `add` away from loading like them:
+ *
+ *     $registry = Registry()->add('scale', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
+ *         return Scale::decode($in, $r);
+ *     });
+ *     Model $m = guard Model::load('net.ann', $registry) else ($e) { die($e->message()); }
+ *
+ * The decoder gets the registry so a composite can decode children with
+ * `$r->decode($in)`, whatever kinds they are.
+ */
+
+namespace ann;
+
+public class Registry
+{
+    private map<string, function<result<Layer, ModelError>(Decoder, Registry)>> $decoders = map<string, function<result<Layer, ModelError>(Decoder, Registry)>>();
+
+    init
+    {
+        $this->add('dense', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
+            return Dense::decode($in, $r);
+        });
+        $this->add('act', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
+            return Act::decode($in, $r);
+        });
+        $this->add('softmax', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
+            return Softmax::decode($in, $r);
+        });
+        $this->add('dropout', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
+            return Dropout::decode($in, $r);
+        });
+        $this->add('layernorm', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
+            return LayerNorm::decode($in, $r);
+        });
+        $this->add('sequential', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
+            return Sequential::decode($in, $r);
+        });
+        $this->add('residual', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
+            return Residual::decode($in, $r);
+        });
+    }
+
+    /**
+     * Register (or replace) the decoder for `$kind`. Returns `$this` so
+     * registrations chain.
+     */
+    public function add(string $kind, function<result<Layer, ModelError>(Decoder, Registry)> $decoder) : Registry
+    {
+        $this->decoders[$kind] = $decoder;
+        return $this;
+    }
+
+    public const function has(const string& $kind) : bool
+    {
+        return $this->decoders->has($kind);
+    }
+
+    /**
+     * One layer: kind, then config through the matching decoder.
+     */
+    public const function decode(Decoder $in) : result<Layer, ModelError>
+    {
+        string $kind = guard $in->text() else ($e) {
+            return .error($e);
+        }
+
+        if (!$this->decoders->has($kind)) {
+            return .error(.unknownLayer);
+        }
+
+        $decoder = $this->decoders[$kind];
+        return $decoder($in, $this);
+    }
+}

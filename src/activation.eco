@@ -1,0 +1,286 @@
+/**
+ * Elementwise activations, each with its derivative. `Act` applies one;
+ * a new activation is a new case and two arms.
+ */
+
+namespace ann;
+
+public enum Activation : uint8
+{
+    /**
+     * Identity. Useful as the output of a regression network.
+     */
+    case linear = 0;
+
+    case relu = 1;
+
+    /**
+     * x when positive, 0.01x otherwise, so no unit is ever stuck at zero
+     * gradient.
+     */
+    case leakyRelu = 2;
+
+    /**
+     * 1 / (1 + e^-x), into (0, 1). Output of a binary classifier.
+     */
+    case sigmoid = 3;
+
+    /**
+     * Into (-1, 1).
+     */
+    case tanh = 4;
+
+    /**
+     * Gaussian error linear unit (tanh approximation). The activation of
+     * most transformer feed-forward blocks.
+     */
+    case gelu = 5;
+
+    /**
+     * ln(1 + e^x), a smooth ReLU.
+     */
+    case softplus = 6;
+
+    /**
+     * x when positive, e^x - 1 otherwise.
+     */
+    case elu = 7;
+
+    /**
+     * x * sigmoid(x), also known as SiLU.
+     */
+    case swish = 8;
+
+    public const function apply(float64 $x) : float64
+    {
+        return match ($this) {
+            .linear => $x,
+            .relu => Activation::rectify($x),
+            .leakyRelu => Activation::leaky($x),
+            .sigmoid => Activation::logistic($x),
+            .tanh => std::math::tanh($x),
+            .gelu => Activation::gaussian($x),
+            .softplus => Activation::smoothRelu($x),
+            .elu => Activation::exponential($x),
+            .swish => Activation::silu($x),
+        };
+    }
+
+    /**
+     * Derivative at `$x`, given `$y` = `apply($x)`. Several are cheapest
+     * written in terms of the output.
+     */
+    public const function derive(float64 $x, float64 $y) : float64
+    {
+        return match ($this) {
+            .linear => 1.0,
+            .relu => Activation::step($x, 1.0, 0.0),
+            .leakyRelu => Activation::step($x, 1.0, 0.01),
+            .sigmoid => Activation::logisticSlope($y),
+            .tanh => Activation::tanhSlope($y),
+            .gelu => Activation::geluSlope($x),
+            .softplus => Activation::logistic($x),
+            .elu => Activation::step($x, 1.0, $y + 1.0),
+            .swish => Activation::swishSlope($x),
+        };
+    }
+
+    /**
+     * `apply` on every value of `$x`. The case is picked once for the whole
+     * tensor, so each loop is a straight run the compiler can inline.
+     */
+    public const function map(const Tensor& $x) : Tensor
+    {
+        Tensor $out = $x;
+        usize $n = $out->size();
+
+        match ($this) {
+            .linear => {},
+            .relu => {
+                foreach (0 .. $n as $i) {
+                    $out->data[$i] = Activation::rectify($out->data[$i]);
+                }
+            },
+            .leakyRelu => {
+                foreach (0 .. $n as $i) {
+                    $out->data[$i] = Activation::leaky($out->data[$i]);
+                }
+            },
+            .sigmoid => {
+                foreach (0 .. $n as $i) {
+                    $out->data[$i] = Activation::logistic($out->data[$i]);
+                }
+            },
+            .tanh => {
+                foreach (0 .. $n as $i) {
+                    $out->data[$i] = std::math::tanh($out->data[$i]);
+                }
+            },
+            .gelu => {
+                foreach (0 .. $n as $i) {
+                    $out->data[$i] = Activation::gaussian($out->data[$i]);
+                }
+            },
+            .softplus => {
+                foreach (0 .. $n as $i) {
+                    $out->data[$i] = Activation::smoothRelu($out->data[$i]);
+                }
+            },
+            .elu => {
+                foreach (0 .. $n as $i) {
+                    $out->data[$i] = Activation::exponential($out->data[$i]);
+                }
+            },
+            .swish => {
+                foreach (0 .. $n as $i) {
+                    $out->data[$i] = Activation::silu($out->data[$i]);
+                }
+            },
+        }
+
+        return $out;
+    }
+
+    /**
+     * `$gradient` times `derive` at every value. `$y` is what `map($x)`
+     * returned. Picks the case once, like `map`.
+     */
+    public const function slope(const Tensor& $x, const Tensor& $y, const Tensor& $gradient) : Tensor
+    {
+        Tensor $out = $gradient;
+        usize $n = $out->size();
+
+        match ($this) {
+            .linear => {},
+            .relu => {
+                foreach (0 .. $n as $i) {
+                    $out->data[$i] = $out->data[$i] * Activation::step($x->data[$i], 1.0, 0.0);
+                }
+            },
+            .leakyRelu => {
+                foreach (0 .. $n as $i) {
+                    $out->data[$i] = $out->data[$i] * Activation::step($x->data[$i], 1.0, 0.01);
+                }
+            },
+            .sigmoid => {
+                foreach (0 .. $n as $i) {
+                    $out->data[$i] = $out->data[$i] * Activation::logisticSlope($y->data[$i]);
+                }
+            },
+            .tanh => {
+                foreach (0 .. $n as $i) {
+                    $out->data[$i] = $out->data[$i] * Activation::tanhSlope($y->data[$i]);
+                }
+            },
+            .gelu => {
+                foreach (0 .. $n as $i) {
+                    $out->data[$i] = $out->data[$i] * Activation::geluSlope($x->data[$i]);
+                }
+            },
+            .softplus => {
+                foreach (0 .. $n as $i) {
+                    $out->data[$i] = $out->data[$i] * Activation::logistic($x->data[$i]);
+                }
+            },
+            .elu => {
+                foreach (0 .. $n as $i) {
+                    $out->data[$i] = $out->data[$i] * Activation::step($x->data[$i], 1.0, $y->data[$i] + 1.0);
+                }
+            },
+            .swish => {
+                foreach (0 .. $n as $i) {
+                    $out->data[$i] = $out->data[$i] * Activation::swishSlope($x->data[$i]);
+                }
+            },
+        }
+
+        return $out;
+    }
+
+    private static function gaussian(float64 $x) : float64
+    {
+        return 0.5 * $x * (1.0 + std::math::tanh(Activation::geluInner($x)));
+    }
+
+    private static function step(float64 $x, float64 $positive, float64 $otherwise) : float64
+    {
+        if ($x > 0.0) {
+            return $positive;
+        }
+
+        return $otherwise;
+    }
+
+    private static function rectify(float64 $x) : float64
+    {
+        return std::math::max($x, 0.0);
+    }
+
+    private static function silu(float64 $x) : float64
+    {
+        return $x * Activation::logistic($x);
+    }
+
+    private static function logisticSlope(float64 $y) : float64
+    {
+        return $y * (1.0 - $y);
+    }
+
+    private static function tanhSlope(float64 $y) : float64
+    {
+        return 1.0 - $y * $y;
+    }
+
+    private static function leaky(float64 $x) : float64
+    {
+        if ($x > 0.0) {
+            return $x;
+        }
+
+        return 0.01 * $x;
+    }
+
+    private static function logistic(float64 $x) : float64
+    {
+        // split by sign so exp never overflows
+        if ($x >= 0.0) {
+            return 1.0 / (1.0 + std::math::exp(-$x));
+        }
+
+        float64 $e = std::math::exp($x);
+        return $e / (1.0 + $e);
+    }
+
+    private static function smoothRelu(float64 $x) : float64
+    {
+        // ln(1 + e^x) = max(x, 0) + ln(1 + e^-|x|), stable for large |x|
+        return Activation::rectify($x) + std::math::log(1.0 + std::math::exp(-std::math::abs($x)));
+    }
+
+    private static function exponential(float64 $x) : float64
+    {
+        if ($x > 0.0) {
+            return $x;
+        }
+
+        return std::math::exp($x) - 1.0;
+    }
+
+    private static function geluInner(float64 $x) : float64
+    {
+        return 0.7978845608028654 * ($x + 0.044715 * $x * $x * $x);
+    }
+
+    private static function geluSlope(float64 $x) : float64
+    {
+        float64 $t = std::math::tanh(Activation::geluInner($x));
+        float64 $inner = 0.7978845608028654 * (1.0 + 3.0 * 0.044715 * $x * $x);
+        return 0.5 * (1.0 + $t) + 0.5 * $x * (1.0 - $t * $t) * $inner;
+    }
+
+    private static function swishSlope(float64 $x) : float64
+    {
+        float64 $s = Activation::logistic($x);
+        return $s + $x * $s * (1.0 - $s);
+    }
+}

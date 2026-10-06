@@ -1,0 +1,145 @@
+/**
+ * Actor-critic that squeezes several epochs of minibatch updates out of
+ * every rollout, without letting the policy drift far from the one that
+ * collected it.
+ *
+ * Each sample's step is the ratio of current probability to the
+ * probability when the action was taken. Once that ratio leaves
+ * `[1 - epsilon, 1 + epsilon]` in the direction the advantage pushes, the
+ * sample stops contributing. Record each action's log-probability in the
+ * rollout (`Rollout::add($t, $choice->logProb)`); PPO needs it.
+ */
+
+namespace ann::rl;
+
+use ann::{Batches, Dataset, MeanSquaredError, Model, Optimizer, Random, Tensor};
+
+public class Ppo
+{
+    /**
+     * The actor.
+     */
+    public Policy $policy;
+
+    /**
+     * Observations in, one value out.
+     */
+    public Model $critic;
+
+    public Optimizer $policyOptimizer;
+
+    public Optimizer $criticOptimizer;
+
+    /**
+     * Discount: how much a reward one step later is worth now.
+     */
+    public float64 $gamma = 0.99;
+
+    /**
+     * GAE trade-off between the critic (0) and the whole return (1).
+     */
+    public float64 $lambda = 0.95;
+
+    /**
+     * How far the probability ratio may move before a sample stops
+     * pushing.
+     */
+    public float64 $epsilon = 0.2;
+
+    /**
+     * Passes over each rollout.
+     */
+    public usize $epochs = 4;
+
+    /**
+     * Samples per minibatch. Last of a pass may be smaller.
+     */
+    public usize $batchSize = 64;
+
+    /**
+     * Weight of the entropy bonus that keeps the policy exploring.
+     */
+    public float64 $entropy = 0.01;
+
+    /**
+     * Global gradient-norm cap for both networks. 0 is none.
+     */
+    public float64 $clip = 0.5;
+
+    /**
+     * Seed for minibatch shuffling.
+     */
+    public uint64 $seed = 1;
+
+    private Random $rng;
+
+    init
+    {
+        $this->rng = Random($this->seed);
+    }
+
+    /**
+     * `epochs` passes of minibatch steps over `$rollout`. The report
+     * averages over every minibatch; its `policy` is the clipped
+     * surrogate's loss.
+     */
+    public function update(const Rollout& $rollout) : Report
+    {
+        Transitions $all = $rollout->transitions();
+        Tensor $old = $rollout->logProbs();
+        Estimate $estimate = $rollout->estimate($all, $this->critic, $this->gamma, $this->lambda);
+        Tensor $advantages = standardize($estimate->advantages);
+        $batches = Batches($all->count(), $this->batchSize);
+        Report $total = Report();
+        usize $steps = 0;
+
+        for (usize $epoch = 0; $epoch < $this->epochs; $epoch++) {
+            $batches->shuffle($this->rng);
+
+            foreach ($batches->all() as $indices) {
+                Transitions $batch = $all->gather($indices);
+                Report $r = $this->step($batch, $old->gather($indices), $advantages->gather($indices));
+                $r->value = $this->critic->learn(Dataset($batch->states, $estimate->returns->gather($indices)), MeanSquaredError(), $this->criticOptimizer, $this->clip);
+                $total->policy = $total->policy + $r->policy;
+                $total->value = $total->value + $r->value;
+                $total->entropy = $total->entropy + $r->entropy;
+                $steps = $steps + 1;
+            }
+        }
+
+        if ($steps > 0) {
+            float64 $count = $steps as float64;
+            $total->policy = $total->policy / $count;
+            $total->value = $total->value / $count;
+            $total->entropy = $total->entropy / $count;
+        }
+
+        return $total;
+    }
+
+    private function step(const Transitions& $batch, const Tensor& $old, const Tensor& $advantages) : Report
+    {
+        Tensor $logp = $this->policy->model->forward($batch->states, .train)->logSoftmax();
+        Tensor $coefficients = $logp->pick($batch->actions);
+        float64 $surrogate = 0.0;
+
+        foreach (0 .. $coefficients->data->count() as $i) {
+            float64 $ratio = std::math::exp($coefficients->data[$i] - $old->data[$i]);
+            float64 $a = $advantages->data[$i];
+            float64 $unclipped = $ratio * $a;
+            float64 $clipped = std::math::clamp($ratio, 1.0 - $this->epsilon, 1.0 + $this->epsilon) * $a;
+
+            // min of the two; only the unclipped side has a slope
+            if ($unclipped <= $clipped) {
+                $surrogate = $surrogate + $unclipped;
+                $coefficients->data[$i] = $unclipped;
+            } else {
+                $surrogate = $surrogate + $clipped;
+                $coefficients->data[$i] = 0.0;
+            }
+        }
+
+        float64 $objective = -$surrogate / ($batch->count() as float64);
+        return $this->policy->apply($logp, $batch->actions, $coefficients, $objective, $this->entropy, $this->policyOptimizer, $this->clip);
+    }
+}

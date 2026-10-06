@@ -1,0 +1,109 @@
+/**
+ * Inverted dropout: training zeroes each value with probability `rate`
+ * and scales the survivors by `1 / (1 - rate)`, so inference is the
+ * identity.
+ */
+
+namespace ann;
+
+public class Dropout : Layer
+{
+    /**
+     * Probability of dropping a value, in [0, 1).
+     */
+    public const float64 $rate;
+
+    private Random $rng;
+    private Tensor $mask;
+
+    init
+    {
+        if (!Dropout::valid($this->rate)) {
+            die("ann::Dropout: rate {$this->rate} is outside [0, 1)");
+        }
+
+        $this->rng = Random(1);
+
+        array<usize> $empty = [0];
+        $this->mask = Tensor($empty);
+    }
+
+    public static function decode(Decoder $in, Registry $registry) : result<Layer, ModelError>
+    {
+        float64 $rate = guard $in->f64() else ($e) {
+            return .error($e);
+        }
+
+        if (!Dropout::valid($rate)) {
+            return .error(.badValue(mem::bit_cast<uint64, float64>($rate)));
+        }
+
+        Layer $layer = Dropout($rate);
+        return .ok($layer);
+    }
+
+    public function forward(const Tensor& $input, Mode $mode) : Tensor
+    {
+        // inference leaves the last training mask for its backward
+        if ($mode == Mode::infer) {
+            return $input;
+        }
+
+        if ($this->rate == 0.0) {
+            return $input;
+        }
+
+        float64 $keep = 1.0 - $this->rate;
+        float64 $scale = 1.0 / $keep;
+        Tensor $mask = Tensor($input->shape);
+
+        foreach (0 .. $mask->data->count() as $i) {
+            if ($this->rng->chance($keep)) {
+                $mask->data[$i] = $scale;
+            }
+        }
+
+        $this->mask = $mask;
+        return $input->mul($mask);
+    }
+
+    public function backward(const Tensor& $gradient) : Tensor
+    {
+        if ($this->rate == 0.0) {
+            return $gradient;
+        }
+
+        return $gradient->mul($this->mask);
+    }
+
+    private static function valid(float64 $rate) : bool
+    {
+        return $rate >= 0.0 && $rate < 1.0;
+    }
+
+    public const function params() : array<Param>
+    {
+        return array<Param>();
+    }
+
+    public function initialize(Random& $rng) : void
+    {
+        // own stream, derived from the model seed, so runs reproduce
+        $this->rng = Random($rng->next());
+    }
+
+    public const function kind() : string
+    {
+        return 'dropout';
+    }
+
+    public const function encode(Encoder $out) : void
+    {
+        $out->f64($this->rate);
+    }
+
+    public const function summary() : string
+    {
+        return "dropout {$this->rate}";
+    }
+}

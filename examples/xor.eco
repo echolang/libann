@@ -1,0 +1,47 @@
+// xor: train, save, load, run
+//
+//   echoc run -m . examples/xor.eco
+
+use ann::{Act, BinaryCrossEntropy, Dataset, Dense, EpochReport, Model, Sequential, Sgd, Tensor, Trainer};
+
+array<array<float64>> $points = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]];
+array<float64> $labels = [0.0, 1.0, 1.0, 0.0];
+$data = Dataset(Tensor(rows: $points), Tensor(column: $labels));
+
+$net = Sequential()
+    ->add(Dense(2, 8))
+    ->add(Act(.tanh))
+    ->add(Dense(8, 1))
+    ->add(Act(.sigmoid));
+
+$model = Model($net, $seed: 7);
+echo $model->summary();
+
+$trainer = Trainer(
+    $epochs: 2000,
+    $batchSize: 4,
+    $metric: .binaryAccuracy,
+    $onEpoch: function(EpochReport $r) : void {
+        if ($r->epoch % 500 == 0) {
+            echo "epoch {$r->epoch}: loss {$r->train->loss:.5f}, accuracy {$r->train->metric:.2f}";
+        }
+    },
+);
+$trainer->fit($model, BinaryCrossEntropy(), Sgd(0.5, $momentum: 0.9), $data);
+
+guard $model->save('xor.ann') else ($e) {
+    die("save failed: {$e}");
+}
+
+Model $loaded = guard Model::load('xor.ann') else ($e) {
+    die("load failed: {$e}");
+}
+
+$out = $loaded->predict($data->inputs);
+$classes = $loaded->classify($data->inputs);
+
+foreach ($classes as $i => $class) {
+    echo "{$points[$i][0]} xor {$points[$i][1]} = {$class}  (p = {$out->data[$i]:.4f})";
+}
+
+std::io::remove('xor.ann');

@@ -1,0 +1,121 @@
+/**
+ * Fully connected: `output = input · weight + bias`.
+ */
+
+namespace ann;
+
+public class Dense : Layer
+{
+    /**
+     * Values per input sample.
+     */
+    public const usize $inputs;
+
+    /**
+     * Values per output sample.
+     */
+    public const usize $outputs;
+
+    /**
+     * How `initialize` fills the weight. Bias always starts at zero.
+     * Weights stay zero until `Model` calls `initialize`.
+     */
+    public const Init $init = .xavier;
+
+    /**
+     * `[inputs, outputs]`.
+     */
+    public Param $weight;
+
+    /**
+     * `[1, outputs]`.
+     */
+    public Param $bias;
+
+    private Tensor $input;
+
+    init
+    {
+        array<usize> $weightShape = [$this->inputs, $this->outputs];
+        array<usize> $biasShape = [1, $this->outputs];
+        array<usize> $empty = [0, $this->inputs];
+
+        $this->weight = Param('weight', $weightShape);
+        $this->bias = Param('bias', $biasShape);
+        $this->input = Tensor($empty);
+    }
+
+    public static function decode(Decoder $in, Registry $registry) : result<Layer, ModelError>
+    {
+        usize $inputs = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        usize $outputs = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        uint8 $code = guard $in->u8() else ($e) {
+            return .error($e);
+        }
+
+        Init $init = guard Init::from($code) else {
+            return .error(.badValue($code as uint64));
+        }
+
+        Layer $layer = Dense($inputs, $outputs, $init);
+        return .ok($layer);
+    }
+
+    public function forward(const Tensor& $input, Mode $mode) : Tensor
+    {
+        if ($input->cols() != $this->inputs) {
+            die("ann::Dense: expected {$this->inputs} values per sample, got {$input->cols()}");
+        }
+
+        if ($mode == Mode::train) {
+            $this->input = $input;
+        }
+
+        return $input->matmul($this->weight->value)->addRow($this->bias->value);
+    }
+
+    public function backward(const Tensor& $gradient) : Tensor
+    {
+        $this->weight->grad->accumulate(outer: $this->input, $gradient);
+        $this->bias->grad->accumulate($gradient->sumRows());
+        Tensor $out = $gradient->matmul(transposed: $this->weight->value);
+        $out->shape = $this->input->shape;
+        return $out;
+    }
+
+    public const function params() : array<Param>
+    {
+        array<Param> $all = [$this->weight, $this->bias];
+        return $all;
+    }
+
+    public function initialize(Random& $rng) : void
+    {
+        $this->init->fill($this->weight->value, $this->inputs, $this->outputs, $rng);
+        $this->bias->value->fill(0.0);
+    }
+
+    public const function kind() : string
+    {
+        return 'dense';
+    }
+
+    public const function encode(Encoder $out) : void
+    {
+        $out->size($this->inputs);
+        $out->size($this->outputs);
+        $out->u8($this->init->value());
+    }
+
+    public const function summary() : string
+    {
+        usize $count = $this->inputs * $this->outputs + $this->outputs;
+        return "dense {$this->inputs} -> {$this->outputs} ({$count} params)";
+    }
+}

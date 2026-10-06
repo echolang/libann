@@ -1,0 +1,107 @@
+/**
+ * Keep a pole balanced on a cart by pushing left or right. Gym CartPole
+ * physics: 20 ms Euler steps, fail past 12 degrees or 2.4 m from centre,
+ * reward 1 per step survived, cut-off at `limit`.
+ *
+ * Observation `[1, 4]`: position, velocity, angle, angular velocity.
+ * Action 0 left, 1 right. Mean return 195 is the traditional "solved";
+ * with the default limit the best possible is 500.
+ */
+
+namespace ann::rl;
+
+use ann::{Random, Tensor};
+
+public class CartPole : Environment
+{
+    /**
+     * Seed for starting states.
+     */
+    public uint64 $seed = 1;
+
+    /**
+     * Steps after which an episode is truncated.
+     */
+    public usize $limit = 500;
+
+    private Random $rng;
+    private float64 $position;
+    private float64 $velocity;
+    private float64 $angle;
+    private float64 $spin;
+    private usize $elapsed;
+
+    init
+    {
+        $this->rng = Random($this->seed);
+        $this->position = 0.0;
+        $this->velocity = 0.0;
+        $this->angle = 0.0;
+        $this->spin = 0.0;
+        $this->elapsed = 0;
+    }
+
+    public function reset() : Tensor
+    {
+        $this->position = $this->rng->uniform(-0.05, 0.05);
+        $this->velocity = $this->rng->uniform(-0.05, 0.05);
+        $this->angle = $this->rng->uniform(-0.05, 0.05);
+        $this->spin = $this->rng->uniform(-0.05, 0.05);
+        $this->elapsed = 0;
+        return $this->observe();
+    }
+
+    public function step(usize $action) : Step
+    {
+        float64 $gravity = 9.8;
+        float64 $poleMass = 0.1;
+        float64 $totalMass = 1.1;
+        float64 $halfLength = 0.5;
+        float64 $poleMoment = $poleMass * $halfLength;
+        float64 $tau = 0.02;
+        float64 $force = -10.0;
+
+        if ($action == 1) {
+            $force = 10.0;
+        }
+
+        float64 $cos = std::math::cos($this->angle);
+        float64 $sin = std::math::sin($this->angle);
+        float64 $temp = ($force + $poleMoment * $this->spin * $this->spin * $sin) / $totalMass;
+        float64 $angular = ($gravity * $sin - $cos * $temp) / ($halfLength * (4.0 / 3.0 - $poleMass * $cos * $cos / $totalMass));
+        float64 $linear = $temp - $poleMoment * $angular * $cos / $totalMass;
+
+        $this->position = $this->position + $tau * $this->velocity;
+        $this->velocity = $this->velocity + $tau * $linear;
+        $this->angle = $this->angle + $tau * $this->spin;
+        $this->spin = $this->spin + $tau * $angular;
+        $this->elapsed = $this->elapsed + 1;
+
+        Outcome $outcome = .running;
+
+        // 12 degrees, in radians
+        if (std::math::abs($this->position) > 2.4 || std::math::abs($this->angle) > 0.20943951023931953) {
+            $outcome = .terminated;
+        } else if ($this->elapsed >= $this->limit) {
+            $outcome = .truncated;
+        }
+
+        return Step($this->observe(), 1.0, $outcome);
+    }
+
+    public const function observations() : usize
+    {
+        return 4;
+    }
+
+    public const function actions() : usize
+    {
+        return 2;
+    }
+
+    private const function observe() : Tensor
+    {
+        array<array<float64>> $row = [[$this->position, $this->velocity, $this->angle, $this->spin]];
+        return Tensor(rows: $row);
+    }
+}

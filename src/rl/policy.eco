@@ -1,0 +1,189 @@
+/**
+ * Stochastic policy over discrete actions: observations in, one logit per
+ * action, read as a softmax. An ordinary `Model` ending in a plain
+ * `Dense`, so it trains, saves and loads like any other. The critic of
+ * actor-critic and PPO is a separate `Model` with one output.
+ */
+
+namespace ann::rl;
+
+use ann::{Model, Optimizer, Random, Tensor};
+
+/**
+ * An action drawn from the policy, and how likely the policy was to draw
+ * it.
+ */
+public struct Choice
+{
+    public usize $action;
+
+    /**
+     * Natural log of the action's probability. What PPO compares later
+     * policies against.
+     */
+    public float64 $logProb;
+}
+
+public class Policy
+{
+    /**
+     * Observations in, one logit per action out.
+     */
+    public Model $model;
+
+    /**
+     * Draw an action for the single observation `$state`.
+     */
+    public function act(const Tensor& $state, Random& $rng) : Choice
+    {
+        Tensor $logits = $this->model->predict($state);
+        array<usize> $drawn = $logits->softmax()->sample($rng);
+        usize $action = $drawn[0];
+        return Choice($action, $logits->logSoftmax()->data[$action]);
+    }
+
+    /**
+     * Most likely action for `$state`. How a trained policy is usually run.
+     */
+    public function greedy(const Tensor& $state) : usize
+    {
+        array<usize> $best = $this->model->predict($state)->argmax();
+        return $best[0];
+    }
+
+    /**
+     * Action probabilities for every observation in `$states`.
+     */
+    public function probabilities(const Tensor& $states) : Tensor
+    {
+        return $this->model->predict($states)->softmax();
+    }
+
+    /**
+     * `[n, 1]` log-probability of each of `$actions` in its state.
+     */
+    public function logProbs(const Tensor& $states, const array<usize>& $actions) : Tensor
+    {
+        return $this->model->predict($states)->logSoftmax()->pick($actions);
+    }
+
+    /**
+     * One policy gradient step: raise log-probability of each taken action
+     * in proportion to its coefficient (its advantage), plus an `$entropy`
+     * bonus for staying random. Returns the objective and the entropy as
+     * they were before the step.
+     */
+    public function improve(const Transitions& $batch, const Tensor& $coefficients, float64 $entropy, Optimizer $optimizer, float64 $clip) : Report
+    {
+        Tensor $logp = $this->model->forward($batch->states, .train)->logSoftmax();
+        float64 $objective = -$logp->pick($batch->actions)->mul($coefficients)->sum() / ($batch->count() as float64);
+        return $this->apply($logp, $batch->actions, $coefficients, $objective, $entropy, $optimizer, $clip);
+    }
+
+    /**
+     * The step `improve` takes, from `$logp` of a training-mode forward.
+     * Reports `$objective` as the policy loss, so PPO's surrogate can share
+     * it.
+     */
+    internal function apply(const Tensor& $logp, const array<usize>& $actions, const Tensor& $coefficients, float64 $objective, float64 $entropy, Optimizer $optimizer, float64 $clip) : Report
+    {
+        float64 $spread = 0.0;
+        Tensor $gradient = Policy::descend($logp, $actions, $coefficients, $entropy, $spread);
+        Report $report = Report();
+        $report->policy = $objective;
+        $report->entropy = $spread;
+        $this->model->backward($gradient);
+        $this->model->step($optimizer, $clip);
+        return $report;
+    }
+
+    /**
+     * d(objective)/d(`$logits`) for `mean(-c * log p(action)) - entropy *
+     * mean(H)`. Every policy-gradient method is this with a different
+     * coefficient: the return for REINFORCE, the advantage for
+     * actor-critic, the clipped ratio times the advantage for PPO.
+     */
+    public static function gradient(const Tensor& $logits, const array<usize>& $actions, const Tensor& $coefficients, float64 $entropy) : Tensor
+    {
+        float64 $spread = 0.0;
+        return Policy::descend($logits->logSoftmax(), $actions, $coefficients, $entropy, $spread);
+    }
+
+    /**
+     * Mean entropy of the distributions `$logits` describe, in nats.
+     */
+    public static function entropy(const Tensor& $logits) : float64
+    {
+        Tensor $logp = $logits->logSoftmax();
+        Tensor $p = $logits->softmax();
+        float64 $total = 0.0;
+
+        for (usize $r = 0; $r < $logits->rows(); $r++) {
+            $total = $total + Policy::spread($p, $logp, $r);
+        }
+
+        return $total / std::math::max($logits->rows() as float64, 1.0);
+    }
+
+    /**
+     * `gradient` from log-probabilities. Writes the mean entropy to `$mean`
+     * on the way.
+     */
+    private static function descend(const Tensor& $logp, const array<usize>& $actions, const Tensor& $coefficients, float64 $entropy, float64& $mean) : Tensor
+    {
+        usize $rows = $logp->rows();
+        usize $cols = $logp->cols();
+
+        if ($actions->count() != $rows || $coefficients->size() != $rows) {
+            die("ann::rl::Policy: {$rows} rows of logits need as many actions and coefficients");
+        }
+
+        Tensor $p = $logp;
+
+        foreach (0 .. $p->data->count() as $i) {
+            $p->data[$i] = std::math::exp($logp->data[$i]);
+        }
+
+        Tensor $out = $p;
+        float64 $n = $rows as float64;
+        float64 $total = 0.0;
+
+        for (usize $r = 0; $r < $rows; $r++) {
+            usize $base = $r * $cols;
+            float64 $c = $coefficients->data[$r];
+            float64 $h = Policy::spread($p, $logp, $r);
+            $total = $total + $h;
+
+            for (usize $j = 0; $j < $cols; $j++) {
+                float64 $pj = $p->data[$base + $j];
+                float64 $taken = 0.0;
+
+                if ($j == $actions[$r]) {
+                    $taken = 1.0;
+                }
+
+                // d(-c log p_a)/dz_j = c (p_j - [j = a]), d(-H)/dz_j = p_j (log p_j + H)
+                $out->data[$base + $j] = ($c * ($pj - $taken) + $entropy * $pj * ($logp->data[$base + $j] + $h)) / $n;
+            }
+        }
+
+        $mean = $total / std::math::max($n, 1.0);
+        return $out;
+    }
+
+    /**
+     * Entropy `-sum(p log p)` of row `$r`, in nats.
+     */
+    private static function spread(const Tensor& $p, const Tensor& $logp, usize $r) : float64
+    {
+        usize $cols = $logp->cols();
+        usize $base = $r * $cols;
+        float64 $h = 0.0;
+
+        for (usize $j = 0; $j < $cols; $j++) {
+            $h = $h - $p->data[$base + $j] * $logp->data[$base + $j];
+        }
+
+        return $h;
+    }
+}

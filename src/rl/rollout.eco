@@ -1,0 +1,159 @@
+/**
+ * On-policy buffer: every transition of the last stretch of acting, in
+ * order, with the log-probability the policy gave each action. Policy
+ * gradient methods learn from it once, then clear it.
+ *
+ * `returns` is the plain discounted return (REINFORCE). `estimate` is
+ * GAE with a critic (actor-critic, PPO).
+ */
+
+namespace ann::rl;
+
+use ann::{Model, Tensor};
+
+/**
+ * Advantages and the return targets a critic regresses on, both `[n, 1]`.
+ */
+public struct Estimate
+{
+    /**
+     * How much better each action turned out than the critic expected.
+     */
+    public Tensor $advantages;
+
+    /**
+     * `advantages + values`, the critic's training target.
+     */
+    public Tensor $returns;
+}
+
+public class Rollout
+{
+    private array<Transition> $items = array<Transition>();
+    private array<float64> $probabilities = array<float64>();
+
+    /**
+     * Append `$t`, taken with log-probability `$logProb`. Only PPO reads
+     * the log-probability.
+     */
+    public function add(const Transition& $t, float64 $logProb = 0.0) : void
+    {
+        $this->items[] = $t;
+        $this->probabilities[] = $logProb;
+    }
+
+    public const function count() : usize
+    {
+        return $this->items->count();
+    }
+
+    /**
+     * Drop everything, ready for the next stretch of acting.
+     */
+    public function clear() : void
+    {
+        $this->items = array<Transition>();
+        $this->probabilities = array<float64>();
+    }
+
+    /**
+     * Every transition as batch tensors. Rollout must not be empty.
+     */
+    public const function transitions() : Transitions
+    {
+        if ($this->items->count() == 0) {
+            die('ann::rl::Rollout: the rollout is empty');
+        }
+
+        return Transitions($this->items);
+    }
+
+    /**
+     * `[n, 1]` log-probabilities recorded with `add`.
+     */
+    public const function logProbs() : Tensor
+    {
+        return Tensor(column: $this->probabilities);
+    }
+
+    /**
+     * Discounted return from every step to the end of its episode,
+     * `r + gamma * r' + ...`, as `[n, 1]`. A running or truncated episode
+     * is cut there with no estimate of what would have followed; use
+     * `estimate` with a critic when that matters.
+     */
+    public const function returns(float64 $gamma) : Tensor
+    {
+        usize $n = $this->items->count();
+        array<usize> $shape = [$n, 1];
+        Tensor $out = Tensor($shape);
+        float64 $future = 0.0;
+        usize $i = $n;
+
+        while ($i > 0) {
+            $i = $i - 1;
+            if ($this->items[$i]->outcome->done()) {
+                $future = 0.0;
+            }
+
+            $future = $this->items[$i]->reward + $gamma * $future;
+            $out->data[$i] = $future;
+        }
+
+        return $out;
+    }
+
+    /**
+     * GAE against `$critic` (observations in, one value out). `$lambda`
+     * trades bias for variance: 0 is one-step TD, 1 is the full return
+     * minus the critic's guess.
+     *
+     * After `terminated` the future is worth zero. After `truncated` and
+     * at the end of the rollout it is the critic's value of the next
+     * observation.
+     */
+    public const function estimate(Model $critic, float64 $gamma, float64 $lambda) : Estimate
+    {
+        return $this->estimate($this->transitions(), $critic, $gamma, $lambda);
+    }
+
+    /**
+     * `estimate` over `$batch`, which must be this rollout's
+     * `transitions()`, for a caller that already stacked them.
+     */
+    public const function estimate(const Transitions& $batch, Model $critic, float64 $gamma, float64 $lambda) : Estimate
+    {
+        if ($batch->count() != $this->items->count()) {
+            die("ann::rl::Rollout: a batch of {$batch->count()} transitions for a rollout of {$this->items->count()}");
+        }
+
+        Tensor $values = $critic->predict($batch->states);
+        Tensor $nextValues = $critic->predict($batch->next);
+        usize $n = $batch->count();
+        array<usize> $shape = [$n, 1];
+        Tensor $advantages = Tensor($shape);
+        float64 $trace = 0.0;
+        usize $i = $n;
+
+        while ($i > 0) {
+            $i = $i - 1;
+            Outcome $outcome = $this->items[$i]->outcome;
+            float64 $bootstrap = $nextValues->data[$i];
+
+            if ($outcome == Outcome::terminated) {
+                $bootstrap = 0.0;
+            }
+
+            // the trace only runs on while the episode does
+            if ($outcome->done()) {
+                $trace = 0.0;
+            }
+
+            float64 $delta = $batch->rewards->data[$i] + $gamma * $bootstrap - $values->data[$i];
+            $trace = $delta + $gamma * $lambda * $trace;
+            $advantages->data[$i] = $trace;
+        }
+
+        return Estimate($advantages, $advantages->add($values));
+    }
+}

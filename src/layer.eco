@@ -1,0 +1,86 @@
+/**
+ * The extension point of the whole library. Implement forward, backward
+ * and `params`, and the rest (train, save, load, nest) comes for free.
+ */
+
+namespace ann;
+
+/**
+ * Whether this forward is part of training. `Dropout` and friends read it;
+ * most layers ignore it.
+ */
+public enum Mode
+{
+    /**
+     * Keep caches for `backward`. Stochastic layers draw.
+     */
+    case train;
+
+    /**
+     * Deterministic. Leave training caches alone.
+     */
+    case infer;
+}
+
+public interface Layer
+{
+    /**
+     * Output for a batch. `.train` caches what `backward` needs. `.infer`
+     * must leave those caches alone, so a critic or Double DQN can peek
+     * between a training forward and its backward.
+     */
+    function forward(const Tensor& $input, Mode $mode) : Tensor;
+
+    /**
+     * Gradient of the loss w.r.t. the last `.train` forward's input. Adds
+     * this layer's param gradients into `grad` along the way.
+     */
+    function backward(const Tensor& $gradient) : Tensor;
+
+    /**
+     * Trainable params, fixed order. Composites return their children's.
+     * Weight files depend on that order staying put.
+     */
+    const function params() : array<Param>;
+
+    /**
+     * Starting values. `Model` calls this once with a seeded generator;
+     * construction itself does no random work.
+     */
+    function initialize(Random& $rng) : void;
+
+    /**
+     * Registry name, written in front of the layer's config in a model file.
+     */
+    const function kind() : string;
+
+    /**
+     * Config only, not weights. The decoder for `kind()` rebuilds an equal
+     * layer from this. Composites write children with `Encoder::layer`.
+     */
+    const function encode(Encoder $out) : void;
+
+    /**
+     * One line, `dense 4 -> 16 (80 params)`. A composite may return several.
+     */
+    const function summary() : string;
+}
+
+/**
+ * Indent every line of `$text` by two spaces, for nested summaries.
+ */
+internal function indent(const string& $text) : string
+{
+    string $out = '  ';
+
+    for (usize $i = 0; $i < $text->size(); $i++) {
+        uint8 $b = $text->byte($i);
+        $out->push($b);
+
+        if ($b == 10) {
+            $out->append('  ');
+        }
+    }
+
+    return $out;
+}

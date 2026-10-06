@@ -1,0 +1,362 @@
+use ann::{Random, Tensor};
+
+internal function matrix(const array<array<float64>>& $rows) : Tensor
+{
+    return Tensor(rows: $rows);
+}
+
+#[group: "tensor"]
+test tensor_zeros_have_shape_and_volume
+{
+    array<usize> $shape = [2, 3, 4];
+    $t = Tensor($shape);
+    assert($t->rank() == 3);
+    assert($t->size() == 24);
+    assert($t->rows() == 2);
+    assert($t->cols() == 12);
+    assert($t->sum() == 0.0);
+}
+
+#[group: "tensor"]
+test tensor_matmul_matches_hand_values
+{
+    array<array<float64>> $l = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
+    array<array<float64>> $r = [[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]];
+    $p = matrix($l)->matmul(matrix($r));
+    assert($p->rows() == 2 && $p->cols() == 2);
+    assert($p->at(0, 0) == 58.0);
+    assert($p->at(0, 1) == 64.0);
+    assert($p->at(1, 0) == 139.0);
+    assert($p->at(1, 1) == 154.0);
+}
+
+#[group: "tensor"]
+test tensor_transpose_swaps_axes
+{
+    array<array<float64>> $rows = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
+    $t = matrix($rows)->transpose();
+    assert($t->rows() == 3 && $t->cols() == 2);
+    assert($t->at(2, 0) == 3.0);
+    assert($t->at(0, 1) == 4.0);
+}
+
+#[group: "tensor"]
+test tensor_broadcast_and_reduce_rows
+{
+    array<array<float64>> $rows = [[1.0, 2.0], [3.0, 4.0]];
+    array<array<float64>> $bias = [[10.0, 20.0]];
+    $t = matrix($rows)->addRow(matrix($bias));
+    assert($t->at(1, 1) == 24.0);
+    $s = $t->sumRows();
+    assert($s->rows() == 1);
+    assert($s->at(0, 0) == 24.0);
+    assert($s->at(0, 1) == 46.0);
+}
+
+#[group: "tensor"]
+test tensor_softmax_rows_sum_to_one
+{
+    array<array<float64>> $rows = [[1.0, 2.0, 3.0], [1000.0, 1000.0, 1000.0]];
+    $p = matrix($rows)->softmax();
+    assert(near($p->at(0, 0) + $p->at(0, 1) + $p->at(0, 2), 1.0));
+    assert(near($p->at(1, 0), 1.0 / 3.0));
+    assert($p->at(0, 2) > $p->at(0, 1));
+}
+
+#[group: "tensor"]
+test tensor_argmax_and_one_hot_agree
+{
+    array<usize> $labels = [2, 0, 1];
+    $t = Tensor(oneHot: $labels, classes: 3);
+    $back = $t->argmax();
+    assert($back[0] == 2 && $back[1] == 0 && $back[2] == 1);
+}
+
+#[group: "tensor"]
+test tensor_gather_picks_rows_in_order
+{
+    array<array<float64>> $rows = [[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]];
+    array<usize> $pick = [2, 0];
+    $g = matrix($rows)->gather($pick);
+    assert($g->rows() == 2);
+    assert($g->at(0, 0) == 3.0 && $g->at(1, 1) == 1.0);
+}
+
+#[group: "tensor"]
+test tensor_elementwise_ops
+{
+    array<array<float64>> $a = [[1.0, 2.0]];
+    array<array<float64>> $b = [[3.0, 5.0]];
+    assert(matrix($a)->add(matrix($b))->sum() == 11.0);
+    assert(matrix($b)->sub(matrix($a))->sum() == 5.0);
+    assert(matrix($a)->mul(matrix($b))->sum() == 13.0);
+    assert(matrix($a)->scale(3.0)->sum() == 9.0);
+    assert(matrix($a)->mean() == 1.5);
+}
+
+#[group: "tensor"]
+test tensor_prints_shape_and_rows
+{
+    array<array<float64>> $rows = [[1.0, 2.0], [3.0, 4.0]];
+    $t = matrix($rows);
+    assert("{$t}" == '[2, 2] [[1, 2], [3, 4]]');
+}
+
+#[group: "random"]
+test random_same_seed_same_stream
+{
+    $a = Random(42);
+    $b = Random(42);
+
+    for (int32 $i = 0; $i < 100; $i++) {
+        assert($a->next() == $b->next());
+    }
+
+    $c = Random(43);
+    assert(Random(42)->next() != $c->next());
+}
+
+#[group: "random"]
+test random_uniform_stays_in_range
+{
+    $r = Random(5);
+
+    for (int32 $i = 0; $i < 1000; $i++) {
+        float64 $u = $r->uniform(-2.0, 3.0);
+        assert($u >= -2.0 && $u < 3.0);
+        assert($r->below(7) < 7);
+    }
+}
+
+#[group: "random"]
+test random_shuffle_is_a_permutation
+{
+    array<usize> $items = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    $r = Random(9);
+    $r->shuffle($items);
+    usize $sum = 0;
+
+    foreach ($items as $v) {
+        $sum = $sum + $v;
+    }
+
+    assert($sum == 45);
+}
+
+#[group: "tensor"]
+test tensor_pick_and_weigh_route_values
+{
+    array<array<float64>> $q = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
+    array<usize> $actions = [2, 0];
+    $chosen = matrix($q)->pick($actions);
+    assert($chosen->rows() == 2 && $chosen->cols() == 1);
+    assert($chosen->data[0] == 3.0 && $chosen->data[1] == 4.0);
+
+    // one-hot weighted by the column puts it back where it came from
+    $back = Tensor(oneHot: $actions, classes: 3)->weigh($chosen);
+    assert($back->at(0, 2) == 3.0 && $back->at(1, 0) == 4.0 && $back->sum() == 7.0);
+
+    array<float64> $factors = [2.0, -1.0];
+    $weighed = matrix($q)->weigh(Tensor(column: $factors));
+    assert($weighed->at(0, 1) == 4.0 && $weighed->at(1, 2) == -6.0);
+}
+
+#[group: "tensor"]
+test tensor_log_softmax_is_stable
+{
+    array<array<float64>> $logits = [[1.0, 2.0, 3.0], [-1.0, 0.0, 4.0]];
+    $t = matrix($logits);
+    $direct = $t->softmax()->map(function(float64 $p) : float64 { return std::math::log($p); });
+    $stable = $t->logSoftmax();
+
+    foreach (0 .. $stable->data->count() as $i) {
+        assert(near($stable->data[$i], $direct->data[$i]));
+    }
+
+    // logits far past exp's range still give finite log-probabilities
+    array<array<float64>> $huge = [[1000.0, 0.0]];
+    $far = matrix($huge)->logSoftmax();
+    assert(near($far->data[0], 0.0) && near($far->data[1], -1000.0));
+}
+
+#[group: "tensor"]
+test tensor_sample_follows_the_probabilities
+{
+    array<array<float64>> $probs = [[0.2, 0.8], [1.0, 0.0]];
+    $p = matrix($probs);
+    $rng = Random(3);
+    usize $second = 0;
+
+    for (int32 $i = 0; $i < 2000; $i++) {
+        $draw = $p->sample($rng);
+        assert($draw[1] == 0);
+
+        if ($draw[0] == 1) {
+            $second = $second + 1;
+        }
+    }
+
+    // 1600 expected, stddev about 18
+    assert($second > 1500 && $second < 1700);
+}
+
+#[group: "tensor"]
+test tensor_rows_stack_and_put
+{
+    array<array<float64>> $m = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+    $t = matrix($m);
+    $middle = $t->row(1);
+    assert($middle->rows() == 1 && $middle->cols() == 2 && $middle->data[0] == 3.0);
+
+    array<Tensor> $samples = [$t->row(2), $middle];
+    $stacked = Tensor(stack: $samples);
+    assert($stacked->rank() == 2 && $stacked->rows() == 2 && $stacked->cols() == 2);
+    assert($stacked->at(0, 1) == 6.0 && $stacked->at(1, 0) == 3.0);
+
+    // rank-one samples stack into a matrix too
+    array<usize> $flat = [2];
+    array<float64> $a = [7.0, 8.0];
+    array<Tensor> $vectors = [Tensor($flat, $a), Tensor($flat, $a)];
+    $pair = Tensor(stack: $vectors);
+    assert($pair->rows() == 2 && $pair->cols() == 2 && $pair->at(1, 1) == 8.0);
+
+    $t->put(0, $middle);
+    assert($t->at(0, 0) == 3.0 && $t->at(0, 1) == 4.0);
+}
+
+// textbook triple loop, the reference the tiled kernels are checked against
+internal function slowProduct(const Tensor& $a, const Tensor& $b) : Tensor
+{
+    usize $n = $a->rows();
+    usize $k = $a->cols();
+    usize $m = $b->cols();
+    Tensor $out = Tensor(shape($n, $m));
+
+    for (usize $i = 0; $i < $n; $i++) {
+        for (usize $j = 0; $j < $m; $j++) {
+            float64 $sum = 0.0;
+
+            for (usize $p = 0; $p < $k; $p++) {
+                $sum = $sum + $a->at($i, $p) * $b->at($p, $j);
+            }
+
+            $out->set($i, $j, $sum);
+        }
+    }
+
+    return $out;
+}
+
+// [n, k, m] triples: full tiles, ragged right edges, ragged bottom rows, too small to tile
+internal function productShapes() : array<array<usize>>
+{
+    array<usize> $flat = [1, 1, 1, 5, 3, 7, 13, 9, 17, 4, 4, 4, 8, 1, 8, 3, 6, 2, 4, 8, 2, 64, 256, 40];
+    array<array<usize>> $shapes = array<array<usize>>();
+
+    for (usize $i = 0; $i < $flat->count(); $i = $i + 3) {
+        array<usize> $s = [$flat[$i], $flat[$i + 1], $flat[$i + 2]];
+        $shapes[] = $s;
+    }
+
+    return $shapes;
+}
+
+#[group: "tensor"]
+test tensor_matmul_matches_the_triple_loop_on_every_edge
+{
+    foreach (productShapes() as $i => $s) {
+        uint64 $seed = $i as uint64;
+        Tensor $a = noise(shape($s[0], $s[1]), 10 + $seed);
+        Tensor $b = noise(shape($s[1], $s[2]), 30 + $seed);
+        assert(identical($a->matmul($b), slowProduct($a, $b), 0.0000000001));
+
+        // half the left values zero, the way they arrive after a relu
+        foreach (0 .. $a->data->count() as $v) {
+            if ($a->data[$v] < 0.0) {
+                $a->data[$v] = 0.0;
+            }
+        }
+
+        assert(identical($a->matmul($b), slowProduct($a, $b), 0.0000000001));
+    }
+}
+
+#[group: "tensor"]
+test tensor_matmul_with_no_depth_is_zero
+{
+    Tensor $p = Tensor(shape(3, 0))->matmul(Tensor(shape(0, 0)));
+    assert($p->rows() == 3);
+    assert($p->size() == 0);
+}
+
+#[group: "tensor"]
+test tensor_matmul_transposed_matches_the_transpose
+{
+    foreach (productShapes() as $i => $s) {
+        uint64 $seed = $i as uint64;
+        Tensor $a = noise(shape($s[0], $s[1]), 50 + $seed);
+        Tensor $b = noise(shape($s[2], $s[1]), 70 + $seed);
+        assert(identical($a->matmul(transposed: $b), slowProduct($a, $b->transpose()), 0.0000000001));
+    }
+}
+
+#[group: "tensor"]
+test tensor_accumulate_outer_adds_the_transposed_product
+{
+    foreach (productShapes() as $i => $s) {
+        uint64 $seed = $i as uint64;
+        Tensor $left = noise(shape($s[0], $s[1]), 90 + $seed);
+        Tensor $right = noise(shape($s[0], $s[2]), 110 + $seed);
+        Tensor $start = noise(shape($s[1], $s[2]), 130 + $seed);
+
+        Tensor $fast = $start;
+        $fast->accumulate(outer: $left, $right);
+        Tensor $slow = $start;
+        $slow->accumulate(slowProduct($left->transpose(), $right));
+        assert(identical($fast, $slow, 0.0000000001));
+    }
+}
+
+#[group: "tensor"]
+test tensor_row_broadcasts_on_a_wide_matrix
+{
+    Tensor $t = noise(shape(3, 5), 7);
+    Tensor $row = noise(shape(1, 5), 8);
+    array<usize> $columnShape = [3, 1];
+    Tensor $factors = noise($columnShape, 9);
+
+    Tensor $added = $t->addRow($row);
+    Tensor $sums = $t->sumRows();
+    Tensor $weighed = $t->weigh($factors);
+
+    for (usize $c = 0; $c < 5; $c++) {
+        float64 $sum = 0.0;
+
+        for (usize $r = 0; $r < 3; $r++) {
+            assert($added->at($r, $c) == $t->at($r, $c) + $row->data[$c]);
+            assert($weighed->at($r, $c) == $t->at($r, $c) * $factors->data[$r]);
+            $sum = $sum + $t->at($r, $c);
+        }
+
+        assert(near($sums->at(0, $c), $sum));
+    }
+}
+
+#[group: "tensor"]
+test tensor_dot_matches_a_running_sum
+{
+    array<usize> $sizes = [0, 1, 7, 8, 9, 1000];
+
+    foreach ($sizes as $size) {
+        array<usize> $s = [$size];
+        Tensor $a = noise($s, 11);
+        Tensor $b = noise($s, 12);
+        float64 $sum = 0.0;
+
+        foreach (0 .. $size as $i) {
+            $sum = $sum + $a->data[$i] * $b->data[$i];
+        }
+
+        assert(near($a->dot($b), $sum));
+    }
+}

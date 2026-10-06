@@ -1,0 +1,138 @@
+// a layer the library has never heard of, trained, saved, loaded back
+//
+//   echoc run -m . examples/custom_layer.eco
+
+use ann::{Act, Activation, Adam, Dataset, Decoder, Dense, Encoder, Layer, MeanSquaredError, Mode, Model, ModelError, Param, Random, Registry, Sequential, Tensor, Trainer};
+
+/**
+ * Learned per-feature gate: `output = input * sigmoid(gate)`. The whole
+ * contract: a param, a cached forward, backward into the param, init, and
+ * a config encoding with its decoder.
+ */
+internal class Gate : Layer
+{
+    public const usize $features;
+    public Param $gate;
+    private Tensor $input;
+
+    init
+    {
+        array<usize> $shape = [1, $this->features];
+        array<usize> $empty = [0, $this->features];
+        $this->gate = Param('gate', $shape);
+        $this->input = Tensor($empty);
+    }
+
+    public static function decode(Decoder $in, Registry $registry) : result<Layer, ModelError>
+    {
+        usize $features = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        Layer $layer = Gate($features);
+        return .ok($layer);
+    }
+
+    public function forward(const Tensor& $input, Mode $mode) : Tensor
+    {
+        if ($mode == Mode::train) {
+            $this->input = $input;
+        }
+
+        Tensor $out = $input;
+
+        foreach (0 .. $out->data->count() as $i) {
+            $out->data[$i] = $input->data[$i] * $this->open($i % $this->features);
+        }
+
+        return $out;
+    }
+
+    public function backward(const Tensor& $gradient) : Tensor
+    {
+        Tensor $out = $gradient;
+
+        foreach (0 .. $out->data->count() as $i) {
+            usize $c = $i % $this->features;
+            float64 $s = $this->open($c);
+            $this->gate->grad->data[$c] = $this->gate->grad->data[$c] + $gradient->data[$i] * $this->input->data[$i] * $s * (1.0 - $s);
+            $out->data[$i] = $gradient->data[$i] * $s;
+        }
+
+        return $out;
+    }
+
+    public const function params() : array<Param>
+    {
+        array<Param> $all = [$this->gate];
+        return $all;
+    }
+
+    public function initialize(Random& $rng) : void
+    {
+        // start wide open
+        $this->gate->value->fill(2.0);
+    }
+
+    public const function kind() : string
+    {
+        return 'gate';
+    }
+
+    public const function encode(Encoder $out) : void
+    {
+        $out->size($this->features);
+    }
+
+    public const function summary() : string
+    {
+        return "gate {$this->features} ({$this->features} params)";
+    }
+
+    private const function open(usize $c) : float64
+    {
+        return Activation::sigmoid->apply($this->gate->value->data[$c]);
+    }
+}
+
+// target depends only on the first of four features, so training opens
+// the first gate and pushes the other three down
+$rng = Random(5);
+array<array<float64>> $rows = array<array<float64>>();
+array<float64> $targets = array<float64>();
+
+for (int32 $i = 0; $i < 256; $i++) {
+    array<float64> $row = [$rng->uniform(-1.0, 1.0), $rng->uniform(-1.0, 1.0), $rng->uniform(-1.0, 1.0), $rng->uniform(-1.0, 1.0)];
+    $targets[] = 2.0 * $row[0];
+    $rows[] = $row;
+}
+
+$data = Dataset(Tensor(rows: $rows), Tensor(column: $targets));
+$gate = Gate(4);
+$net = Sequential()->add($gate)->add(Dense(4, 1));
+$model = Model($net, $seed: 2);
+echo $model->summary();
+
+// a little weight decay so the useless gates have a reason to close
+Trainer($epochs: 200, $batchSize: 32)->fit($model, MeanSquaredError(), Adam(0.05, $weightDecay: 0.01), $data);
+
+$weights = $gate->gate->value;
+echo "gates after training: {$weights}";
+
+$registry = Registry()->add('gate', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
+    return Gate::decode($in, $r);
+});
+
+guard $model->save('gate.ann') else ($e) {
+    die("save failed: {$e}");
+}
+
+Model $loaded = guard Model::load('gate.ann', $registry) else ($e) {
+    die("load failed: {$e}");
+}
+
+array<array<float64>> $probe = [[0.5, 0.9, -0.9, 0.3]];
+$x = Tensor(rows: $probe);
+echo "original says {$model->predict($x)->data[0]:.4f}, loaded says {$loaded->predict($x)->data[0]:.4f} (target 1.0)";
+
+std::io::remove('gate.ann');

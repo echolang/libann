@@ -1,0 +1,59 @@
+/**
+ * `str::from` for this library's types, so `"{$e}"` and `"{$t}"` work.
+ * Own file because a namespace is a property of the file: `error.eco` is
+ * `namespace ann;` and cannot also be `namespace str;`.
+ */
+
+namespace str;
+
+public function from(const ann::ModelError& $e) : string
+{
+    return $e->message();
+}
+
+public function from(ann::Activation $a) : string
+{
+    return match ($a) {
+        .linear => 'linear',
+        .relu => 'relu',
+        .leakyRelu => 'leakyRelu',
+        .sigmoid => 'sigmoid',
+        .tanh => 'tanh',
+        .gelu => 'gelu',
+        .softplus => 'softplus',
+        .elu => 'elu',
+        .swish => 'swish',
+    };
+}
+
+/**
+ * Shape, then the matrix view row by row: `[2, 2] [[1, 2], [3, 4]]`.
+ */
+public function from(const ann::Tensor& $t) : string
+{
+    string $out = ann::Tensor::describe($t->shape);
+    $out->append(' [');
+    usize $rows = $t->rows();
+    usize $cols = $t->cols();
+
+    for (usize $r = 0; $r < $rows; $r++) {
+        if ($r > 0) {
+            $out->append(', ');
+        }
+
+        $out->append('[');
+
+        for (usize $c = 0; $c < $cols; $c++) {
+            if ($c > 0) {
+                $out->append(', ');
+            }
+
+            $out->append(str::from($t->data[$r * $cols + $c]));
+        }
+
+        $out->append(']');
+    }
+
+    $out->append(']');
+    return $out;
+}

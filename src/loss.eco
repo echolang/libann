@@ -1,0 +1,272 @@
+/**
+ * What training minimises. Scores each sample on its own; averaging and
+ * weighting live in `Dataset::loss` / `Dataset::gradient`. That keeps a
+ * custom loss short, and every loss gets per-sample weights for free
+ * (advantages, prioritised replay).
+ *
+ * Regression: `MeanSquaredError`, `MeanAbsoluteError` or `Huber`. Binary
+ * classifier ending in sigmoid: `BinaryCrossEntropy`. Multi-class ending
+ * in a plain `Dense` (logits): `CrossEntropy`.
+ */
+
+namespace ann;
+
+public interface Loss
+{
+    /**
+     * Per-sample loss, a `[rows, 1]` column.
+     */
+    const function losses(const Tensor& $output, const Tensor& $target) : Tensor;
+
+    /**
+     * Per-sample d(loss)/d(output). Same shape as `$output`, not divided by
+     * batch size: the reduction does that.
+     */
+    const function gradients(const Tensor& $output, const Tensor& $target) : Tensor;
+
+    /**
+     * What the raw network output means as a prediction. Identity for most
+     * losses; softmax for `CrossEntropy`, whose network outputs logits.
+     */
+    const function predict(const Tensor& $output) : Tensor;
+}
+
+/**
+ * Mean of the squared differences. The default for regression.
+ */
+public class MeanSquaredError : Loss
+{
+    public const function losses(const Tensor& $output, const Tensor& $target) : Tensor
+    {
+        $output->expectSize($target, 'MeanSquaredError');
+        Tensor $d = $output->sub($target);
+        return perSample($d->mul($d));
+    }
+
+    public const function gradients(const Tensor& $output, const Tensor& $target) : Tensor
+    {
+        $output->expectSize($target, 'MeanSquaredError');
+        return $output->sub($target)->scale(2.0 / ($output->cols() as float64));
+    }
+
+    public const function predict(const Tensor& $output) : Tensor
+    {
+        return $output;
+    }
+}
+
+/**
+ * Mean of the absolute differences. Less swayed by outliers than squared
+ * error.
+ */
+public class MeanAbsoluteError : Loss
+{
+    public const function losses(const Tensor& $output, const Tensor& $target) : Tensor
+    {
+        $output->expectSize($target, 'MeanAbsoluteError');
+        Tensor $d = $output->sub($target);
+
+        foreach (0 .. $d->data->count() as $i) {
+            $d->data[$i] = std::math::abs($d->data[$i]);
+        }
+
+        return perSample($d);
+    }
+
+    public const function gradients(const Tensor& $output, const Tensor& $target) : Tensor
+    {
+        $output->expectSize($target, 'MeanAbsoluteError');
+        float64 $n = $output->cols() as float64;
+        Tensor $out = $output;
+
+        foreach (0 .. $out->data->count() as $i) {
+            float64 $d = $output->data[$i] - $target->data[$i];
+            float64 $sign = 0.0;
+
+            if ($d > 0.0) {
+                $sign = 1.0;
+            } else if ($d < 0.0) {
+                $sign = -1.0;
+            }
+
+            $out->data[$i] = $sign / $n;
+        }
+
+        return $out;
+    }
+
+    public const function predict(const Tensor& $output) : Tensor
+    {
+        return $output;
+    }
+}
+
+/**
+ * Squared error up to `delta`, absolute beyond. The usual TD loss of DQN.
+ */
+public class Huber : Loss
+{
+    /**
+     * Where the loss turns from quadratic to linear.
+     */
+    public const float64 $delta = 1.0;
+
+    public const function losses(const Tensor& $output, const Tensor& $target) : Tensor
+    {
+        $output->expectSize($target, 'Huber');
+        Tensor $out = $output;
+
+        foreach (0 .. $out->data->count() as $i) {
+            float64 $d = std::math::abs($output->data[$i] - $target->data[$i]);
+
+            if ($d <= $this->delta) {
+                $out->data[$i] = 0.5 * $d * $d;
+            } else {
+                $out->data[$i] = $this->delta * ($d - 0.5 * $this->delta);
+            }
+        }
+
+        return perSample($out);
+    }
+
+    public const function gradients(const Tensor& $output, const Tensor& $target) : Tensor
+    {
+        $output->expectSize($target, 'Huber');
+        float64 $n = $output->cols() as float64;
+        Tensor $out = $output;
+
+        foreach (0 .. $out->data->count() as $i) {
+            float64 $d = $output->data[$i] - $target->data[$i];
+            $out->data[$i] = std::math::clamp($d, -$this->delta, $this->delta) / $n;
+        }
+
+        return $out;
+    }
+
+    public const function predict(const Tensor& $output) : Tensor
+    {
+        return $output;
+    }
+}
+
+/**
+ * Cross-entropy for probabilities in (0, 1), one per independent yes/no
+ * target. Pair with a final `Act(.sigmoid)`.
+ */
+public class BinaryCrossEntropy : Loss
+{
+    public const function losses(const Tensor& $output, const Tensor& $target) : Tensor
+    {
+        $output->expectSize($target, 'BinaryCrossEntropy');
+        Tensor $out = $output;
+
+        foreach (0 .. $out->data->count() as $i) {
+            float64 $p = BinaryCrossEntropy::clip($output->data[$i]);
+            float64 $t = $target->data[$i];
+            $out->data[$i] = -($t * std::math::log($p) + (1.0 - $t) * std::math::log(1.0 - $p));
+        }
+
+        return perSample($out);
+    }
+
+    public const function gradients(const Tensor& $output, const Tensor& $target) : Tensor
+    {
+        $output->expectSize($target, 'BinaryCrossEntropy');
+        float64 $n = $output->cols() as float64;
+        Tensor $out = $output;
+
+        foreach (0 .. $out->data->count() as $i) {
+            float64 $p = BinaryCrossEntropy::clip($output->data[$i]);
+            $out->data[$i] = ($p - $target->data[$i]) / ($p * (1.0 - $p)) / $n;
+        }
+
+        return $out;
+    }
+
+    public const function predict(const Tensor& $output) : Tensor
+    {
+        return $output;
+    }
+
+    private static function clip(float64 $p) : float64
+    {
+        return std::math::clamp($p, 0.000000000001, 1.0 - 0.000000000001);
+    }
+}
+
+/**
+ * Softmax cross-entropy over logits: the network ends in a plain `Dense`
+ * and this loss applies softmax itself, so the value and the gradient
+ * (`softmax - target`) stay numerically stable. Targets are one-hot rows,
+ * or soft distributions.
+ *
+ * `smoothing` mixes targets with uniform. Cheap regulariser for
+ * overconfident classifiers.
+ */
+public class CrossEntropy : Loss
+{
+    /**
+     * How much of each target is spread evenly over all classes, in [0, 1).
+     */
+    public const float64 $smoothing = 0.0;
+
+    public const function losses(const Tensor& $output, const Tensor& $target) : Tensor
+    {
+        $output->expectSize($target, 'CrossEntropy');
+        Tensor $logp = $output->logSoftmax();
+        usize $cols = $output->cols();
+        array<usize> $shape = [$output->rows(), 1];
+        Tensor $out = Tensor($shape);
+
+        foreach (0 .. $logp->data->count() as $i) {
+            float64 $t = $this->smooth($target->data[$i], $cols);
+
+            if ($t != 0.0) {
+                $out->data[$i / $cols] = $out->data[$i / $cols] - $t * $logp->data[$i];
+            }
+        }
+
+        return $out;
+    }
+
+    public const function gradients(const Tensor& $output, const Tensor& $target) : Tensor
+    {
+        $output->expectSize($target, 'CrossEntropy');
+        Tensor $out = $output->softmax();
+
+        foreach (0 .. $out->data->count() as $i) {
+            $out->data[$i] = $out->data[$i] - $this->smooth($target->data[$i], $out->cols());
+        }
+
+        return $out;
+    }
+
+    public const function predict(const Tensor& $output) : Tensor
+    {
+        return $output->softmax();
+    }
+
+    private const function smooth(float64 $t, usize $classes) : float64
+    {
+        return $t * (1.0 - $this->smoothing) + $this->smoothing / ($classes as float64);
+    }
+}
+
+/**
+ * `[rows, 1]` of each row's mean: how an elementwise loss becomes one
+ * loss per sample.
+ */
+private function perSample(const Tensor& $values) : Tensor
+{
+    usize $rows = $values->rows();
+    usize $cols = $values->cols();
+    array<usize> $shape = [$rows, 1];
+    Tensor $out = Tensor($shape);
+    float64 $n = std::math::max($cols as float64, 1.0);
+
+    foreach (0 .. $values->data->count() as $i) {
+        $out->data[$i / $cols] = $out->data[$i / $cols] + $values->data[$i] / $n;
+    }
+
+    return $out;
+}

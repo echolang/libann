@@ -1,0 +1,67 @@
+/**
+ * Skip connection: `output = input + inner(input)`. Inner must keep the
+ * shape. Building block of ResNets and every transformer sublayer.
+ */
+
+namespace ann;
+
+public class Residual : Layer
+{
+    public Layer $inner;
+
+    public static function decode(Decoder $in, Registry $registry) : result<Layer, ModelError>
+    {
+        Layer $inner = guard $registry->decode($in) else ($e) {
+            return .error($e);
+        }
+
+        Layer $layer = Residual($inner);
+        return .ok($layer);
+    }
+
+    public function forward(const Tensor& $input, Mode $mode) : Tensor
+    {
+        Tensor $branch = $this->inner->forward($input, $mode);
+
+        if (!$branch->sameShape($input)) {
+            $from = Tensor::describe($input->shape);
+            $to = Tensor::describe($branch->shape);
+            die("ann::Residual: the inner layer turned {$from} into {$to}, it must keep the shape");
+        }
+
+        return $input->add($branch);
+    }
+
+    public function backward(const Tensor& $gradient) : Tensor
+    {
+        return $gradient->add($this->inner->backward($gradient));
+    }
+
+    public const function params() : array<Param>
+    {
+        return $this->inner->params();
+    }
+
+    public function initialize(Random& $rng) : void
+    {
+        $this->inner->initialize($rng);
+    }
+
+    public const function kind() : string
+    {
+        return 'residual';
+    }
+
+    public const function encode(Encoder $out) : void
+    {
+        $out->layer($this->inner);
+    }
+
+    public const function summary() : string
+    {
+        string $out = 'residual';
+        $out->append("\n");
+        $out->append(indent($this->inner->summary()));
+        return $out;
+    }
+}

@@ -1,0 +1,69 @@
+/**
+ * Sample indices, reshuffled and cut into minibatches. `Trainer` and
+ * `ann::rl::Ppo` walk their data this way.
+ */
+
+namespace ann;
+
+internal struct Batches
+{
+    /**
+     * Every index once, in the current order.
+     */
+    internal array<usize> $order;
+
+    private usize $size;
+
+    /**
+     * Indices `0 .. $n`, cut `$size` at a time. Size 0 is the whole set as
+     * one batch.
+     */
+    internal constructor(usize $n, usize $size = 0)
+    {
+        array<usize> $order = arr::room<usize>($n);
+
+        foreach (0 .. $n as $i) {
+            usize $index = $i;
+            $order[] = $index;
+        }
+
+        $this->order = mv $order;
+        $this->size = $size;
+
+        if ($size == 0) {
+            $this->size = $n;
+        }
+    }
+
+    /**
+     * Shuffle in place. Starts from the last order, not the identity.
+     */
+    internal function shuffle(Random& $rng) : void
+    {
+        $rng->shuffle($this->order);
+    }
+
+    /**
+     * Current order as consecutive batches of `size`. Last one may be smaller.
+     */
+    internal const function all() : array<array<usize>>
+    {
+        usize $n = $this->order->count();
+        array<array<usize>> $out = array<array<usize>>();
+        usize $start = 0;
+
+        while ($start < $n) {
+            usize $end = std::math::min($start + $this->size, $n);
+            array<usize> $batch = arr::room<usize>($end - $start);
+
+            for (usize $i = $start; $i < $end; $i++) {
+                $batch[] = $this->order[$i];
+            }
+
+            $out[] = $batch;
+            $start = $end;
+        }
+
+        return $out;
+    }
+}

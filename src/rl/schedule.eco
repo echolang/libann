@@ -1,0 +1,37 @@
+/**
+ * Straight line from `from` to `to` over `over` steps, then stays put.
+ * The usual decay of DQN's exploration rate, and a fine learning-rate
+ * schedule too.
+ *
+ *     $epsilon = Schedule(from: 1.0, to: 0.05, over: 10000);
+ *     float64 $e = $epsilon->at($runner->steps);
+ */
+
+namespace ann::rl;
+
+public struct Schedule
+{
+    public float64 $from;
+    public float64 $to;
+    public usize $over;
+
+    public constructor(from: float64 $from, to: float64 $to, over: usize $over)
+    {
+        $this->from = $from;
+        $this->to = $to;
+        $this->over = $over;
+    }
+
+    /**
+     * Value after `$step` steps.
+     */
+    public const function at(usize $step) : float64
+    {
+        if ($step >= $this->over) {
+            return $this->to;
+        }
+
+        float64 $progress = ($step as float64) / ($this->over as float64);
+        return $this->from + ($this->to - $this->from) * $progress;
+    }
+}

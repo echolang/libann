@@ -1,0 +1,84 @@
+/**
+ * Row-wise softmax: each sample's scores become probabilities.
+ *
+ * Put it at the end of a classifier that should *output* probabilities.
+ * Training with `CrossEntropy`: leave it out. That loss applies softmax
+ * itself (faster, safer), and `CrossEntropy::predict` gives them back.
+ */
+
+namespace ann;
+
+public class Softmax : Layer
+{
+    private Tensor $output;
+
+    init
+    {
+        array<usize> $empty = [0];
+        $this->output = Tensor($empty);
+    }
+
+    public static function decode(Decoder $in, Registry $registry) : result<Layer, ModelError>
+    {
+        Layer $layer = Softmax();
+        return .ok($layer);
+    }
+
+    public function forward(const Tensor& $input, Mode $mode) : Tensor
+    {
+        Tensor $out = $input->softmax();
+
+        if ($mode == Mode::train) {
+            $this->output = $out;
+        }
+
+        return $out;
+    }
+
+    public function backward(const Tensor& $gradient) : Tensor
+    {
+        // per row: dx = y * (g - sum(g * y)), softmax Jacobian applied to g
+        usize $rows = $gradient->rows();
+        usize $cols = $gradient->cols();
+        Tensor $out = $gradient;
+
+        for (usize $r = 0; $r < $rows; $r++) {
+            usize $base = $r * $cols;
+            float64 $dot = 0.0;
+
+            for (usize $c = 0; $c < $cols; $c++) {
+                $dot = $dot + $gradient->data[$base + $c] * $this->output->data[$base + $c];
+            }
+
+            for (usize $c = 0; $c < $cols; $c++) {
+                float64 $y = $this->output->data[$base + $c];
+                $out->data[$base + $c] = $y * ($gradient->data[$base + $c] - $dot);
+            }
+        }
+
+        return $out;
+    }
+
+    public const function params() : array<Param>
+    {
+        return array<Param>();
+    }
+
+    public function initialize(Random& $rng) : void
+    {
+    }
+
+    public const function kind() : string
+    {
+        return 'softmax';
+    }
+
+    public const function encode(Encoder $out) : void
+    {
+    }
+
+    public const function summary() : string
+    {
+        return 'softmax';
+    }
+}

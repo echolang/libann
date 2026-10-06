@@ -1,0 +1,103 @@
+use ann::{BinaryCrossEntropy, CrossEntropy, Dataset, Huber, MeanAbsoluteError, MeanSquaredError, Metric, Tensor};
+
+const LOSS_TOLERANCE = 0.000001;
+
+#[group: "losses"]
+test mse_value_and_gradient
+{
+    array<array<float64>> $o = [[1.0, 2.0], [3.0, 4.0]];
+    array<array<float64>> $t = [[1.0, 1.0], [1.0, 1.0]];
+    $loss = MeanSquaredError();
+    // per sample (0 + 1) / 2 and (4 + 9) / 2, mean (0 + 1 + 4 + 9) / 4
+    $each = $loss->losses(Tensor(rows: $o), Tensor(rows: $t));
+    assert($each->rows() == 2 && $each->cols() == 1);
+    assert($each->data[0] == 0.5 && $each->data[1] == 6.5);
+    $data = Dataset(Tensor(rows: $o), Tensor(rows: $t));
+    assert($data->loss($loss, Tensor(rows: $o)) == 3.5);
+    assert(lossGradientError($loss, noise(shape(3, 2), 1), noise(shape(3, 2), 2)) < LOSS_TOLERANCE);
+}
+
+#[group: "losses"]
+test mae_and_huber_gradients
+{
+    assert(lossGradientError(MeanAbsoluteError(), noise(shape(3, 4), 3), noise(shape(3, 4), 4)) < LOSS_TOLERANCE);
+    assert(lossGradientError(Huber(0.3), noise(shape(3, 4), 5), noise(shape(3, 4), 6)) < LOSS_TOLERANCE);
+}
+
+#[group: "losses"]
+test binary_cross_entropy_gradient
+{
+    // probabilities strictly inside (0, 1)
+    $p = noise(shape(4, 2), 7)->scale(0.4)->map(function(float64 $x) : float64 { return $x + 0.5; });
+    array<array<float64>> $t = [[0.0, 1.0], [1.0, 1.0], [0.0, 0.0], [1.0, 0.0]];
+    assert(lossGradientError(BinaryCrossEntropy(), $p, Tensor(rows: $t)) < LOSS_TOLERANCE);
+}
+
+#[group: "losses"]
+test cross_entropy_on_logits
+{
+    array<usize> $labels = [0, 2, 1];
+    $targets = Tensor(oneHot: $labels, classes: 3);
+    $logits = noise(shape(3, 3), 8);
+    $loss = CrossEntropy();
+    assert(lossGradientError($loss, $logits, $targets) < LOSS_TOLERANCE);
+    assert(lossGradientError(CrossEntropy(0.1), $logits, $targets) < LOSS_TOLERANCE);
+
+    // uniform logits cost ln(3) per sample
+    array<usize> $s = [3, 3];
+    $each = $loss->losses(Tensor($s), $targets);
+
+    foreach ($each->data as $v) {
+        float64 $value = $v;
+        assert(near($value, std::math::log(3.0)));
+    }
+
+    $p = $loss->predict($logits);
+    assert(near($p->sum(), 3.0));
+}
+
+#[group: "losses"]
+test dataset_weights_scale_each_sample
+{
+    array<array<float64>> $o = [[1.0], [3.0], [0.0]];
+    array<array<float64>> $t = [[0.0], [1.0], [0.0]];
+    array<float64> $w = [2.0, -1.0, 5.0];
+    $output = Tensor(rows: $o);
+    $data = Dataset(Tensor(rows: $o), Tensor(rows: $t), weights: Tensor(column: $w));
+    $loss = MeanSquaredError();
+
+    // (2 * 1 - 1 * 4 + 5 * 0) / 3 rows, not divided by the weight sum
+    assert(near($data->loss($loss, $output), -2.0 / 3.0));
+
+    // d/do of w * (o - t)^2 / rows
+    $g = $data->gradient($loss, $output);
+    assert(near($g->data[0], 4.0 / 3.0));
+    assert(near($g->data[1], -4.0 / 3.0));
+    assert($g->data[2] == 0.0);
+
+    // batching carries the weights along
+    array<usize> $pick = [1];
+    $one = $data->batch($pick);
+    assert($one->weights->data[0] == -1.0);
+}
+
+#[group: "metrics"]
+test metrics_score_known_cases
+{
+    array<array<float64>> $pred = [[0.9, 0.1], [0.2, 0.8], [0.6, 0.4]];
+    array<usize> $labels = [0, 1, 1];
+    $p = Tensor(rows: $pred);
+    assert(near(Metric::accuracy->score($p, Tensor(oneHot: $labels, classes: 2)), 2.0 / 3.0));
+
+    array<float64> $indices = [0.0, 1.0, 0.0];
+    assert(Metric::accuracy->score($p, Tensor(column: $indices)) == 1.0);
+
+    array<float64> $a = [1.0, 2.0];
+    array<float64> $b = [2.0, 4.0];
+    assert(Metric::mae->score(Tensor(column: $a), Tensor(column: $b)) == 1.5);
+    assert(near(Metric::rmse->score(Tensor(column: $a), Tensor(column: $b)), std::math::sqrt(2.5)));
+
+    array<float64> $probs = [0.7, 0.2, 0.4];
+    array<float64> $truth = [1.0, 0.0, 1.0];
+    assert(near(Metric::binaryAccuracy->score(Tensor(column: $probs), Tensor(column: $truth)), 2.0 / 3.0));
+}

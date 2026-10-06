@@ -1,0 +1,67 @@
+/**
+ * Last `capacity` transitions, sampled uniformly. Learning from a random
+ * mix of old steps rather than the latest few is what makes DQN stable.
+ */
+
+namespace ann::rl;
+
+use ann::Random;
+
+public class Replay
+{
+    /**
+     * Most transitions kept. Once full, every new one replaces the oldest.
+     */
+    public const usize $capacity;
+
+    private array<Transition> $items;
+    private usize $next;
+
+    init
+    {
+        if ($this->capacity == 0) {
+            die('ann::rl::Replay: the capacity must be at least one');
+        }
+
+        $this->items = arr::room<Transition>($this->capacity);
+        $this->next = 0;
+    }
+
+    /**
+     * Store `$t`, evicting the oldest when full.
+     */
+    public function add(const Transition& $t) : void
+    {
+        if ($this->items->count() < $this->capacity) {
+            $this->items[] = $t;
+        } else {
+            $this->items[$this->next] = $t;
+        }
+
+        $this->next = ($this->next + 1) % $this->capacity;
+    }
+
+    public const function count() : usize
+    {
+        return $this->items->count();
+    }
+
+    /**
+     * `$n` transitions drawn uniformly, with replacement. Buffer must not
+     * be empty.
+     */
+    public const function sample(usize $n, Random& $rng) : Transitions
+    {
+        if ($this->items->count() == 0) {
+            die('ann::rl::Replay: cannot sample from an empty buffer');
+        }
+
+        array<Transition> $picked = arr::room<Transition>($n);
+
+        for (usize $i = 0; $i < $n; $i++) {
+            $picked[] = $this->items[$rng->below($this->items->count())];
+        }
+
+        return Transitions($picked);
+    }
+}

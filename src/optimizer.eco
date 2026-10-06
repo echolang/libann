@@ -1,0 +1,149 @@
+/**
+ * Moves params from their gradients. Sees the model's flat `Param` list,
+ * so it does not care about the architecture. `rate` is public on the
+ * built-ins: a schedule is one line in `onEpoch`.
+ */
+
+namespace ann;
+
+public interface Optimizer
+{
+    /**
+     * Apply accumulated gradients. The list is the same every call, so
+     * per-param state can live by position.
+     */
+    function step(const array<Param>& $params) : void;
+}
+
+/**
+ * SGD, with optional Nesterov momentum.
+ */
+public class Sgd : Optimizer
+{
+    public float64 $rate = 0.01;
+
+    /**
+     * Share of the previous step that carries into the next. 0 is plain SGD.
+     */
+    public float64 $momentum = 0.0;
+
+    /**
+     * Nesterov's look-ahead form of momentum.
+     */
+    public bool $nesterov = false;
+
+    private array<Tensor> $velocity = array<Tensor>();
+
+    public function step(const array<Param>& $params) : void
+    {
+        if ($this->velocity->count() != $params->count()) {
+            $this->velocity = zeros($params);
+        }
+
+        foreach (0 .. $params->count() as $k) {
+            Param $p = $params[$k];
+
+            foreach (0 .. $p->value->data->count() as $i) {
+                float64 $g = $p->grad->data[$i];
+                float64 $update = $g;
+
+                if ($this->momentum != 0.0) {
+                    float64 $v = $this->momentum * $this->velocity[$k]->data[$i] + $g;
+                    $this->velocity[$k]->data[$i] = $v;
+                    $update = $v;
+
+                    if ($this->nesterov) {
+                        $update = $g + $this->momentum * $v;
+                    }
+                }
+
+                $p->value->data[$i] = $p->value->data[$i] - $this->rate * $update;
+            }
+        }
+    }
+}
+
+/**
+ * Adam: per-value step sizes from running averages of the gradient and its
+ * square. The usual default. Non-zero `weightDecay` makes it AdamW.
+ */
+public class Adam : Optimizer
+{
+    public float64 $rate = 0.001;
+
+    /**
+     * Decay of the running mean of gradients.
+     */
+    public float64 $beta1 = 0.9;
+
+    /**
+     * Decay of the running mean of squared gradients.
+     */
+    public float64 $beta2 = 0.999;
+
+    /**
+     * Floor on the denominator so a flat gradient does not divide by zero.
+     */
+    public float64 $epsilon = 0.00000001;
+
+    /**
+     * Decoupled weight decay per step, relative to the rate. That's AdamW.
+     */
+    public float64 $weightDecay = 0.0;
+
+    private array<Tensor> $first = array<Tensor>();
+    private array<Tensor> $second = array<Tensor>();
+    private uint64 $steps = 0;
+
+    public function step(const array<Param>& $params) : void
+    {
+        if ($this->first->count() != $params->count()) {
+            $this->first = zeros($params);
+            $this->second = zeros($params);
+            $this->steps = 0;
+        }
+
+        $this->steps = $this->steps + 1;
+        float64 $t = $this->steps as float64;
+        float64 $correct1 = 1.0 - std::math::pow($this->beta1, $t);
+        float64 $correct2 = 1.0 - std::math::pow($this->beta2, $t);
+
+        // hoist fields: the inner loop reads locals, nothing reloads through $this
+        float64 $beta1 = $this->beta1;
+        float64 $beta2 = $this->beta2;
+        float64 $rest1 = 1.0 - $beta1;
+        float64 $rest2 = 1.0 - $beta2;
+        float64 $rate = $this->rate;
+        float64 $epsilon = $this->epsilon;
+        float64 $decay = $this->weightDecay;
+
+        foreach (0 .. $params->count() as $k) {
+            Param $p = $params[$k];
+            Tensor& $first = $this->first[$k];
+            Tensor& $second = $this->second[$k];
+
+            foreach (0 .. $p->value->data->count() as $i) {
+                float64 $g = $p->grad->data[$i];
+                float64 $m = $beta1 * $first->data[$i] + $rest1 * $g;
+                float64 $v = $beta2 * $second->data[$i] + $rest2 * $g * $g;
+                $first->data[$i] = $m;
+                $second->data[$i] = $v;
+
+                float64 $w = $p->value->data[$i];
+                float64 $update = ($m / $correct1) / (std::math::sqrt($v / $correct2) + $epsilon);
+                $p->value->data[$i] = $w - $rate * ($update + $decay * $w);
+            }
+        }
+    }
+}
+
+private function zeros(const array<Param>& $params) : array<Tensor>
+{
+    array<Tensor> $out = arr::room<Tensor>($params->count());
+
+    foreach ($params as $p) {
+        $out[] = Tensor($p->value->shape);
+    }
+
+    return $out;
+}
