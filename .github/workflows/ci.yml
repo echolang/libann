@@ -24,5 +24,8 @@ jobs:
 
       - uses: echolang/setup-echo@v1
 
+      - name: Install packages
+        run: epm install
+
       - name: Build and test
         run: echoc test
