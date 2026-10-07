@@ -1,8 +1,11 @@
-// fit sin(x) on [-pi, pi] with a small relu network
+// fit sin(x) on [-pi, pi] with a small relu network. the terminal gets
+// the bars, regression.jsonl gets one JSON object per event:
 //
 //   echoc run -m . examples/regression.eco
+//   tail -f regression.jsonl                  # from another shell
 
-use ann::{Act, Adam, Dataset, Dense, EpochReport, Evaluation, MeanSquaredError, Model, Sequential, Tensor, Trainer};
+use ann::{Act, Adam, Dataset, Dense, FileLog, Log, MeanSquaredError, Model, Sequential, Tensor, Trainer};
+use ann::cli;
 
 array<float64> $xs = array<float64>();
 array<float64> $ys = array<float64>();
@@ -24,27 +27,29 @@ $net = Sequential()
     ->add(Dense(32, 1));
 
 $model = Model($net, $seed: 3);
-echo $model->summary();
+$log = Log()
+    ->to(cli::Console())
+    ->to(FileLog('regression.jsonl'));
+$log->begin('regression');
+$log->model($model);
 
-$adam = Adam(0.01);
 $trainer = Trainer(
     $epochs: 300,
     $batchSize: 16,
     $metric: .rmse,
     $validation: $split->holdout,
-    $onEpoch: function(EpochReport $r) : void {
-        if ($r->epoch % 50 == 0) {
-            Evaluation $v = $r->validation ?? $r->train;
-            echo "epoch {$r->epoch}: train rmse {$r->train->metric:.4f}, validation rmse {$v->metric:.4f}";
-        }
-    },
+    $observer: $log->training(),
 );
-$trainer->fit($model, MeanSquaredError(), $adam, $split->train);
+$trainer->fit($model, MeanSquaredError(), Adam(0.01), $split->train);
 
 array<float64> $probe = [-2.0, -1.0, 0.0, 0.5, 1.5, 3.0];
 $out = $model->predict(Tensor(column: $probe));
+$table = $log->table(['x', 'sin(x)', 'network']);
 
 foreach ($probe as $i => $x) {
     float64 $want = std::math::sin($x);
-    echo "sin({$x:.1f}) = {$want:.4f}, network says {$out->data[$i]:.4f}";
+    $table->row(["{$x:.1f}", "{$want:.4f}", "{$out->data[$i]:.4f}"]);
 }
+
+$log->note('probe', $table);
+$log->end('done, every epoch is in regression.jsonl');

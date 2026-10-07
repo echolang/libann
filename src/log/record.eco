@@ -1,0 +1,347 @@
+/**
+ * One line of a `FileLog`, before it is written: named fields in order,
+ * rendered as a JSON object or as logfmt `key=value` pairs.
+ */
+
+namespace ann;
+
+internal enum Value
+{
+    case text(string $s);
+
+    /**
+     * A number already written out, `t` with its three decimals, say.
+     */
+    case raw(string $s);
+
+    case number(float64 $x);
+    case flag(bool $b);
+
+    /**
+     * A JSON array of strings. In logfmt every item gets a line of its
+     * own, keyed `$one`.
+     */
+    case list(string $one, array<string> $items);
+
+    /**
+     * A JSON array of rows, with `headers` beside it. In logfmt every row
+     * gets a line of its own, a cell under each header's key.
+     */
+    case grid(array<string> $headers, array<array<string>> $rows);
+}
+
+internal struct Field
+{
+    public string $key;
+    public Value $value;
+}
+
+internal struct Record
+{
+    public array<Field> $fields = array<Field>();
+
+    public function text(string $key, string $value) : void
+    {
+        $this->fields[] = Field($key, .text($value));
+    }
+
+    public function raw(string $key, string $value) : void
+    {
+        $this->fields[] = Field($key, .raw($value));
+    }
+
+    public function count(string $key, usize $value) : void
+    {
+        uint64 $n = $value as uint64;
+        $this->fields[] = Field($key, .raw("{$n}"));
+    }
+
+    public function number(string $key, float64 $value) : void
+    {
+        $this->fields[] = Field($key, .number($value));
+    }
+
+    public function flag(string $key, bool $value) : void
+    {
+        $this->fields[] = Field($key, .flag($value));
+    }
+
+    public function list(string $key, string $one, array<string> $items) : void
+    {
+        $this->fields[] = Field($key, .list($one, $items));
+    }
+
+    public function grid(string $key, array<string> $headers, array<array<string>> $rows) : void
+    {
+        $this->fields[] = Field($key, .grid($headers, $rows));
+    }
+
+    /**
+     * One JSON object, no newline in it.
+     */
+    public const function json() : string
+    {
+        string $out = '{';
+
+        foreach ($this->fields as $i => $field) {
+            if ($i > 0) {
+                $out->append(',');
+            }
+
+            match ($field->value) {
+                Value::text($s) => {
+                    $out->append(quote($field->key));
+                    $out->append(':');
+                    $out->append(quote($s));
+                },
+                Value::raw($s) => {
+                    $out->append(quote($field->key));
+                    $out->append(':');
+                    $out->append($s);
+                },
+                Value::number($x) => {
+                    $out->append(quote($field->key));
+                    $out->append(':');
+                    $out->append(json($x));
+                },
+                Value::flag($b) => {
+                    $out->append(quote($field->key));
+                    $out->append(':');
+                    $out->append(json($b));
+                },
+                Value::list($one, $items) => {
+                    $out->append(quote($field->key));
+                    $out->append(':');
+                    $out->append(json($items));
+                },
+                Value::grid($headers, $rows) => {
+                    $out->append('"headers":');
+                    $out->append(json($headers));
+                    $out->append(',');
+                    $out->append(quote($field->key));
+                    $out->append(':[');
+                    array<array<string>> $grid = $rows;
+
+                    foreach ($grid as $r => $row) {
+                        if ($r > 0) {
+                            $out->append(',');
+                        }
+
+                        $out->append(json($row));
+                    }
+
+                    $out->append(']');
+                },
+            }
+        }
+
+        $out->append('}');
+        return $out;
+    }
+
+    /**
+     * logfmt: the plain fields on one line. A list or a grid repeats that
+     * line once per item or row, with the item or the row's cells added.
+     */
+    public const function lines() : array<string>
+    {
+        string $base = '';
+
+        foreach ($this->fields as $field) {
+            match ($field->value) {
+                Value::text($s) => { pair($base, $field->key, logfmt($s)); },
+                Value::raw($s) => { pair($base, $field->key, $s); },
+                Value::number($x) => { pair($base, $field->key, "{$x}"); },
+                Value::flag($b) => { pair($base, $field->key, json($b)); },
+                else => {},
+            }
+        }
+
+        array<string> $out = array<string>();
+
+        foreach ($this->fields as $field) {
+            match ($field->value) {
+                Value::list($one, $items) => {
+                    array<string> $list = $items;
+
+                    foreach ($list as $item) {
+                        string $line = $base->clone();
+                        pair($line, $one, logfmt($item));
+                        $out[] = $line;
+                    }
+                },
+                Value::grid($headers, $rows) => {
+                    array<array<string>> $grid = $rows;
+
+                    foreach ($grid as $row) {
+                        string $line = $base->clone();
+
+                        foreach ($row as $c => $cell) {
+                            if ($c < $headers->count()) {
+                                pair($line, key($headers[$c]), logfmt($cell));
+                            }
+                        }
+
+                        $out[] = $line;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        if ($out->count() == 0) {
+            $out[] = $base;
+        }
+
+        return $out;
+    }
+}
+
+/**
+ * Append ` key=value` to a logfmt line, without the space on an empty one.
+ */
+internal function pair(string& $line, const string& $key, const string& $value) : void
+{
+    if (!$line->empty()) {
+        $line->append(' ');
+    }
+
+    $line->append($key);
+    $line->append('=');
+    $line->append($value);
+}
+
+/**
+ * A logfmt value: bare when it is one plain word, quoted like JSON when it
+ * is empty or holds a space, `=`, `"` or a control character.
+ */
+internal function logfmt(const string& $s) : string
+{
+    if ($s->empty()) {
+        return '""';
+    }
+
+    for (usize $i = 0; $i < $s->size(); $i++) {
+        uint8 $b = $s->byte($i);
+
+        if ($b <= 32 || $b == 34 || $b == 61 || $b == 92 || $b == 127) {
+            return quote($s);
+        }
+    }
+
+    return $s->clone();
+}
+
+/**
+ * A logfmt key: spaces become underscores, so `val loss` stays one word.
+ */
+internal function key(const string& $header) : string
+{
+    return str::join(str::split($header, ' ')->owned(), '_');
+}
+
+/**
+ * `$s` as a JSON string, quotes included.
+ */
+internal function quote(const string& $s) : string
+{
+    string $out = '"';
+    usize $from = 0;
+
+    for (usize $i = 0; $i < $s->size(); $i++) {
+        string $escaped = escape($s->byte($i));
+
+        if ($escaped->empty()) {
+            continue;
+        }
+
+        $out->append($s->sub($from, $i - $from));
+        $out->append($escaped);
+        $from = $i + 1;
+    }
+
+    $out->append($s->sub($from, $s->size() - $from));
+    $out->append('"');
+    return $out;
+}
+
+/**
+ * The JSON escape for one byte, empty when it goes in as it is.
+ */
+internal function escape(uint8 $b) : string
+{
+    if ($b == 34) {
+        return "\\\"";
+    }
+
+    if ($b == 92) {
+        return "\\\\";
+    }
+
+    if ($b == 10) {
+        return "\\n";
+    }
+
+    if ($b == 13) {
+        return "\\r";
+    }
+
+    if ($b == 9) {
+        return "\\t";
+    }
+
+    if ($b < 32) {
+        string $out = "\\u00";
+        $out->append(hex($b / 16));
+        $out->append(hex($b % 16));
+        return $out;
+    }
+
+    return '';
+}
+
+internal function hex(uint8 $digit) : string
+{
+    uint32 $d = $digit as uint32;
+    return "{$d:x}";
+}
+
+/**
+ * A JSON number. NaN and the infinities have no JSON spelling, so they
+ * are null.
+ */
+internal function json(float64 $x) : string
+{
+    // nan and the infinities are the floats whose difference from
+    // themselves is not zero
+    if ($x - $x != 0.0) {
+        return 'null';
+    }
+
+    return "{$x}";
+}
+
+internal function json(bool $b) : string
+{
+    if ($b) {
+        return 'true';
+    }
+
+    return 'false';
+}
+
+internal function json(const array<string>& $items) : string
+{
+    string $out = '[';
+
+    foreach ($items as $i => $item) {
+        if ($i > 0) {
+            $out->append(',');
+        }
+
+        $out->append(quote($item));
+    }
+
+    $out->append(']');
+    return $out;
+}

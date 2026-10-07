@@ -1,0 +1,275 @@
+/**
+ * One fit on the terminal: a window streaming one row per epoch with a
+ * live bar under it, then the milestone epochs as a table. `Console`
+ * makes one for every `Event::plan` and feeds it the fit's events.
+ */
+
+namespace ann::cli;
+
+use command;
+use command::element;
+use std::time;
+
+internal class Training
+{
+    public command::CLIContext $context;
+
+    /**
+     * Epochs between milestone rows. 0 picks about five over the fit.
+     */
+    public usize $every;
+
+    /**
+     * Rows of the epoch window. The window collapses when the fit ends; the
+     * milestone table is what stays.
+     */
+    public int32 $lines;
+
+    /**
+     * Epochs between two streamed rows. Rows only stream on a terminal: a
+     * pipe gets the milestone table and nothing else.
+     */
+    public usize $stream = 1;
+
+    private element::LogStream? $log = null;
+    private array<string> $pending = array<string>();
+    private element::Progress? $bar = null;
+    private ann::Plan $plan = ann::Plan(0, 0, 0, .none, false);
+    private Throttle $throttle = Throttle();
+    private time::instant $started = time::instant::now();
+    private int32 $done = 0;
+    private string $detail = '';
+    private string $live = '';
+    private element::Table? $milestones = null;
+
+    /**
+     * Starts drawing `$plan` right away.
+     */
+    public constructor(command::CLIContext $context, const ann::Plan& $plan, usize $every = 0, int32 $lines = 6)
+    {
+        $this->context = $context;
+        $this->every = $every;
+        $this->lines = $lines;
+        $this->plan = $plan;
+        $this->milestones = $this->table();
+
+        if ($this->every == 0) {
+            $this->every = std::math::max($plan->epochs / 5, 1 as usize);
+        }
+
+        $log = $this->context->create<element::LogStream>($this->lines);
+        // the bar is the cadence; the log's own tick only catches a stall
+        $log->interval = 1000;
+        $bar = $log->progress();
+        $bar->start('training', ($plan->epochs * $plan->batches) as int32);
+        $this->log = $log;
+        $this->bar = $bar;
+    }
+
+    /**
+     * One more gradient step.
+     */
+    public function batch() : void
+    {
+        $this->done = $this->done + 1;
+
+        if ($this->throttle->due()) {
+            $this->sync();
+        }
+    }
+
+    public function epoch(const ann::EpochReport& $report) : void
+    {
+        $this->detail = $this->describe($report);
+        $this->live = $this->detail;
+
+        if ($this->streaming()) {
+            // the window above already shows the numbers
+            $this->live = "epoch {$report->epoch}/{$this->plan->epochs}";
+        }
+
+        if ($report->epoch == 1 || $report->epoch % $this->every == 0 || $report->epoch == $this->plan->epochs) {
+            $this->milestone($report);
+        }
+
+        if (!$this->streaming() || $report->epoch % $this->stream != 0) {
+            return;
+        }
+
+        $this->pending[] = $this->row($report);
+
+        if ($this->throttle->due()) {
+            $this->sync();
+        }
+    }
+
+    /**
+     * Hand the held rows to the window, then move the bar. A docked bar
+     * draws the whole frame at once, so rows and bar always land in the
+     * same paint and never show two different epochs.
+     */
+    private function sync() : void
+    {
+        element::Progress $bar = guard $this->bar else {
+            return;
+        }
+
+        element::LogStream $log = guard $this->log else {
+            return;
+        }
+
+        if ($this->pending->count() > 0) {
+            $log->push(str::join($this->pending, "\n"));
+            $this->pending->clear();
+        }
+
+        $bar->set($this->done, $this->live);
+    }
+
+    /**
+     * Rows stream only on a terminal; a pipe gets the milestone table.
+     */
+    private const function streaming() : bool
+    {
+        return $this->context->caps->interactive && $this->stream > 0;
+    }
+
+    /**
+     * Finish the bar and leave the milestone table.
+     */
+    public function finish() : void
+    {
+        element::Progress $bar = guard $this->bar else {
+            return;
+        }
+
+        $this->live = $this->detail;
+        $this->sync();
+        $bar->finish();
+        $this->bar = null;
+        $this->log = null;
+
+        element::Table $t = guard $this->milestones else {
+            return;
+        }
+
+        string $sep = separator($this->context->caps);
+        string $took = seconds(time::instant::now() - $this->started);
+        string $title = "trained {$this->plan->epochs} epochs{$sep}{$took}";
+        $this->context->gap();
+        $this->context->print(element::noteFrame($this->context->channel(), $title, $t->render()->rows));
+    }
+
+    /**
+     * The bar's detail: where the fit is and what the last epoch scored.
+     */
+    private const function describe(const ann::EpochReport& $report) : string
+    {
+        string $sep = separator($this->context->caps);
+        string $loss = figure($report->train->loss);
+        string $out = "epoch {$report->epoch}/{$this->plan->epochs}{$sep}loss {$loss}";
+        string $name = $this->plan->metric->name();
+
+        if (!$name->empty()) {
+            $out->append("{$sep}{$name} {$report->train->metric:.3f}");
+        }
+
+        ann::Evaluation $held = guard $report->validation else {
+            return $out;
+        }
+
+        if ($name->empty()) {
+            string $heldLoss = figure($held->loss);
+            $out->append("{$sep}val loss {$heldLoss}");
+        } else {
+            $out->append("{$sep}val {$held->metric:.3f}");
+        }
+
+        return $out;
+    }
+
+    /**
+     * One streamed row: the epoch right-aligned to the widest one, then the
+     * same numbers the milestone table keeps.
+     */
+    private const function row(const ann::EpochReport& $report) : string
+    {
+        string $sep = separator($this->context->caps);
+        string $total = "{$this->plan->epochs}";
+        string $epoch = pad("{$report->epoch}", command::textWidth($total));
+        string $loss = figure($report->train->loss);
+        string $out = "epoch {$epoch}{$sep}loss {$loss}";
+        string $name = $this->plan->metric->name();
+
+        if (!$name->empty()) {
+            $out->append("{$sep}{$name} {$report->train->metric:.3f}");
+        }
+
+        ann::Evaluation $held = guard $report->validation else {
+            return $out;
+        }
+
+        string $heldLoss = figure($held->loss);
+        $out->append("{$sep}val loss {$heldLoss}");
+
+        if (!$name->empty()) {
+            $out->append("{$sep}val {$name} {$held->metric:.3f}");
+        }
+
+        return $out;
+    }
+
+    /**
+     * Columns follow the plan: the metric only when there is one, the
+     * validation pair only when there is a validation set.
+     */
+    private function table() : element::Table
+    {
+        $t = $this->context->create<element::Table>();
+        $t->border = false;
+        string $name = $this->plan->metric->name();
+        $t->column('epoch');
+        $t->column('loss');
+
+        if (!$name->empty()) {
+            $t->column($name);
+        }
+
+        if ($this->plan->validation) {
+            $t->column('val loss');
+
+            if (!$name->empty()) {
+                $t->column("val {$name}");
+            }
+        }
+
+        return $t;
+    }
+
+    private function milestone(const ann::EpochReport& $report) : void
+    {
+        element::Table $t = guard $this->milestones else {
+            return;
+        }
+
+        bool $scored = $this->plan->metric != ann::Metric::none;
+        array<string> $row = ["{$report->epoch}", figure($report->train->loss)];
+
+        if ($scored) {
+            $row[] = "{$report->train->metric:.3f}";
+        }
+
+        ann::Evaluation $held = guard $report->validation else {
+            $t->row($row);
+            return;
+        }
+
+        $row[] = figure($held->loss);
+
+        if ($scored) {
+            $row[] = "{$held->metric:.3f}";
+        }
+
+        $t->row($row);
+    }
+}

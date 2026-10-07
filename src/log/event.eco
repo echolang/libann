@@ -1,0 +1,152 @@
+/**
+ * What a run says about itself, as data. A `Log` turns calls into these
+ * and hands every one to its sinks: `cli::Console` draws them, `FileLog`
+ * writes them down, a sink of your own does whatever it likes.
+ *
+ *     public class Tally : ann::Sink
+ *     {
+ *         public usize $epochs = 0;
+ *
+ *         public function write(const ann::Event& $event) : void
+ *         {
+ *             match ($event) {
+ *                 ann::Event::epoch($report) => { $this->epochs = $this->epochs + 1; },
+ *                 else => {},
+ *             }
+ *         }
+ *     }
+ */
+
+namespace ann;
+
+public interface Sink
+{
+    /**
+     * Every event the log emits, in order. Ignore the ones you do not
+     * care about.
+     */
+    function write(const Event& $event) : void;
+}
+
+public enum Event
+{
+    /**
+     * A run titled `$title` starts. Optional; a log may never send it.
+     */
+    case begin(string $title);
+
+    /**
+     * The run is over, `$message` says how it went.
+     */
+    case end(string $message);
+
+    /**
+     * The network: its parameter count and `Layer::summary`, one line per
+     * layer, two spaces per level of nesting.
+     */
+    case model(usize $params, string $summary);
+
+    /**
+     * A `Trainer` is about to fit.
+     */
+    case plan(Plan $plan);
+
+    /**
+     * One gradient step of the fit. `$index` counts from 0 within the
+     * epoch, `$loss` is that batch's mean loss.
+     */
+    case batch(usize $epoch, usize $index, float64 $loss);
+
+    /**
+     * One epoch of the fit is done.
+     */
+    case epoch(EpochReport $report);
+
+    /**
+     * The fit is done, every epoch's report in order.
+     */
+    case fitted(History $history);
+
+    /**
+     * A loop of your own, reinforcement learning say, starts. It runs
+     * `$total` rounds.
+     */
+    case run(string $label, int32 $total);
+
+    /**
+     * One round of that loop is done.
+     */
+    case round(Round $round);
+
+    /**
+     * An episode finished during the loop: the `$n`th, its return and the
+     * mean return over the window `Run` keeps.
+     */
+    case episode(usize $n, float64 $reward, float64 $mean);
+
+    /**
+     * The loop stopped, as a success or not.
+     */
+    case finished(bool $ok, string $message);
+
+    /**
+     * An aside titled `$title`, one entry per row.
+     */
+    case note(string $title, array<string> $rows);
+
+    /**
+     * A table titled `$title`.
+     */
+    case table(string $title, Table $table);
+}
+
+/**
+ * Where a loop of your own stands after one round.
+ */
+public struct Round
+{
+    /**
+     * Rounds done, out of `total`.
+     */
+    public int32 $at;
+
+    public int32 $total;
+
+    /**
+     * Episodes finished so far.
+     */
+    public usize $episodes;
+
+    /**
+     * Environment steps taken so far.
+     */
+    public usize $steps;
+
+    /**
+     * Mean return over the window `Run` keeps.
+     */
+    public float64 $mean;
+
+    /**
+     * What the round's update measured.
+     */
+    public ann::rl::Report $report;
+}
+
+/**
+ * Rows of text under a header row. Build one with `Log::table`, fill it
+ * with `row`, hand it to `Log::note`.
+ */
+public struct Table
+{
+    public array<string> $headers = array<string>();
+    public array<array<string>> $rows = array<array<string>>();
+
+    /**
+     * Add a row, one cell per header.
+     */
+    public function row(array<string> $cells) : void
+    {
+        $this->rows[] = $cells;
+    }
+}

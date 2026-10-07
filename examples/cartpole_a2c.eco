@@ -3,8 +3,9 @@
 //
 //   echoc run -m . examples/cartpole_a2c.eco
 
-use ann::{Act, Adam, Dense, Model, Random, Sequential};
+use ann::{Act, Adam, Dense, Log, Model, Random, Sequential};
 use ann::rl::{ActorCritic, CartPole, Choice, Policy, Report, Rollout, Runner};
+use ann::cli;
 
 internal function net(usize $outputs) : Sequential
 {
@@ -21,6 +22,10 @@ $policy = Policy(Model(net(2), $seed: 1));
 $agent = ActorCritic($policy, Model(net(1), $seed: 2), Adam(0.001), Adam(0.005), $lambda: 0.99);
 $rollout = Rollout();
 $rng = Random(1);
+$log = Log()->to(cli::Console());
+$log->begin('cartpole a2c');
+$log->model($policy->model);
+$run = $log->run('rounds', 600);
 
 for (int32 $round = 1; $round <= 600; $round++) {
     for (int32 $i = 0; $i < 256; $i++) {
@@ -30,16 +35,15 @@ for (int32 $round = 1; $round <= 600; $round++) {
 
     Report $r = $agent->update($rollout);
     $rollout->clear();
-
-    if ($round % 25 == 0) {
-        echo "round {$round}: {$runner->episodes->count()} episodes, mean return {$runner->mean(20):.1f}, entropy {$r->entropy:.3f}";
-    }
+    $run->update($round, $runner, $r);
 
     if ($runner->episodes->count() >= 20 && $runner->mean(20) >= 450.0) {
-        echo "solved in round {$round} after {$runner->episodes->count()} episodes: mean return {$runner->mean(20):.1f}";
+        $run->done("solved in round {$round} after {$runner->episodes->count()} episodes, mean return {$runner->mean(20):.1f}");
         break;
     }
 }
+
+$run->fail("not solved, mean return {$runner->mean(20):.1f}");
 
 guard $policy->model->save('cartpole-a2c.ann') else ($e) {
     die("save failed: {$e}");
@@ -56,5 +60,6 @@ while ($check->episodes->count() < 10) {
     $check->step($greedy->greedy($check->observation));
 }
 
-echo "loaded policy, greedy over 10 episodes: mean return {$check->mean(10):.1f}";
+$log->note('cartpole-a2c.ann', "greedy over 10 episodes: mean return {$check->mean(10):.1f}");
+$log->end('done');
 std::io::remove('cartpole-a2c.ann');

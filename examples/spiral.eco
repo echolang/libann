@@ -3,7 +3,8 @@
 //
 //   echoc run -m . examples/spiral.eco
 
-use ann::{Act, Adam, CrossEntropy, Dataset, Dense, Dropout, EpochReport, Evaluation, LayerNorm, Model, Random, Residual, Sequential, Tensor, Trainer};
+use ann::{Act, Adam, CrossEntropy, Dataset, Dense, Dropout, EpochReport, LayerNorm, Log, Model, Random, Residual, Sequential, Tensor, Trainer};
+use ann::cli;
 
 const CLASSES = 3;
 const PER_CLASS = 100;
@@ -45,7 +46,9 @@ internal function network() : Sequential
 
 $split = spirals(42)->split(0.2, $seed: 7);
 $model = Model(network(), $seed: 1);
-echo $model->summary();
+$log = Log()->to(cli::Console($every: 25));
+$log->begin('spiral');
+$log->model($model);
 
 $adam = Adam(0.01, $weightDecay: 0.0001);
 $trainer = Trainer(
@@ -54,15 +57,11 @@ $trainer = Trainer(
     $metric: .accuracy,
     $clip: 5.0,
     $validation: $split->holdout,
+    $observer: $log->training(),
+    // step decay: halve the rate every 50 epochs
     $onEpoch: function(EpochReport $r) : void {
-        // step decay: halve the rate every 50 epochs
         if ($r->epoch % 50 == 0) {
             $adam->rate = $adam->rate * 0.5;
-        }
-
-        if ($r->epoch % 25 == 0) {
-            Evaluation $v = $r->validation ?? $r->train;
-            echo "epoch {$r->epoch}: loss {$r->train->loss:.4f}, accuracy {$r->train->metric:.3f}, validation {$v->metric:.3f}";
         }
     },
 );
@@ -82,6 +81,10 @@ guard $fresh->loadWeights($path) else ($e) {
 }
 
 $after = $fresh->evaluate($split->holdout, CrossEntropy(), .accuracy);
-echo "fresh network: validation accuracy {$before->metric:.3f} before loading, {$after->metric:.3f} after";
+$table = $log->table(['fresh network', 'validation accuracy']);
+$table->row(['before loadWeights', "{$before->metric:.3f}"]);
+$table->row(['after loadWeights', "{$after->metric:.3f}"]);
+$log->note($path, $table);
+$log->end('done');
 
 std::io::remove($path);

@@ -1,0 +1,59 @@
+/**
+ * Watch a `Trainer` work. An observer hears the plan, every batch, every
+ * epoch and the end. No terminal involved: `Log::training` turns them into
+ * events for any sink, a test that counts calls is another.
+ *
+ *     Trainer($epochs: 50, $observer: $log->training())
+ *         ->fit($model, CrossEntropy(), Adam(), $data);
+ */
+
+namespace ann;
+
+/**
+ * What `fit` is about to do, handed over before the first batch.
+ */
+public struct Plan
+{
+    public usize $epochs;
+
+    /**
+     * Gradient steps per epoch.
+     */
+    public usize $batches;
+
+    /**
+     * Training samples, not counting the validation set.
+     */
+    public usize $samples;
+
+    public Metric $metric;
+
+    /**
+     * True when every epoch also reports a validation evaluation.
+     */
+    public bool $validation;
+}
+
+public interface Observer
+{
+    /**
+     * Once, before the first batch.
+     */
+    function begin(const Plan& $plan) : void;
+
+    /**
+     * After every gradient step. `$index` counts from 0 within the epoch,
+     * `$loss` is that batch's mean loss.
+     */
+    function batch(usize $epoch, usize $index, float64 $loss) : void;
+
+    /**
+     * After every epoch, with the same report `History` keeps.
+     */
+    function epoch(const EpochReport& $report) : void;
+
+    /**
+     * Once, after the last epoch.
+     */
+    function end(const History& $history) : void;
+}

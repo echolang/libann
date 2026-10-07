@@ -1,0 +1,110 @@
+/**
+ * One `Log::run` on the terminal: a live bar, finished episodes streaming
+ * through a window above it. `Console` makes one for every `Event::run`
+ * and feeds it the loop's events.
+ */
+
+namespace ann::cli;
+
+use command;
+use command::element;
+
+internal class Run
+{
+    public command::CLIContext $context;
+
+    private element::LogStream $log;
+    private element::Progress $bar;
+    private array<string> $pending = array<string>();
+    private Throttle $throttle = Throttle();
+    private int32 $at = 0;
+
+    /**
+     * `$lines` is the height of the episode window above the bar.
+     */
+    public constructor(command::CLIContext $context, string $label, int32 $total, int32 $lines = 6)
+    {
+        $this->context = $context;
+        $this->log = $context->create<element::LogStream>($lines);
+        // the bar is the cadence; the log's own tick only catches a stall
+        $this->log->interval = 1000;
+        $this->bar = $this->log->progress();
+        $this->bar->start($label, $total);
+    }
+
+    /**
+     * Move the bar to the round and describe the episodes and what the
+     * update measured. Fields that are zero (DQN has no policy loss) stay
+     * out of the line.
+     */
+    public function round(const ann::Round& $round) : void
+    {
+        $this->at = $round->at;
+
+        if (!$this->throttle->due()) {
+            return;
+        }
+
+        string $sep = separator($this->context->caps);
+        uint64 $episodes = $round->episodes as uint64;
+        string $out = "episodes {$episodes}{$sep}return {$round->mean:.1f}";
+
+        if ($round->report->entropy != 0.0) {
+            $out->append("{$sep}entropy {$round->report->entropy:.3f}");
+        }
+
+        if ($round->report->value != 0.0) {
+            string $value = figure($round->report->value);
+            $out->append("{$sep}value {$value}");
+        }
+
+        $this->flush();
+        $this->bar->set($this->at, $out);
+    }
+
+    /**
+     * Hold one row for a finished episode: its return and the running
+     * mean. Terminal only; a pipe keeps to the bar.
+     */
+    public function episode(usize $n, float64 $reward, float64 $mean) : void
+    {
+        if (!$this->context->caps->interactive) {
+            return;
+        }
+
+        string $sep = separator($this->context->caps);
+        uint64 $count = $n as uint64;
+        string $episode = pad("{$count}", 4);
+        $this->pending[] = "episode {$episode}{$sep}return {$reward:6.1f}{$sep}mean {$mean:6.1f}";
+    }
+
+    /**
+     * Stop the bar where it stands, `$message` as its detail: finished on
+     * success, failed otherwise.
+     */
+    public function finish(bool $ok, string $message) : void
+    {
+        $this->flush();
+        $this->bar->set($this->at, $message);
+
+        if ($ok) {
+            $this->bar->finish();
+        } else {
+            $this->bar->fail();
+        }
+    }
+
+    /**
+     * Held episode rows into the window. The bar's next paint carries
+     * them, so one frame shows both.
+     */
+    private function flush() : void
+    {
+        if ($this->pending->count() == 0) {
+            return;
+        }
+
+        $this->log->push(str::join($this->pending, "\n"));
+        $this->pending->clear();
+    }
+}

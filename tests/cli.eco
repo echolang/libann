@@ -1,0 +1,120 @@
+use ann::{Act, Dataset, Dense, Log, MeanSquaredError, Model, Sequential, Sgd, Tensor, Trainer};
+use ann::cli;
+use ann::rl::{CartPole, Report, Runner};
+use command;
+
+// a context that captures into ->page instead of writing to the tty
+internal function quiet(usize $every = 0) : cli::Console
+{
+    return cli::Console(context: command::CLIContext::plain(), $every: $every);
+}
+
+internal function captured(const cli::Console& $console) : string
+{
+    return str::join($console->context->page->rows, "\n");
+}
+
+#[group: "cli"]
+test training_commits_bar_and_milestones
+{
+    array<float64> $xs = [0.0, 0.25, 0.5, 0.75, 1.0];
+    $data = Dataset(Tensor(column: $xs), Tensor(column: $xs));
+    $console = quiet(5);
+    $log = Log()->to($console);
+
+    Trainer($epochs: 10, $batchSize: 2, $metric: .mae, $observer: $log->training())
+        ->fit(Model(Sequential()->add(Dense(1, 1))), MeanSquaredError(), Sgd(0.1), $data);
+
+    string $page = captured($console);
+    // a pipe never repaints: only the finished bar and the table land
+    assert($page->contains('training'));
+    assert($page->contains('epoch 10/10'));
+    assert($page->contains('trained 10 epochs'));
+    assert($page->contains('mae'));
+    assert(!$page->contains('val loss'));
+}
+
+#[group: "cli"]
+test model_draws_one_row_per_layer
+{
+    $console = quiet();
+    $net = Sequential()
+        ->add(Dense(2, 4))
+        ->add(Act(.relu))
+        ->add(Dense(4, 1));
+    Log()->to($console)->model(Model($net));
+
+    string $page = captured($console);
+    assert($page->contains('model | 17 params'));
+    assert($page->contains('dense 2 -> 4'));
+    assert($page->contains('act relu'));
+    assert($page->contains('dense 4 -> 1'));
+}
+
+#[group: "cli"]
+test run_finishes_once
+{
+    $console = quiet();
+    $runner = Runner(CartPole($seed: 1));
+    $run = Log()->to($console)->run('rounds', 3);
+
+    for (int32 $i = 1; $i <= 3; $i++) {
+        $runner->step(0);
+        $run->update($i, $runner, Report(0.0, 0.5, 0.0));
+    }
+
+    $run->done('finished');
+    $run->fail('ignored');
+
+    string $page = captured($console);
+    assert($page->contains('finished'));
+    assert(!$page->contains('ignored'));
+}
+
+// an interactive terminal that writes into ->vt instead of the tty
+internal function live(int32 $lines = 6) : cli::Console
+{
+    command::TerminalCapabilities $caps = command::TerminalCapabilities(false, false, 80, true);
+    return cli::Console(context: command::CLIContext::buffer($caps), $lines: $lines);
+}
+
+#[group: "cli"]
+test training_streams_epochs_on_a_terminal
+{
+    array<float64> $xs = [0.0, 0.25, 0.5, 0.75, 1.0];
+    $data = Dataset(Tensor(column: $xs), Tensor(column: $xs));
+    $console = live(3);
+
+    Trainer($epochs: 12, $batchSize: 2, $observer: Log()->to($console)->training())
+        ->fit(Model(Sequential()->add(Dense(1, 1))), MeanSquaredError(), Sgd(0.1), $data);
+
+    string $vt = $console->context->vt;
+    // a fit this short lands in one paint: only the window's 3 rows show
+    assert(!$vt->contains(': epoch  9'), 'scrolled out');
+    assert($vt->contains(': epoch 12'), 'last epoch streamed');
+    assert($vt->contains('training'), 'bar');
+    // the window collapsed: the milestone table is what stays
+    assert(captured($console)->contains('trained 12 epochs'));
+}
+
+#[group: "cli"]
+test run_streams_episodes_and_keeps_them_on_failure
+{
+    $console = live(3);
+    $runner = Runner(CartPole($seed: 1));
+    $run = Log()->to($console)->run('rounds', 200);
+
+    for (int32 $i = 1; $i <= 200; $i++) {
+        $runner->step(0);
+        $run->update($i, $runner, Report(0.0, 0.5, 0.0));
+    }
+
+    $run->fail('not solved');
+
+    string $vt = $console->context->vt;
+    assert($runner->episodes->count() > 3);
+    uint64 $last = $runner->episodes->count() as uint64;
+    assert($vt->contains("episode"), 'episodes streamed');
+    assert($vt->contains("{$last}"), 'the last episode made it in before the failed row');
+    assert($vt->contains('not solved'));
+}

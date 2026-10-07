@@ -2,7 +2,8 @@
 //
 //   echoc run -m . examples/custom_layer.eco
 
-use ann::{Act, Activation, Adam, Dataset, Decoder, Dense, Encoder, Layer, MeanSquaredError, Mode, Model, ModelError, Param, Random, Registry, Sequential, Tensor, Trainer};
+use ann::{Act, Activation, Adam, Dataset, Decoder, Dense, Encoder, Layer, Log, MeanSquaredError, Mode, Model, ModelError, Param, Random, Registry, Sequential, Tensor, Trainer};
+use ann::cli;
 
 /**
  * Learned per-feature gate: `output = input * sigmoid(gate)`. The whole
@@ -111,13 +112,23 @@ $data = Dataset(Tensor(rows: $rows), Tensor(column: $targets));
 $gate = Gate(4);
 $net = Sequential()->add($gate)->add(Dense(4, 1));
 $model = Model($net, $seed: 2);
-echo $model->summary();
+$log = Log()->to(cli::Console());
+$log->begin('custom layer');
+$log->model($model);
 
 // a little weight decay so the useless gates have a reason to close
-Trainer($epochs: 200, $batchSize: 32)->fit($model, MeanSquaredError(), Adam(0.05, $weightDecay: 0.01), $data);
+Trainer($epochs: 200, $batchSize: 32, $observer: $log->training())
+    ->fit($model, MeanSquaredError(), Adam(0.05, $weightDecay: 0.01), $data);
 
-$weights = $gate->gate->value;
-echo "gates after training: {$weights}";
+$gates = $log->table(['feature', 'gate', 'open']);
+
+for (usize $i = 0; $i < 4; $i++) {
+    float64 $w = $gate->gate->value->data[$i];
+    float64 $open = Activation::sigmoid->apply($w);
+    $gates->row(["{$i}", "{$w:.3f}", "{$open:.3f}"]);
+}
+
+$log->note('gates after training (target uses feature 0)', $gates);
 
 $registry = Registry()->add('gate', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
     return Gate::decode($in, $r);
@@ -133,6 +144,10 @@ Model $loaded = guard Model::load('gate.ann', $registry) else ($e) {
 
 array<array<float64>> $probe = [[0.5, 0.9, -0.9, 0.3]];
 $x = Tensor(rows: $probe);
-echo "original says {$model->predict($x)->data[0]:.4f}, loaded says {$loaded->predict($x)->data[0]:.4f} (target 1.0)";
+$table = $log->table(['network', 'says', 'target']);
+$table->row(['original', "{$model->predict($x)->data[0]:.4f}", '1.0']);
+$table->row(['loaded', "{$loaded->predict($x)->data[0]:.4f}", '1.0']);
+$log->note('gate.ann', $table);
+$log->end('done');
 
 std::io::remove('gate.ann');

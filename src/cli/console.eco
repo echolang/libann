@@ -1,0 +1,178 @@
+/**
+ * The terminal sink, drawn with libcommand. Optional: nothing in `ann`
+ * reaches for this, a `Log` without it draws nothing.
+ *
+ *     $log = ann::Log()->to(cli::Console());
+ *     $log->begin('xor');
+ *     $log->model($model);
+ *     Trainer($epochs: 2000, $observer: $log->training())->fit(...);
+ *     $log->end('saved xor.ann');
+ *
+ * A fit draws a live bar with a window of epochs above it, then a table
+ * of milestone epochs. A `Log::run` draws a bar with a window of finished
+ * episodes. On a pipe the bars do not repaint; only finished rows land.
+ */
+
+namespace ann::cli;
+
+use command;
+use command::element;
+use ann::Event;
+
+public class Console : ann::Sink
+{
+    /**
+     * Where everything is drawn. Colour, unicode and width were decided
+     * when it was resolved.
+     */
+    public command::CLIContext $context;
+
+    /**
+     * Epochs between milestone rows of a fit. 0 picks about five.
+     */
+    public usize $every;
+
+    /**
+     * Rows of the window that streams epochs or episodes above a bar.
+     */
+    public int32 $lines;
+
+    private Training? $training = null;
+    private Run? $run = null;
+
+    /**
+     * Stderr, colour by `NO_COLOR` / `CLICOLOR_FORCE` / isatty.
+     */
+    public constructor(usize $every = 0, int32 $lines = 6)
+    {
+        $this->context = command::CLIContext::resolve(.auto, .stderr);
+        $this->every = $every;
+        $this->lines = $lines;
+    }
+
+    /**
+     * A context the program already has, say one that honours the
+     * `--color` its own libcommand parse took.
+     */
+    public constructor(context: command::CLIContext $context, usize $every = 0, int32 $lines = 6)
+    {
+        $this->context = $context;
+        $this->every = $every;
+        $this->lines = $lines;
+    }
+
+    public function write(const ann::Event& $event) : void
+    {
+        match ($event) {
+            Event::begin($title) => {
+                $this->context->beginStepper($title);
+            },
+            Event::end($message) => {
+                $this->context->endStepper($message);
+            },
+            Event::model($params, $summary) => {
+                usize $count = $params;
+                $this->model($count, $summary);
+            },
+            Event::plan($plan) => {
+                $this->training = Training($this->context, $plan, $this->every, $this->lines);
+            },
+            Event::batch($epoch, $index, $loss) => {
+                Training $t = guard $this->training else {
+                    return;
+                }
+
+                $t->batch();
+            },
+            Event::epoch($report) => {
+                Training $t = guard $this->training else {
+                    return;
+                }
+
+                $t->epoch($report);
+            },
+            Event::fitted($history) => {
+                Training $t = guard $this->training else {
+                    return;
+                }
+
+                $t->finish();
+                $this->training = null;
+            },
+            Event::run($label, $total) => {
+                int32 $rounds = $total;
+                $this->run = Run($this->context, $label, $rounds, $this->lines);
+            },
+            Event::round($round) => {
+                Run $r = guard $this->run else {
+                    return;
+                }
+
+                $r->round($round);
+            },
+            Event::episode($n, $reward, $mean) => {
+                Run $r = guard $this->run else {
+                    return;
+                }
+
+                usize $episode = $n;
+                float64 $got = $reward;
+                float64 $window = $mean;
+                $r->episode($episode, $got, $window);
+            },
+            Event::finished($ok, $message) => {
+                Run $r = guard $this->run else {
+                    return;
+                }
+
+                bool $solved = $ok;
+                $r->finish($solved, $message);
+                $this->run = null;
+            },
+            Event::note($title, $rows) => {
+                $this->note($title, $rows);
+            },
+            Event::table($title, $table) => {
+                $t = $this->context->create<element::Table>();
+                $t->columns($table->headers);
+                $t->border = false;
+
+                foreach ($table->rows as $row) {
+                    $t->row($row);
+                }
+
+                $this->note($title, $t->render()->rows);
+            },
+        }
+    }
+
+    /**
+     * The network as a tree, one node per layer, under its param count.
+     */
+    private function model(usize $params, const string& $summary) : void
+    {
+        uint64 $count = $params as uint64;
+        $lines = str::split($summary, "\n")->owned();
+        usize $at = 0;
+        $tree = $this->context->create<element::Tree>('');
+        array<element::Node> $top = nodes($lines, $at, 0);
+
+        if ($top->count() == 1) {
+            $tree->root = $top[0];
+        } else {
+            $tree->root->children = $top;
+        }
+
+        string $sep = separator($this->context->caps);
+        $this->note("model{$sep}{$count} params", $tree->render()->rows);
+    }
+
+    /**
+     * A boxed aside titled `$title`, one row per entry of `$rows`.
+     */
+    private function note(string $title, const array<string>& $rows) : void
+    {
+        $this->context->gap();
+        $this->context->print(element::noteFrame($this->context->channel(), $title, $rows));
+    }
+}

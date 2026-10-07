@@ -1,2 +1,4 @@
 ecobuild/
 vendor/
+regression.jsonl
+cartpole-ppo.log

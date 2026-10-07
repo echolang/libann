@@ -1,0 +1,143 @@
+/**
+ * Small pieces the terminal reporters share: a repaint throttle, the
+ * separator between detail fields, and the model summary as a tree.
+ */
+
+namespace ann::cli;
+
+use command;
+use command::element;
+use std::time;
+
+/**
+ * Lets a caller repaint at most once per `gap`. A tight loop asks every
+ * step; most of the time the answer is no, and the terminal is spared.
+ */
+public struct Throttle
+{
+    public time::duration $gap;
+    private time::instant? $last = null;
+
+    public constructor(time::duration $gap = time::duration::millis(50))
+    {
+        $this->gap = $gap;
+    }
+
+    /**
+     * True on the first call and whenever `gap` has passed since the last
+     * true. A true answer restarts the wait.
+     */
+    public function due() : bool
+    {
+        time::instant $now = time::instant::now();
+        time::instant $last = guard $this->last else {
+            $this->last = $now;
+            return true;
+        }
+
+        if ($now - $last < $this->gap) {
+            return false;
+        }
+
+        $this->last = $now;
+        return true;
+    }
+}
+
+/**
+ * Between two fields of a detail line: a middle dot, or a bar when the
+ * terminal cannot draw one.
+ */
+internal function separator(const command::TerminalCapabilities& $caps) : string
+{
+    if ($caps->unicode) {
+        return ' · ';
+    }
+
+    return ' | ';
+}
+
+/**
+ * Milliseconds under a second, seconds with two decimals above.
+ */
+internal function seconds(time::duration $elapsed) : string
+{
+    float64 $s = $elapsed->as_float_secs();
+
+    if ($s < 1.0) {
+        int64 $ms = $elapsed->as_millis() as int64;
+        return "{$ms}ms";
+    }
+
+    return "{$s:.2f}s";
+}
+
+/**
+ * `$text` padded with spaces on the left to `$width` columns, so streamed
+ * rows line their numbers up.
+ */
+internal function pad(const string& $text, int32 $width) : string
+{
+    int32 $missing = $width - command::textWidth($text);
+
+    if ($missing <= 0) {
+        return $text;
+    }
+
+    string $out = command::spaces($missing);
+    $out->append($text);
+    return $out;
+}
+
+/**
+ * A loss for a narrow column: four decimals, or scientific once four
+ * decimals would print zero.
+ */
+internal function figure(float64 $x) : string
+{
+    if ($x != 0.0 && std::math::abs($x) < 0.001) {
+        return "{$x:.2e}";
+    }
+
+    return "{$x:.4f}";
+}
+
+/**
+ * A layer summary (one line per layer, two spaces per level of nesting)
+ * as tree nodes. Consumes lines from `$at` while they sit at `$depth`, and
+ * their deeper followers become children.
+ */
+internal function nodes(const array<string>& $lines, usize& $at, usize $depth) : array<element::Node>
+{
+    array<element::Node> $out = array<element::Node>();
+
+    while ($at < $lines->count()) {
+        usize $d = depth($lines[$at]);
+
+        if ($d < $depth) {
+            break;
+        }
+
+        string $label = str::from(str::ltrim($lines[$at]));
+        $at = $at + 1;
+        $node = element::Node($label);
+        $node->children = nodes($lines, $at, $d + 1);
+        $out[] = $node;
+    }
+
+    return $out;
+}
+
+/**
+ * Nesting level of a summary line: leading spaces over two.
+ */
+internal function depth(const string& $line) : usize
+{
+    usize $spaces = 0;
+
+    while ($spaces < $line->size() && $line->byte($spaces) == 32) {
+        $spaces = $spaces + 1;
+    }
+
+    return $spaces / 2;
+}

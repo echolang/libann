@@ -2,7 +2,8 @@
 //
 //   echoc run -m . examples/xor.eco
 
-use ann::{Act, BinaryCrossEntropy, Dataset, Dense, EpochReport, Model, Sequential, Sgd, Tensor, Trainer};
+use ann::{Act, BinaryCrossEntropy, Dataset, Dense, Log, Model, Sequential, Sgd, Tensor, Trainer};
+use ann::cli;
 
 array<array<float64>> $points = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]];
 array<float64> $labels = [0.0, 1.0, 1.0, 0.0];
@@ -15,17 +16,15 @@ $net = Sequential()
     ->add(Act(.sigmoid));
 
 $model = Model($net, $seed: 7);
-echo $model->summary();
+$log = Log()->to(cli::Console());
+$log->begin('xor');
+$log->model($model);
 
 $trainer = Trainer(
     $epochs: 2000,
     $batchSize: 4,
     $metric: .binaryAccuracy,
-    $onEpoch: function(EpochReport $r) : void {
-        if ($r->epoch % 500 == 0) {
-            echo "epoch {$r->epoch}: loss {$r->train->loss:.5f}, accuracy {$r->train->metric:.2f}";
-        }
-    },
+    $observer: $log->training(),
 );
 $trainer->fit($model, BinaryCrossEntropy(), Sgd(0.5, $momentum: 0.9), $data);
 
@@ -39,9 +38,13 @@ Model $loaded = guard Model::load('xor.ann') else ($e) {
 
 $out = $loaded->predict($data->inputs);
 $classes = $loaded->classify($data->inputs);
+$truth = $log->table(['a', 'b', 'xor', 'p']);
 
-foreach ($classes as $i => $class) {
-    echo "{$points[$i][0]} xor {$points[$i][1]} = {$class}  (p = {$out->data[$i]:.4f})";
+foreach (0 .. $classes->count() as $i) {
+    uint64 $c = $classes[$i] as uint64;
+    $truth->row(["{$points[$i][0]}", "{$points[$i][1]}", "{$c}", "{$out->data[$i]:.4f}"]);
 }
 
+$log->note('loaded from xor.ann', $truth);
+$log->end('done');
 std::io::remove('xor.ann');

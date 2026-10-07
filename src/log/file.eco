@@ -1,0 +1,305 @@
+/**
+ * Every event as one line of a file, flushed as it is written, so a long
+ * run can be followed from somewhere else while it trains: `tail -f`, a
+ * script, an agent.
+ *
+ *     $log->to(ann::FileLog('spiral.jsonl'));              // JSON Lines
+ *     $log->to(ann::FileLog('spiral.log', .text));         // logfmt
+ *
+ * Each line carries `event`, `t` (seconds since the file was opened) and
+ * `ts` (Unix milliseconds), then the event's own fields. Batches are not
+ * written one by one: when nothing else was written for `heartbeat`, the
+ * next batch writes a `progress` line, so a slow epoch still shows the
+ * run is alive.
+ */
+
+namespace ann;
+
+use std::time;
+
+public enum Format : uint8
+{
+    /**
+     * One JSON object per line.
+     */
+    case jsonl = 0;
+
+    /**
+     * logfmt, `key=value` pairs. A list or a table writes one line per
+     * item or row.
+     */
+    case text = 1;
+}
+
+public class FileLog : Sink
+{
+    public string $path;
+    public Format $format;
+
+    /**
+     * Quiet time after which a batch writes a `progress` line. Zero
+     * writes one for every batch.
+     */
+    public time::duration $heartbeat = time::duration::secs(5);
+
+    /**
+     * Epochs between two `epoch` lines. The first and the last epoch are
+     * always written.
+     */
+    public usize $every = 1;
+
+    /**
+     * The first write that failed. A full disk does not stop the training;
+     * the log goes quiet and this says why.
+     */
+    public std::io::ioerror? $error = null;
+
+    private std::io::file $out;
+    private time::instant $opened = time::instant::now();
+    private time::instant $wrote = time::instant::now();
+    private time::instant $fitting = time::instant::now();
+    private Plan $plan = Plan(0, 0, 0, .none, false);
+
+    /**
+     * Create or truncate `$path`. Dies when it cannot be opened, before
+     * any training has been spent.
+     */
+    public constructor(string $path, Format $format = .jsonl)
+    {
+        std::io::file $out = guard std::io::create($path) else ($e) {
+            die("ann::FileLog: cannot open {$path}: {$e}");
+        }
+
+        $this->path = $path;
+        $this->format = $format;
+        $this->out = $out;
+    }
+
+    public function write(const Event& $event) : void
+    {
+        if ($this->error != null) {
+            return;
+        }
+
+        Record $record = guard $this->record($event) else {
+            return;
+        }
+
+        if ($this->format == Format::jsonl) {
+            $this->line($record->json());
+        } else {
+            foreach ($record->lines() as $line) {
+                $this->line($line);
+            }
+        }
+
+        guard $this->out->flush() else ($e) {
+            $this->error = $e;
+            return;
+        }
+
+        $this->wrote = time::instant::now();
+    }
+
+    private function line(string $text) : void
+    {
+        if ($this->error != null) {
+            return;
+        }
+
+        $text->append("\n");
+
+        guard $this->out->write($text) else ($e) {
+            $this->error = $e;
+            return;
+        }
+    }
+
+    /**
+     * The fields `$event` is written as, null when it is not written at
+     * all: a batch inside the heartbeat, an epoch between `every`.
+     */
+    private function record(const Event& $event) : Record?
+    {
+        match ($event) {
+            Event::begin($title) => {
+                $r = $this->start('begin');
+                $r->text('title', $title);
+                return $r;
+            },
+            Event::end($message) => {
+                $r = $this->start('end');
+                $r->text('message', $message);
+                return $r;
+            },
+            Event::model($params, $summary) => {
+                usize $count = $params;
+                $r = $this->start('model');
+                $r->count('params', $count);
+                $r->list('layers', 'layer', layers($summary));
+                return $r;
+            },
+            Event::plan($plan) => {
+                $this->plan = $plan;
+                $this->fitting = time::instant::now();
+                $r = $this->start('plan');
+                $r->count('epochs', $plan->epochs);
+                $r->count('batches', $plan->batches);
+                $r->count('samples', $plan->samples);
+                string $name = $plan->metric->name();
+
+                if (!$name->empty()) {
+                    $r->text('metric', $name);
+                }
+
+                $r->flag('validation', $plan->validation);
+                return $r;
+            },
+            Event::batch($epoch, $index, $loss) => {
+                if (time::instant::now() - $this->wrote < $this->heartbeat) {
+                    return null;
+                }
+
+                usize $at = $epoch;
+                usize $step = $index;
+                float64 $value = $loss;
+                $r = $this->start('progress');
+                $r->count('epoch', $at);
+                $r->count('epochs', $this->plan->epochs);
+                $r->count('batch', $step + 1);
+                $r->count('batches', $this->plan->batches);
+                $r->number('loss', $value);
+                return $r;
+            },
+            Event::epoch($report) => {
+                usize $n = $report->epoch;
+                bool $edge = $n == 1 || $n == $this->plan->epochs;
+
+                if (!$edge && $this->every > 1 && $n % $this->every != 0) {
+                    return null;
+                }
+
+                $r = $this->start('epoch');
+                $r->count('epoch', $n);
+                $r->count('epochs', $this->plan->epochs);
+                $this->scores($r, $report);
+                return $r;
+            },
+            Event::fitted($history) => {
+                float64 $took = (time::instant::now() - $this->fitting)->as_float_secs();
+                $r = $this->start('fitted');
+                $r->count('epochs', $history->epochs->count());
+                $r->raw('seconds', "{$took:.3f}");
+
+                EpochReport $last = guard $history->last() else {
+                    return $r;
+                }
+
+                $this->scores($r, $last);
+                return $r;
+            },
+            Event::run($label, $total) => {
+                int32 $rounds = $total;
+                $r = $this->start('run');
+                $r->text('label', $label);
+                $r->raw('total', "{$rounds}");
+                return $r;
+            },
+            Event::round($round) => {
+                $r = $this->start('round');
+                $r->raw('round', "{$round->at}");
+                $r->raw('total', "{$round->total}");
+                $r->count('episodes', $round->episodes);
+                $r->count('steps', $round->steps);
+                $r->number('mean', $round->mean);
+                $r->number('policy', $round->report->policy);
+                $r->number('value', $round->report->value);
+                $r->number('entropy', $round->report->entropy);
+                return $r;
+            },
+            Event::episode($n, $reward, $mean) => {
+                usize $episode = $n;
+                float64 $got = $reward;
+                float64 $window = $mean;
+                $r = $this->start('episode');
+                $r->count('episode', $episode);
+                $r->number('return', $got);
+                $r->number('mean', $window);
+                return $r;
+            },
+            Event::finished($ok, $message) => {
+                bool $solved = $ok;
+                $r = $this->start('finished');
+                $r->flag('ok', $solved);
+                $r->text('message', $message);
+                return $r;
+            },
+            Event::note($title, $rows) => {
+                $r = $this->start('note');
+                $r->text('title', $title);
+                $r->list('rows', 'row', $rows);
+                return $r;
+            },
+            Event::table($title, $table) => {
+                $r = $this->start('table');
+                $r->text('title', $title);
+                $r->grid('rows', $table->headers, $table->rows);
+                return $r;
+            },
+        }
+    }
+
+    /**
+     * A record that already says what happened and when.
+     */
+    private const function start(string $event) : Record
+    {
+        float64 $t = (time::instant::now() - $this->opened)->as_float_secs();
+        int64 $ts = time::timestamp::now()->unix_millis();
+        $r = Record();
+        $r->text('event', $event);
+        $r->raw('t', "{$t:.3f}");
+        $r->raw('ts', "{$ts}");
+        return $r;
+    }
+
+    /**
+     * Loss and metric of an epoch, then the same on the validation set.
+     * The metric keys are its name, left out when there is none.
+     */
+    private const function scores(Record& $r, const EpochReport& $report) : void
+    {
+        string $name = $this->plan->metric->name();
+        $r->number('loss', $report->train->loss);
+
+        if (!$name->empty()) {
+            $r->number($name, $report->train->metric);
+        }
+
+        Evaluation $held = guard $report->validation else {
+            return;
+        }
+
+        $r->number('val_loss', $held->loss);
+
+        if (!$name->empty()) {
+            $r->number("val_{$name}", $held->metric);
+        }
+    }
+}
+
+/**
+ * The lines of a layer summary, the trailing empty one dropped.
+ */
+internal function layers(const string& $summary) : array<string>
+{
+    array<string> $out = array<string>();
+
+    foreach (str::split($summary, "\n")->owned() as $line) {
+        if (!$line->empty()) {
+            $out[] = $line;
+        }
+    }
+
+    return $out;
+}

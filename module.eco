@@ -14,6 +14,8 @@
 #[epm::license: "MIT"]
 #[epm::description: "A small artificial neural network trainer & runner library for echo."]
 
+#[requires: "echolang/libcommand" { version: "^0.1", source: git "https://github.com/echolang/libcommand" }]
+
 #[sources: "src/**/*.eco"]
 
 #[target: test] {

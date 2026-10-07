@@ -1,0 +1,221 @@
+use ann::{Dataset, Dense, Event, FileLog, Log, MeanSquaredError, Model, Sequential, Sgd, Sink, Tensor, Trainer};
+use ann::rl::{CartPole, Report, Runner};
+use std::time;
+
+// counts every event a log hands it
+internal class Events : Sink
+{
+    public usize $plans = 0;
+    public usize $batches = 0;
+    public usize $epochs = 0;
+    public usize $fits = 0;
+    public usize $rounds = 0;
+    public usize $episodes = 0;
+    public usize $finishes = 0;
+    public bool $ok = false;
+
+    public function write(const Event& $event) : void
+    {
+        match ($event) {
+            Event::plan($plan) => { $this->plans = $this->plans + 1; },
+            Event::batch($epoch, $index, $loss) => { $this->batches = $this->batches + 1; },
+            Event::epoch($report) => { $this->epochs = $this->epochs + 1; },
+            Event::fitted($history) => { $this->fits = $this->fits + 1; },
+            Event::round($round) => { $this->rounds = $this->rounds + 1; },
+            Event::episode($n, $reward, $mean) => { $this->episodes = $this->episodes + 1; },
+            Event::finished($ok, $message) => {
+                bool $solved = $ok;
+                $this->finishes = $this->finishes + 1;
+                $this->ok = $solved;
+            },
+            else => {},
+        }
+    }
+}
+
+internal function line() : Dataset
+{
+    array<float64> $xs = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+    return Dataset(Tensor(column: $xs), Tensor(column: $xs));
+}
+
+internal function scratch(string $name) : string
+{
+    return std::env::join(std::env::tmp(), $name);
+}
+
+// the file's lines, the empty one after the last newline dropped
+internal function lines(const string& $path) : array<string>
+{
+    string $text = guard std::io::readfile($path);
+    array<string> $out = array<string>();
+
+    foreach (str::split($text, "\n")->owned() as $l) {
+        if (!$l->empty()) {
+            $out[] = $l;
+        }
+    }
+
+    return $out;
+}
+
+internal function count(const array<string>& $lines, const string& $needle) : usize
+{
+    usize $n = 0;
+
+    foreach ($lines as $l) {
+        if ($l->contains($needle)) {
+            $n = $n + 1;
+        }
+    }
+
+    return $n;
+}
+
+#[group: "log"]
+test every_sink_hears_the_fit
+{
+    $a = Events();
+    $b = Events();
+    $log = Log()->to($a)->to($b);
+
+    // 10 samples in batches of 4: 3 batches an epoch
+    Trainer($epochs: 5, $batchSize: 4, $observer: $log->training())
+        ->fit(Model(Sequential()->add(Dense(1, 1))), MeanSquaredError(), Sgd(0.1), line());
+
+    assert($a->plans == 1 && $a->fits == 1);
+    assert($a->batches == 15);
+    assert($a->epochs == 5);
+    assert($b->batches == $a->batches && $b->epochs == $a->epochs);
+}
+
+#[group: "log"]
+test run_reports_each_episode_and_finishes_once
+{
+    $events = Events();
+    $runner = Runner(CartPole($seed: 1));
+    $run = Log()->to($events)->run('rounds', 50);
+
+    for (int32 $i = 1; $i <= 50; $i++) {
+        for (int32 $s = 0; $s < 10; $s++) {
+            $runner->step(0);
+        }
+
+        $run->update($i, $runner, Report(0.0, 0.5, 0.0));
+    }
+
+    $run->done('finished');
+    $run->fail('ignored');
+
+    assert($runner->episodes->count() > 0);
+    assert($events->episodes == $runner->episodes->count());
+    assert($events->rounds == 50);
+    assert($events->finishes == 1);
+    assert($events->ok);
+}
+
+#[group: "log"]
+test file_log_writes_json_lines
+{
+    string $path = scratch('libann-log-test.jsonl');
+    $data = line();
+    $split = $data->split(0.2, $seed: 1);
+    $log = Log()->to(FileLog($path));
+    $log->begin('fit');
+    $log->model(Model(Sequential()->add(Dense(1, 1))));
+
+    Trainer($epochs: 5, $batchSize: 4, $metric: .rmse, $validation: $split->holdout, $observer: $log->training())
+        ->fit(Model(Sequential()->add(Dense(1, 1))), MeanSquaredError(), Sgd(0.1), $split->train);
+
+    $log->end('done');
+    array<string> $got = lines($path);
+
+    // begin, model, plan, 5 epochs, fitted, end; a fit this short has no
+    // progress lines
+    assert($got->count() == 10);
+    assert($got[0]->starts('{"event":"begin","t":'));
+    assert($got[0]->contains('"title":"fit"'));
+    assert($got[1]->contains('"params":2'));
+    assert($got[1]->contains('"layers":["sequential","  dense 1 -> 1'));
+    assert($got[2]->contains('"metric":"rmse","validation":true'));
+    assert(count($got, '"event":"epoch"') == 5);
+    assert($got[3]->contains('"epoch":1,"epochs":5,"loss":'));
+    assert($got[3]->contains('"rmse":'));
+    assert($got[3]->contains('"val_loss":'));
+    assert($got[3]->contains('"val_rmse":'));
+    assert($got[8]->contains('"event":"fitted","t":'));
+    assert($got[8]->contains('"epochs":5'));
+    assert($got[9]->contains('"message":"done"'));
+    assert(count($got, '"event":"progress"') == 0);
+    std::io::remove($path);
+}
+
+#[group: "log"]
+test file_log_escapes_json_strings
+{
+    string $path = scratch('libann-log-escape.jsonl');
+    $log = Log()->to(FileLog($path));
+    array<string> $rows = ['back\\slash', "tab\there"];
+    $log->note('say "hi"', $rows);
+    $t = $log->table(['x', 'y']);
+    $t->row(['1', '2']);
+    $log->note('probe', $t);
+
+    array<string> $got = lines($path);
+    assert($got->count() == 2);
+    assert($got[0]->contains('"title":"say \\"hi\\""'));
+    assert($got[0]->contains('"rows":["back\\\\slash","tab\\there"]'));
+    assert($got[1]->contains('"headers":["x","y"],"rows":[["1","2"]]'));
+    std::io::remove($path);
+}
+
+#[group: "log"]
+test file_log_writes_logfmt
+{
+    string $path = scratch('libann-log-test.log');
+    $log = Log()->to(FileLog($path, .text));
+    $log->begin('two words');
+
+    Trainer($epochs: 3, $batchSize: 4, $metric: .mae, $observer: $log->training())
+        ->fit(Model(Sequential()->add(Dense(1, 1))), MeanSquaredError(), Sgd(0.1), line());
+
+    $t = $log->table(['x', 'val loss']);
+    $t->row(['1', '0.5']);
+    $t->row(['2', '0.25']);
+    $log->note('probe', $t);
+
+    array<string> $got = lines($path);
+    assert($got[0]->starts('event=begin t='));
+    assert($got[0]->contains(' title="two words"'));
+    assert($got[1]->contains('event=plan '));
+    assert($got[1]->contains(' metric=mae validation=false'));
+    assert(count($got, 'event=epoch ') == 3);
+    assert($got[2]->contains(' epoch=1 epochs=3 loss='));
+    assert($got[2]->contains(' mae='));
+    // one line per table row, a cell under each header
+    assert(count($got, 'event=table ') == 2);
+    assert($got[$got->count() - 1]->contains(' title=probe x=2 val_loss=0.25'));
+    std::io::remove($path);
+}
+
+#[group: "log"]
+test file_log_heartbeat_and_spacing
+{
+    string $path = scratch('libann-log-beat.jsonl');
+    $file = FileLog($path);
+    $file->heartbeat = time::duration::zero();
+    $file->every = 2;
+    $log = Log()->to($file);
+
+    Trainer($epochs: 5, $batchSize: 4, $observer: $log->training())
+        ->fit(Model(Sequential()->add(Dense(1, 1))), MeanSquaredError(), Sgd(0.1), line());
+
+    array<string> $got = lines($path);
+    // no heartbeat wait: every batch writes a progress line
+    assert(count($got, '"event":"progress"') == 15);
+    assert(count($got, '"event":"progress","t":') == 15);
+    assert($got[1]->contains('"epoch":1,"epochs":5,"batch":1,"batches":3,"loss":'));
+    // every 2: epochs 1, 2, 4 and the last
+    assert(count($got, '"event":"epoch"') == 4);
+    std::io::remove($path);
+}

@@ -103,6 +103,12 @@ public struct Trainer
     public function<void(EpochReport)>? $onEpoch = null;
 
     /**
+     * Hears the plan, every batch, every epoch and the end. Null trains in
+     * silence. `Log::training` reports it to a terminal, a file, or both.
+     */
+    public Observer? $observer = null;
+
+    /**
      * Train `$model` on `$data`. Returns every epoch's report.
      */
     public function fit(Model $model, Loss $loss, Optimizer $optimizer, const Dataset& $data) : History
@@ -117,6 +123,8 @@ public struct Trainer
         $rng = Random($this->seed);
         $model->zeroGrad();
         $history = History();
+        Observer? $observer = $this->observer;
+        $observer?->begin(Plan($this->epochs, $batches->count(), $n, $this->metric, $this->validation != null));
 
         for (usize $epoch = 1; $epoch <= $this->epochs; $epoch++) {
             if ($this->shuffle) {
@@ -125,9 +133,11 @@ public struct Trainer
 
             float64 $total = 0.0;
 
-            foreach ($batches->all() as $indices) {
+            foreach ($batches->all() as $b => $indices) {
                 Dataset $batch = $data->batch($indices);
-                $total = $total + $model->learn($batch, $loss, $optimizer, $this->clip) * ($indices->count() as float64);
+                float64 $step = $model->learn($batch, $loss, $optimizer, $this->clip);
+                $total = $total + $step * ($indices->count() as float64);
+                $observer?->batch($epoch, $b, $step);
             }
 
             Evaluation $train = Evaluation($total / ($n as float64), 0.0);
@@ -139,7 +149,10 @@ public struct Trainer
             EpochReport $report = EpochReport($epoch, $train, $this->validate($model, $loss));
             $history->epochs[] = $report;
             $this->notify($report);
+            $observer?->epoch($report);
         }
+
+        $observer?->end($history);
 
         return $history;
     }

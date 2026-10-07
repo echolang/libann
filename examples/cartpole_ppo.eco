@@ -2,9 +2,12 @@
 // epochs, clipped so the policy cannot drift far
 //
 //   echoc run -m . examples/cartpole_ppo.eco
+//
+// every episode and round also lands in cartpole-ppo.log as logfmt
 
-use ann::{Act, Adam, Dense, Model, Random, Sequential};
+use ann::{Act, Adam, Dense, FileLog, Log, Model, Random, Sequential};
 use ann::rl::{CartPole, Choice, Policy, Ppo, Report, Rollout, Runner};
+use ann::cli;
 
 internal function net(usize $outputs) : Sequential
 {
@@ -16,11 +19,17 @@ internal function net(usize $outputs) : Sequential
         ->add(Dense(64, $outputs));
 }
 
+$log = Log()
+    ->to(cli::Console())
+    ->to(FileLog('cartpole-ppo.log', .text));
 $runner = Runner(CartPole($seed: 1));
 $policy = Policy(Model(net(2), $seed: 1));
 $agent = Ppo($policy, Model(net(1), $seed: 2), Adam(0.0003), Adam(0.001), $epochs: 10, $batchSize: 64, $entropy: 0.0);
 $rollout = Rollout();
 $rng = Random(1);
+$log->begin('cartpole ppo');
+$log->model($policy->model);
+$run = $log->run('rounds', 100);
 
 for (int32 $round = 1; $round <= 100; $round++) {
     for (int32 $i = 0; $i < 1024; $i++) {
@@ -30,13 +39,15 @@ for (int32 $round = 1; $round <= 100; $round++) {
 
     Report $r = $agent->update($rollout);
     $rollout->clear();
-    echo "round {$round}: {$runner->episodes->count()} episodes, mean return {$runner->mean(20):.1f}, surrogate {$r->policy:.4f}, value {$r->value:.3f}, entropy {$r->entropy:.3f}";
+    $run->update($round, $runner, $r);
 
     if ($runner->episodes->count() >= 20 && $runner->mean(20) >= 450.0) {
-        echo "solved in round {$round} after {$runner->episodes->count()} episodes";
+        $run->done("solved in round {$round} after {$runner->episodes->count()} episodes, mean return {$runner->mean(20):.1f}");
         break;
     }
 }
+
+$run->fail("not solved, mean return {$runner->mean(20):.1f}");
 
 guard $policy->model->save('cartpole-ppo.ann') else ($e) {
     die("save failed: {$e}");
@@ -53,5 +64,6 @@ while ($check->episodes->count() < 10) {
     $check->step($greedy->greedy($check->observation));
 }
 
-echo "loaded policy, greedy over 10 episodes: mean return {$check->mean(10):.1f}";
+$log->note('cartpole-ppo.ann', "greedy over 10 episodes: mean return {$check->mean(10):.1f}");
+$log->end('done, every round is in cartpole-ppo.log');
 std::io::remove('cartpole-ppo.ann');

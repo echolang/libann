@@ -1,0 +1,154 @@
+/**
+ * One place a run reports to, any number of places it ends up. A `Log`
+ * turns calls into `Event`s and hands each to every sink: the terminal,
+ * a file an agent can tail, a test that counts.
+ *
+ *     $log = ann::Log()
+ *         ->to(cli::Console())
+ *         ->to(ann::FileLog('xor.jsonl'));
+ *
+ *     $log->begin('xor');
+ *     $log->model($model);
+ *     Trainer($epochs: 2000, $observer: $log->training())->fit(...);
+ *     $log->end('done');
+ *
+ * A log with no sinks is silent, and so is a `Trainer` without one.
+ */
+
+namespace ann;
+
+public class Log
+{
+    public array<Sink> $sinks = array<Sink>();
+
+    /**
+     * Send everything from here on to `$sink` as well. Returns the log, so
+     * sinks chain.
+     */
+    public function to(Sink $sink) : Log
+    {
+        $this->sinks[] = $sink;
+        return $this;
+    }
+
+    /**
+     * Hand `$event` to every sink, in the order they were added.
+     */
+    public function emit(const Event& $event) : void
+    {
+        foreach ($this->sinks as $sink) {
+            $sink->write($event);
+        }
+    }
+
+    /**
+     * Open a run titled `$title`. Optional.
+     */
+    public function begin(string $title) : void
+    {
+        $this->emit(.begin($title));
+    }
+
+    /**
+     * Close the run, `$message` saying how it went.
+     */
+    public function end(string $message) : void
+    {
+        $this->emit(.end($message));
+    }
+
+    /**
+     * The network: parameter count and one line per layer.
+     */
+    public function model(const Model& $model) : void
+    {
+        $this->emit(.model($model->parameterCount(), $model->root->summary()));
+    }
+
+    /**
+     * An aside titled `$title`, one entry of `$rows` per row.
+     */
+    public function note(string $title, const array<string>& $rows) : void
+    {
+        $this->emit(.note($title, $rows));
+    }
+
+    /**
+     * An aside; newlines in `$body` split the rows.
+     */
+    public function note(string $title, string $body) : void
+    {
+        $this->note($title, str::split($body, "\n")->owned());
+    }
+
+    /**
+     * `$table` under the title `$title`.
+     */
+    public function note(string $title, const Table& $table) : void
+    {
+        $this->emit(.table($title, $table));
+    }
+
+    /**
+     * An empty table with these headers. Fill it with `row`, then hand it
+     * to `note`.
+     */
+    public function table(const array<string>& $headers) : Table
+    {
+        $t = Table();
+        $t->headers = $headers;
+        return $t;
+    }
+
+    /**
+     * An observer for `Trainer::observer` that reports the fit to this
+     * log: the plan, every batch, every epoch and the end.
+     */
+    public function training() : Observer
+    {
+        return Fit($this);
+    }
+
+    /**
+     * Report a loop of your own, reinforcement learning say, that runs
+     * `$total` rounds. Announces it right away.
+     */
+    public function run(string $label, int32 $total) : Run
+    {
+        return Run($this, $label, $total);
+    }
+}
+
+/**
+ * What `Log::training` hands the trainer: every observer call becomes an
+ * event.
+ */
+internal class Fit : Observer
+{
+    public Log $log;
+
+    public constructor(Log $log)
+    {
+        $this->log = $log;
+    }
+
+    public function begin(const Plan& $plan) : void
+    {
+        $this->log->emit(.plan($plan));
+    }
+
+    public function batch(usize $epoch, usize $index, float64 $loss) : void
+    {
+        $this->log->emit(.batch($epoch, $index, $loss));
+    }
+
+    public function epoch(const EpochReport& $report) : void
+    {
+        $this->log->emit(.epoch($report));
+    }
+
+    public function end(const History& $history) : void
+    {
+        $this->log->emit(.fitted($history));
+    }
+}

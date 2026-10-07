@@ -44,6 +44,20 @@ internal struct Batches
     }
 
     /**
+     * Batches per pass: `all()->count()` without cutting them.
+     */
+    internal const function count() : usize
+    {
+        usize $n = $this->order->count();
+
+        if ($this->size == 0) {
+            return 0;
+        }
+
+        return ($n + $this->size - 1) / $this->size;
+    }
+
+    /**
      * Current order as consecutive batches of `size`. Last one may be smaller.
      */
     internal const function all() : array<array<usize>>

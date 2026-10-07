@@ -1,4 +1,4 @@
-use ann::{Act, Adam, BinaryCrossEntropy, CrossEntropy, Dataset, Dense, Dropout, EpochReport, Evaluation, MeanSquaredError, Model, Random, Sequential, Sgd, Standardizer, Tensor, Trainer};
+use ann::{Act, Adam, BinaryCrossEntropy, CrossEntropy, Dataset, Dense, Dropout, EpochReport, Evaluation, History, MeanSquaredError, Model, Observer, Plan, Random, Sequential, Sgd, Standardizer, Tensor, Trainer};
 
 internal function xorData() : Dataset
 {
@@ -178,4 +178,83 @@ test inference_between_forward_and_backward_changes_nothing
     $twin->backward($data->gradient($loss, $again));
     assert(identical($again, $out));
     assert($twin->gradientNorm() == $plain);
+}
+
+// counts every call and keeps what it was handed
+internal class Tally : Observer
+{
+    public usize $begins = 0;
+    public usize $batches = 0;
+    public usize $epochs = 0;
+    public usize $ends = 0;
+    public Plan $plan = Plan(0, 0, 0, .none, false);
+    public float64 $lastLoss = 0.0;
+
+    public function begin(const Plan& $plan) : void
+    {
+        $this->begins = $this->begins + 1;
+        $this->plan = $plan;
+    }
+
+    public function batch(usize $epoch, usize $index, float64 $loss) : void
+    {
+        assert($index < $this->plan->batches);
+        $this->batches = $this->batches + 1;
+    }
+
+    public function epoch(const EpochReport& $report) : void
+    {
+        $this->epochs = $this->epochs + 1;
+        assert($report->epoch == $this->epochs);
+        $this->lastLoss = $report->train->loss;
+    }
+
+    public function end(const History& $history) : void
+    {
+        $this->ends = $this->ends + 1;
+        assert($history->epochs->count() == $this->epochs);
+    }
+}
+
+#[group: "training"]
+test observer_hears_every_step
+{
+    // 10 samples in batches of 4: 4 + 4 + 2
+    array<float64> $xs = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+    $data = Dataset(Tensor(column: $xs), Tensor(column: $xs));
+    $split = $data->split(0.2, $seed: 1);
+    $tally = Tally();
+    $model = Model(Sequential()->add(Dense(1, 1)));
+
+    $history = Trainer($epochs: 6, $batchSize: 4, $metric: .rmse, $validation: $split->holdout, $observer: $tally)
+        ->fit($model, MeanSquaredError(), Sgd(0.1), $data);
+
+    assert($tally->begins == 1 && $tally->ends == 1);
+    assert($tally->plan->epochs == 6);
+    assert($tally->plan->batches == 3);
+    assert($tally->plan->samples == 10);
+    assert($tally->plan->metric == ann::Metric::rmse);
+    assert($tally->plan->validation);
+    assert($tally->batches == 18);
+    assert($tally->epochs == 6);
+
+    EpochReport $last = guard $history->last() else {
+        assert(false, 'training produced no report');
+        return;
+    }
+
+    assert($tally->lastLoss == $last->train->loss);
+}
+
+#[group: "training"]
+test observer_changes_nothing
+{
+    $data = xorData();
+    $quiet = Model(Sequential()->add(Dense(2, 1)), $seed: 3);
+    $watched = Model(Sequential()->add(Dense(2, 1)), $seed: 3);
+
+    Trainer($epochs: 20, $batchSize: 2)->fit($quiet, MeanSquaredError(), Sgd(0.1), $data);
+    Trainer($epochs: 20, $batchSize: 2, $observer: Tally())->fit($watched, MeanSquaredError(), Sgd(0.1), $data);
+
+    assert(identical($quiet->predict($data->inputs), $watched->predict($data->inputs)));
 }

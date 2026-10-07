@@ -1,0 +1,107 @@
+/**
+ * Reports a loop you write yourself, the reinforcement learning kind:
+ * rounds of collect and update, no `Trainer` in sight. Minted by
+ * `Log::run`.
+ *
+ *     $run = $log->run('ppo', 100);
+ *
+ *     for (int32 $round = 1; $round <= 100; $round++) {
+ *         ...
+ *         $run->update($round, $runner, $agent->update($rollout));
+ *     }
+ *
+ *     $run->done('solved');
+ */
+
+namespace ann;
+
+public class Run
+{
+    public Log $log;
+
+    /**
+     * Finished episodes the mean return is taken over.
+     */
+    public usize $window = 20;
+
+    private int32 $total;
+    private usize $seen = 0;
+    private bool $open = true;
+
+    public constructor(Log $log, string $label, int32 $total)
+    {
+        $this->log = $log;
+        $this->total = $total;
+        $log->emit(.run($label, $total));
+    }
+
+    /**
+     * Round `$at` is done. Reports every episode the runner finished since
+     * the last update, then the round with what its update measured.
+     */
+    public function update(int32 $at, const ann::rl::Runner& $runner, const ann::rl::Report& $report) : void
+    {
+        usize $count = $runner->episodes->count();
+
+        while ($this->seen < $count) {
+            float64 $reward = $runner->episodes[$this->seen];
+            $this->seen = $this->seen + 1;
+            $this->log->emit(.episode($this->seen, $reward, $this->mean($runner, $this->seen)));
+        }
+
+        $this->log->emit(.round(Round($at, $this->total, $count, $runner->steps, $this->mean($runner, $count), $report)));
+    }
+
+    /**
+     * Stop as a success, `$message` saying why. Only the first of `done`
+     * and `fail` counts.
+     */
+    public function done(string $message) : void
+    {
+        $this->close(true, $message);
+    }
+
+    /**
+     * Stop as a failure, `$message` saying why. Only the first of `done`
+     * and `fail` counts.
+     */
+    public function fail(string $message) : void
+    {
+        $this->close(false, $message);
+    }
+
+    /**
+     * Mean return over the `window` episodes ending with episode `$upTo`.
+     * Zero before the first.
+     */
+    private const function mean(const ann::rl::Runner& $runner, usize $upTo) : float64
+    {
+        if ($upTo == 0) {
+            return 0.0;
+        }
+
+        usize $from = 0;
+
+        if ($upTo > $this->window) {
+            $from = $upTo - $this->window;
+        }
+
+        float64 $total = 0.0;
+
+        for (usize $i = $from; $i < $upTo; $i++) {
+            $total = $total + $runner->episodes[$i];
+        }
+
+        return $total / (($upTo - $from) as float64);
+    }
+
+    private function close(bool $ok, string $message) : void
+    {
+        if (!$this->open) {
+            return;
+        }
+
+        $this->open = false;
+        $this->log->emit(.finished($ok, $message));
+    }
+}

@@ -32,6 +32,21 @@ public enum Metric : uint8
     case rmse = 4;
 
     /**
+     * What a report calls the number: `accuracy`, `mae`, `rmse`. Empty for
+     * `none`.
+     */
+    public const function name() : string
+    {
+        return match ($this) {
+            .none => '',
+            .accuracy => 'accuracy',
+            .binaryAccuracy => 'accuracy',
+            .mae => 'mae',
+            .rmse => 'rmse',
+        };
+    }
+
+    /**
      * Score `$prediction` against `$target`. Run the prediction through
      * `Loss::predict` first, so a `CrossEntropy` network is scored on
      * probabilities.

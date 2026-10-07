@@ -2,8 +2,9 @@
 //
 //   echoc run -m . examples/cartpole_dqn.eco
 
-use ann::{Act, Adam, Dense, MeanSquaredError, Model, Random, Sequential};
+use ann::{Act, Adam, Dense, Log, MeanSquaredError, Model, Random, Sequential};
 use ann::rl::{CartPole, Dqn, Replay, Report, Runner, Schedule};
+use ann::cli;
 
 internal function qnet() : Sequential
 {
@@ -16,10 +17,8 @@ internal function qnet() : Sequential
 }
 
 // mean return of greedy episodes, no exploration
-internal function play(Model $q, usize $episodes) : float64
+internal function play(Model $q, Runner $runner, usize $episodes) : float64
 {
-    $runner = Runner(CartPole($seed: 99));
-
     while ($runner->episodes->count() < $episodes) {
         array<usize> $best = $q->predict($runner->observation)->argmax();
         $runner->step($best[0]);
@@ -28,6 +27,7 @@ internal function play(Model $q, usize $episodes) : float64
     return $runner->mean($episodes);
 }
 
+$log = Log()->to(cli::Console());
 $runner = Runner(CartPole($seed: 1));
 // rewards here are small and steady, so squared TD error learns faster
 // than Huber; the target trails by 0.5% a step
@@ -35,25 +35,25 @@ $dqn = Dqn(Model(qnet(), $seed: 1), Model(qnet()), Adam(0.001), $tau: 0.005, $lo
 $replay = Replay(50000);
 $epsilon = Schedule(from: 1.0, to: 0.02, over: 10000);
 $rng = Random(1);
-usize $reported = 0;
+$log->begin('cartpole dqn');
+$log->model($dqn->online);
+$run = $log->run('steps', 60000);
 
 for (usize $i = 0; $i < 60000; $i++) {
     $replay->add($runner->step($dqn->act($runner->observation, $epsilon->at($i), $rng)));
 
     if ($replay->count() >= 1000) {
         Report $r = $dqn->update($replay->sample(64, $rng));
-
-        if ($runner->episodes->count() >= $reported + 25) {
-            $reported = $runner->episodes->count();
-            echo "step {$i}: episode {$reported}, mean return {$runner->mean(20):.1f}, td loss {$r->value:.4f}";
-        }
+        $run->update(($i + 1) as int32, $runner, $r);
     }
 
     if ($runner->episodes->count() >= 20 && $runner->mean(20) >= 450.0) {
-        echo "solved at step {$i} after {$runner->episodes->count()} episodes: mean return {$runner->mean(20):.1f}";
+        $run->done("solved at step {$i} after {$runner->episodes->count()} episodes, mean return {$runner->mean(20):.1f}");
         break;
     }
 }
+
+$run->fail("not solved, mean return {$runner->mean(20):.1f}");
 
 guard $dqn->online->save('cartpole-dqn.ann') else ($e) {
     die("save failed: {$e}");
@@ -63,6 +63,7 @@ Model $loaded = guard Model::load('cartpole-dqn.ann') else ($e) {
     die("load failed: {$e}");
 }
 
-float64 $score = play($loaded, 10);
-echo "loaded network, greedy over 10 episodes: mean return {$score:.1f}";
+float64 $score = play($loaded, Runner(CartPole($seed: 99)), 10);
+$log->note('cartpole-dqn.ann', "greedy over 10 episodes: mean return {$score:.1f}");
+$log->end('done');
 std::io::remove('cartpole-dqn.ann');
