@@ -1,0 +1,150 @@
+/**
+ * Reorders columns: output column `j` is input column `order[j]`. A
+ * column may be read twice or not at all. No params.
+ *
+ *     Permute(slots: 5, width: 2)
+ *
+ * That form regroups slot-major `[s0: 2 values][s1: 2 values]...` into
+ * field-major `[field 0 of s0..s4][field 1 of s0..s4]`. A `PerSlot`
+ * scorer answers per slot; `Heads` wants one contiguous block per role,
+ * so a `CrossEntropy` can pick a slot.
+ */
+
+namespace ann;
+
+public class Permute : Layer
+{
+    /**
+     * Input column of every output column.
+     */
+    public const array<usize> $order;
+
+    // input shape of the last .train forward
+    private array<usize> $input = array<usize>();
+
+    /**
+     * Output column `j` is input column `$order[j]`.
+     */
+    public constructor(const array<usize>& $order)
+    {
+        $this->order = $order;
+    }
+
+    /**
+     * Slot-major to field-major: `$slots` slots of `$width` values each
+     * become `$width` blocks of `$slots` values each.
+     */
+    public constructor(slots: usize $slots, width: usize $width)
+    {
+        array<usize> $order = arr::room<usize>($slots * $width);
+
+        foreach (0 .. $width as $field) {
+            foreach (0 .. $slots as $s) {
+                $order[] = $s * $width + $field;
+            }
+        }
+
+        $this->order = $order;
+    }
+
+    public static function decode(Decoder $in, Registry $registry) : result<Layer, ModelError>
+    {
+        usize $count = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        // a corrupt count must not become a giant allocation
+        if ($count > $in->remaining() / 8) {
+            return .error(.truncated);
+        }
+
+        array<usize> $order = arr::room<usize>($count);
+
+        for (usize $i = 0; $i < $count; $i++) {
+            usize $column = guard $in->size() else ($e) {
+                return .error($e);
+            }
+
+            $order[] = $column;
+        }
+
+        Layer $layer = Permute($order);
+        return .ok($layer);
+    }
+
+    public function forward(const Tensor& $input, Mode $mode) : Tensor
+    {
+        usize $rows = $input->rows();
+        usize $width = $input->cols();
+        usize $outWidth = $this->order->count();
+
+        foreach ($this->order as $j => $column) {
+            usize $c = $column;
+
+            if ($c >= $width) {
+                die("ann::Permute: output column {$j} reads column {$c}, the input has {$width}");
+            }
+        }
+
+        array<usize> $shape = [$rows, $outWidth];
+        Tensor $out = Tensor($shape);
+
+        foreach (0 .. $rows as $r) {
+            foreach ($this->order as $j => $column) {
+                $out->data[$r * $outWidth + $j] = $input->data[$r * $width + $column];
+            }
+        }
+
+        if ($mode == Mode::train) {
+            $this->input = $input->shape;
+        }
+
+        return $out;
+    }
+
+    public function backward(const Tensor& $gradient) : Tensor
+    {
+        Tensor $out = Tensor($this->input);
+        usize $rows = $out->rows();
+        usize $width = $out->cols();
+        usize $outWidth = $this->order->count();
+
+        foreach (0 .. $rows as $r) {
+            foreach ($this->order as $j => $column) {
+                usize $at = $r * $width + $column;
+                $out->data[$at] = $out->data[$at] + $gradient->data[$r * $outWidth + $j];
+            }
+        }
+
+        return $out;
+    }
+
+    public const function params() : array<Param>
+    {
+        return array<Param>();
+    }
+
+    public function initialize(Random& $rng) : void
+    {
+    }
+
+    public const function kind() : string
+    {
+        return 'permute';
+    }
+
+    public const function encode(Encoder $out) : void
+    {
+        $out->size($this->order->count());
+
+        foreach ($this->order as $column) {
+            usize $c = $column;
+            $out->size($c);
+        }
+    }
+
+    public const function summary() : string
+    {
+        return "permute {$this->order->count()} columns";
+    }
+}

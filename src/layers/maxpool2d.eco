@@ -1,0 +1,203 @@
+/**
+ * Max over non-overlapping `size x size` windows of an HWC image, per
+ * channel. Stride is the window size; a height or width that does not
+ * split evenly drops the last pixels. No params.
+ *
+ *     MaxPool2D(16, 32, 32)        // [n, 32 * 32 * 16] -> [n, 16 * 16 * 16]
+ *
+ * Gradient goes to the largest pixel of each window alone, the first one
+ * in row order on a tie.
+ */
+
+namespace ann;
+
+public class MaxPool2D : Layer
+{
+    /**
+     * Channels per pixel, pooled independently.
+     */
+    public const usize $channels;
+
+    /**
+     * Input image height in pixels.
+     */
+    public const usize $height;
+
+    /**
+     * Input image width in pixels.
+     */
+    public const usize $width;
+
+    /**
+     * Window side and stride.
+     */
+    public const usize $size = 2;
+
+    // input shape and the winning input column of every output value, from the last .train forward
+    private array<usize> $input = array<usize>();
+    private array<usize> $winners = array<usize>();
+
+    init
+    {
+        if ($this->channels == 0 || $this->size == 0) {
+            die('ann::MaxPool2D: needs at least one channel and a window of at least 1');
+        }
+
+        if ($this->size > $this->height || $this->size > $this->width) {
+            die("ann::MaxPool2D: a {$this->size}x{$this->size} window does not fit a {$this->height}x{$this->width} image");
+        }
+    }
+
+    public static function decode(Decoder $in, Registry $registry) : result<Layer, ModelError>
+    {
+        usize $channels = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        usize $height = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        usize $width = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        usize $size = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        if ($channels == 0 || $size == 0 || $size > $height || $size > $width) {
+            return .error(.badValue($size as uint64));
+        }
+
+        Layer $layer = MaxPool2D($channels, $height, $width, $size);
+        return .ok($layer);
+    }
+
+    /**
+     * Output image height, `height / size` rounded down.
+     */
+    public const function outputHeight() : usize
+    {
+        return $this->height / $this->size;
+    }
+
+    /**
+     * Output image width, `width / size` rounded down.
+     */
+    public const function outputWidth() : usize
+    {
+        return $this->width / $this->size;
+    }
+
+    /**
+     * Values per input sample, `height * width * channels`.
+     */
+    public const function inputs() : usize
+    {
+        return $this->height * $this->width * $this->channels;
+    }
+
+    /**
+     * Values per output sample, `outputHeight() * outputWidth() * channels`.
+     */
+    public const function outputs() : usize
+    {
+        return $this->outputHeight() * $this->outputWidth() * $this->channels;
+    }
+
+    public function forward(const Tensor& $input, Mode $mode) : Tensor
+    {
+        usize $sample = $this->inputs();
+
+        if ($input->cols() != $sample) {
+            die("ann::MaxPool2D: expected {$this->height}x{$this->width}x{$this->channels} = {$sample} values per sample, got {$input->cols()}");
+        }
+
+        usize $rows = $input->rows();
+        usize $outH = $this->outputHeight();
+        usize $outW = $this->outputWidth();
+        usize $c = $this->channels;
+        usize $outWidth = $this->outputs();
+        array<usize> $shape = [$rows, $outWidth];
+        Tensor $out = Tensor($shape);
+        array<usize> $winners = arr::room<usize>($rows * $outWidth);
+
+        for (usize $n = 0; $n < $rows; $n++) {
+            for (usize $oy = 0; $oy < $outH; $oy++) {
+                for (usize $ox = 0; $ox < $outW; $ox++) {
+                    // top left pixel of the window
+                    usize $corner = $n * $sample + ($oy * $this->size * $this->width + $ox * $this->size) * $c;
+
+                    for (usize $ch = 0; $ch < $c; $ch++) {
+                        usize $best = $corner + $ch;
+                        float64 $peak = $input->data[$best];
+
+                        for (usize $dy = 0; $dy < $this->size; $dy++) {
+                            for (usize $dx = 0; $dx < $this->size; $dx++) {
+                                usize $at = $corner + ($dy * $this->width + $dx) * $c + $ch;
+
+                                if ($input->data[$at] > $peak) {
+                                    $peak = $input->data[$at];
+                                    $best = $at;
+                                }
+                            }
+                        }
+
+                        $out->data[$n * $outWidth + ($oy * $outW + $ox) * $c + $ch] = $peak;
+                        $winners[] = $best;
+                    }
+                }
+            }
+        }
+
+        if ($mode == Mode::train) {
+            $this->input = $input->shape;
+            $this->winners = $winners;
+        }
+
+        return $out;
+    }
+
+    public function backward(const Tensor& $gradient) : Tensor
+    {
+        Tensor $out = Tensor($this->input);
+
+        // winners are in output order, so the gradient lines up value by value
+        foreach ($this->winners as $i => $winner) {
+            usize $at = $winner;
+            $out->data[$at] = $out->data[$at] + $gradient->data[$i];
+        }
+
+        return $out;
+    }
+
+    public const function params() : array<Param>
+    {
+        return array<Param>();
+    }
+
+    public function initialize(Random& $rng) : void
+    {
+    }
+
+    public const function kind() : string
+    {
+        return 'maxpool2d';
+    }
+
+    public const function encode(Encoder $out) : void
+    {
+        $out->size($this->channels);
+        $out->size($this->height);
+        $out->size($this->width);
+        $out->size($this->size);
+    }
+
+    public const function summary() : string
+    {
+        usize $outH = $this->outputHeight();
+        usize $outW = $this->outputWidth();
+        return "maxpool2d {$this->height}x{$this->width}x{$this->channels} -> {$outH}x{$outW}x{$this->channels}, {$this->size}x{$this->size}";
+    }
+}

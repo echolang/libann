@@ -1,0 +1,88 @@
+// 16x16 grayscale pictures of one of three things at a random spot: a
+// horizontal bar, a vertical bar or a small dot, over a little noise.
+// two convolutions find the strokes wherever they are, a global max pool
+// forgets where, and a dense layer names the shape
+//
+//   echoc run -m . examples/shapes.eco
+
+use ann::{Act, Adam, Conv2D, CrossEntropy, Dataset, Dense, MaxPool2D, Model, Pool, Random, Sequential, Tensor, Trainer};
+
+const SIDE = 16;
+const PER_CLASS = 300;
+const CLASSES = 3;
+
+// one image as a flat HWC row; a single channel makes that plain row-major
+internal function picture(usize $shape, Random& $rng) : array<float64>
+{
+    array<float64> $pixels = arr::room<float64>(SIDE * SIDE);
+
+    foreach (0 .. SIDE * SIDE as $i) {
+        $pixels[] = $rng->normal(0.0, 0.1);
+    }
+
+    usize $length = 5 + $rng->below(6);
+    usize $along = $rng->below(SIDE - $length + 1);
+    usize $across = $rng->below(SIDE);
+
+    if ($shape == 0) {
+        foreach (0 .. $length as $k) {
+            $pixels[$across * SIDE + $along + $k] = 1.0;
+        }
+    }
+
+    if ($shape == 1) {
+        foreach (0 .. $length as $k) {
+            $pixels[($along + $k) * SIDE + $across] = 1.0;
+        }
+    }
+
+    if ($shape == 2) {
+        usize $y = $rng->below(SIDE - 1);
+        usize $x = $rng->below(SIDE - 1);
+        $pixels[$y * SIDE + $x] = 1.0;
+        $pixels[$y * SIDE + $x + 1] = 1.0;
+        $pixels[($y + 1) * SIDE + $x] = 1.0;
+        $pixels[($y + 1) * SIDE + $x + 1] = 1.0;
+    }
+
+    return $pixels;
+}
+
+internal function pictures(uint64 $seed) : Dataset
+{
+    $rng = Random($seed);
+    array<array<float64>> $images = array<array<float64>>();
+    array<usize> $labels = array<usize>();
+
+    for (usize $c = 0; $c < CLASSES; $c++) {
+        for (usize $i = 0; $i < PER_CLASS; $i++) {
+            $images[] = picture($c, $rng);
+            $labels[] = $c;
+        }
+    }
+
+    return Dataset(Tensor(rows: $images), Tensor(oneHot: $labels, classes: CLASSES));
+}
+
+// 16x16x1 -> 16x16x8 -> 8x8x8 -> 8x8x16, then the max of each filter over all 64 pixels
+$first = Conv2D(1, 8, SIDE, SIDE);
+$pool = MaxPool2D(8, $first->outputHeight(), $first->outputWidth());
+$second = Conv2D(8, 16, $pool->outputHeight(), $pool->outputWidth());
+usize $pixels = $second->outputHeight() * $second->outputWidth();
+
+$net = Sequential()
+    ->add($first)
+    ->add(Act(.relu))
+    ->add($pool)
+    ->add($second)
+    ->add(Act(.relu))
+    ->add(Pool($pixels, .max))
+    ->add(Dense(16, CLASSES));
+
+$split = pictures(5)->split(0.2, $seed: 3);
+$model = Model($net, $seed: 1);
+echo $model->summary();
+Trainer($epochs: 8, $batchSize: 32)->fit($model, CrossEntropy(), Adam(0.01), $split->train);
+
+$result = $model->evaluate($split->holdout, CrossEntropy(), .accuracy);
+echo "holdout accuracy {$result->metric:.3f} (chance 0.333)";

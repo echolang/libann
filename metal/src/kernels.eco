@@ -1,0 +1,529 @@
+/**
+ * The Metal kernels, compiled once per `Gpu`. Every kernel reads its sizes
+ * and constants from a `constant uint*` word buffer (`Words`), floats as
+ * their bits. `setBytes` does not compile in libmetal up to 0.1.3, and a
+ * buffer per dispatch site never changes shape anyway.
+ *
+ * The source is a single-quoted string, so it holds no backslashes: echoc
+ * would read them as escapes.
+ *
+ * Every exp, log, tanh and sqrt is `precise::`. Turning fast math off is
+ * not enough on its own: the default functions stay the fast ones, and
+ * their tanh returns NaN from 45 up, which a GELU reaches once its inputs
+ * pass about 10.
+ */
+
+namespace ann::metal;
+
+internal const KERNELS = '
+#include <metal_stdlib>
+using namespace metal;
+
+#define TILE 64
+#define DEPTH 16
+#define GROUP 256
+
+inline float word(constant uint* a, uint i)
+{
+    return as_type<float>(a[i]);
+}
+
+// C[m, n] = sum over k of A[m, k] B[k, n], strides given, so one kernel is
+// A.B, A.Bt and At.B. 16 x 16 threads, each owns a 4 x 4 block of a 64 x 64
+// tile. a: M N K, A strides (m, k), B strides (k, n), bias flag
+kernel void matmul(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    device const float* bias [[buffer(3)]],
+    constant uint* a [[buffer(4)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint2 local [[thread_position_in_threadgroup]],
+    uint index [[thread_index_in_threadgroup]])
+{
+    const uint M = a[0];
+    const uint N = a[1];
+    const uint K = a[2];
+    const uint sam = a[3];
+    const uint sak = a[4];
+    const uint sbk = a[5];
+    const uint sbn = a[6];
+    const bool hasBias = a[7] != 0;
+
+    threadgroup float as[DEPTH][TILE];
+    threadgroup float bs[DEPTH][TILE];
+
+    const uint row0 = group.y * TILE;
+    const uint col0 = group.x * TILE;
+    float4 acc[4] = { float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f) };
+
+    for (uint k0 = 0; k0 < K; k0 += DEPTH) {
+        // walk memory in whichever direction is contiguous
+        for (uint e = index; e < TILE * DEPTH; e += GROUP) {
+            uint m;
+            uint k;
+
+            if (sak == 1) {
+                m = e / DEPTH;
+                k = e % DEPTH;
+            } else {
+                k = e / TILE;
+                m = e % TILE;
+            }
+
+            uint gm = row0 + m;
+            uint gk = k0 + k;
+            as[k][m] = (gm < M && gk < K) ? A[gm * sam + gk * sak] : 0.0f;
+        }
+
+        for (uint e = index; e < TILE * DEPTH; e += GROUP) {
+            uint n;
+            uint k;
+
+            if (sbn == 1) {
+                k = e / TILE;
+                n = e % TILE;
+            } else {
+                n = e / DEPTH;
+                k = e % DEPTH;
+            }
+
+            uint gn = col0 + n;
+            uint gk = k0 + k;
+            bs[k][n] = (gn < N && gk < K) ? B[gk * sbk + gn * sbn] : 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k = 0; k < DEPTH; k++) {
+            float4 x = float4(as[k][local.y * 4], as[k][local.y * 4 + 1], as[k][local.y * 4 + 2], as[k][local.y * 4 + 3]);
+            float4 y = float4(bs[k][local.x * 4], bs[k][local.x * 4 + 1], bs[k][local.x * 4 + 2], bs[k][local.x * 4 + 3]);
+            acc[0] += x.x * y;
+            acc[1] += x.y * y;
+            acc[2] += x.z * y;
+            acc[3] += x.w * y;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < 4; i++) {
+        uint gm = row0 + local.y * 4 + i;
+
+        if (gm >= M) {
+            continue;
+        }
+
+        for (uint j = 0; j < 4; j++) {
+            uint gn = col0 + local.x * 4 + j;
+
+            if (gn < N) {
+                float v = acc[i][j];
+
+                if (hasBias) {
+                    v += bias[gn];
+                }
+
+                C[gm * N + gn] = v;
+            }
+        }
+    }
+}
+
+inline float logistic(float x)
+{
+    if (x >= 0.0f) {
+        return 1.0f / (1.0f + precise::exp(-x));
+    }
+
+    float e = precise::exp(x);
+    return e / (1.0f + e);
+}
+
+inline float geluInner(float x)
+{
+    return 0.7978845608028654f * (x + 0.044715f * x * x * x);
+}
+
+// codes are ann::Activation values
+inline float activate(uint kind, float x)
+{
+    switch (kind) {
+        case 1: return max(x, 0.0f);
+        case 2: return x > 0.0f ? x : 0.01f * x;
+        case 3: return logistic(x);
+        case 4: return precise::tanh(x);
+        case 5: return 0.5f * x * (1.0f + precise::tanh(geluInner(x)));
+        case 6: return max(x, 0.0f) + precise::log(1.0f + precise::exp(-abs(x)));
+        case 7: return x > 0.0f ? x : precise::exp(x) - 1.0f;
+        case 8: return x * logistic(x);
+        default: return x;
+    }
+}
+
+inline float derive(uint kind, float x, float y)
+{
+    switch (kind) {
+        case 1: return x > 0.0f ? 1.0f : 0.0f;
+        case 2: return x > 0.0f ? 1.0f : 0.01f;
+        case 3: return y * (1.0f - y);
+        case 4: return 1.0f - y * y;
+        case 5: {
+            float t = precise::tanh(geluInner(x));
+            float inner = 0.7978845608028654f * (1.0f + 3.0f * 0.044715f * x * x);
+            return 0.5f * (1.0f + t) + 0.5f * x * (1.0f - t * t) * inner;
+        }
+        case 6: return logistic(x);
+        case 7: return x > 0.0f ? 1.0f : y + 1.0f;
+        case 8: {
+            float s = logistic(x);
+            return s + x * s * (1.0f - s);
+        }
+        default: return 1.0f;
+    }
+}
+
+// a: n, activation
+kernel void act(
+    device const float* x [[buffer(0)]],
+    device float* y [[buffer(1)]],
+    constant uint* a [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i < a[0]) {
+        y[i] = activate(a[1], x[i]);
+    }
+}
+
+// a: n, activation
+kernel void slope(
+    device const float* x [[buffer(0)]],
+    device const float* y [[buffer(1)]],
+    device const float* g [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint* a [[buffer(4)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i < a[0]) {
+        out[i] = g[i] * derive(a[1], x[i], y[i]);
+    }
+}
+
+// sum of every row, one thread per column. a: rows, cols
+kernel void columns(
+    device const float* g [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant uint* a [[buffer(2)]],
+    uint c [[thread_position_in_grid]])
+{
+    const uint rows = a[0];
+    const uint cols = a[1];
+
+    if (c >= cols) {
+        return;
+    }
+
+    float sum = 0.0f;
+
+    for (uint r = 0; r < rows; r++) {
+        sum += g[r * cols + c];
+    }
+
+    out[c] = sum;
+}
+
+// dst row r = src row idx[r]. a: rows, cols
+kernel void gather(
+    device const float* src [[buffer(0)]],
+    device const uint* idx [[buffer(1)]],
+    device float* dst [[buffer(2)]],
+    constant uint* a [[buffer(3)]],
+    uint2 p [[thread_position_in_grid]])
+{
+    const uint cols = a[1];
+
+    if (p.y < a[0] && p.x < cols) {
+        dst[p.y * cols + p.x] = src[idx[p.y] * cols + p.x];
+    }
+}
+
+// one thread per row: weighted row loss, and the row of d(loss)/d(output)
+// already weighted and divided by the batch. codes: 0 mse, 1 mae, 2 huber,
+// 3 binary cross-entropy, 4 softmax cross-entropy.
+// a: rows, cols, kind, param (delta or smoothing), 1 / rows
+kernel void loss(
+    device const float* out [[buffer(0)]],
+    device const float* target [[buffer(1)]],
+    device const float* weight [[buffer(2)]],
+    device float* losses [[buffer(3)]],
+    device float* grad [[buffer(4)]],
+    constant uint* a [[buffer(5)]],
+    uint r [[thread_position_in_grid]])
+{
+    if (r >= a[0]) {
+        return;
+    }
+
+    const uint cols = a[1];
+    const uint kind = a[2];
+    const float p = word(a, 3);
+    const float scale = weight[r] * word(a, 4);
+    const float n = float(cols);
+    const uint base = r * cols;
+    float total = 0.0f;
+
+    if (kind == 4) {
+        float top = out[base];
+
+        for (uint c = 1; c < cols; c++) {
+            top = max(top, out[base + c]);
+        }
+
+        float sum = 0.0f;
+
+        for (uint c = 0; c < cols; c++) {
+            sum += precise::exp(out[base + c] - top);
+        }
+
+        const float lse = top + precise::log(sum);
+
+        for (uint c = 0; c < cols; c++) {
+            float t = target[base + c] * (1.0f - p) + p / n;
+            float o = out[base + c];
+
+            if (t != 0.0f) {
+                total -= t * (o - lse);
+            }
+
+            grad[base + c] = scale * (precise::exp(o - lse) - t);
+        }
+
+        losses[r] = weight[r] * total;
+        return;
+    }
+
+    for (uint c = 0; c < cols; c++) {
+        float o = out[base + c];
+        float t = target[base + c];
+        float d = o - t;
+        float l;
+        float g;
+
+        if (kind == 1) {
+            l = abs(d);
+            g = sign(d);
+        } else if (kind == 2) {
+            float ad = abs(d);
+            l = ad <= p ? 0.5f * d * d : p * (ad - 0.5f * p);
+            g = clamp(d, -p, p);
+        } else if (kind == 3) {
+            float q = clamp(o, 1e-7f, 1.0f - 1e-7f);
+            l = -(t * precise::log(q) + (1.0f - t) * precise::log(1.0f - q));
+            g = (q - t) / (q * (1.0f - q));
+        } else {
+            l = d * d;
+            g = 2.0f * d;
+        }
+
+        total += l / n;
+        grad[base + c] = scale * g / n;
+    }
+
+    losses[r] = weight[r] * total;
+}
+
+// partial sums of squares, one per threadgroup, into partials[offset + group]
+// a: n, offset
+kernel void squares(
+    device const float* g [[buffer(0)]],
+    device float* partials [[buffer(1)]],
+    constant uint* a [[buffer(2)]],
+    uint index [[thread_index_in_threadgroup]],
+    uint group [[threadgroup_position_in_grid]],
+    uint groups [[threadgroups_per_grid]])
+{
+    threadgroup float shared[GROUP];
+    const uint n = a[0];
+    float s = 0.0f;
+
+    for (uint i = group * GROUP + index; i < n; i += groups * GROUP) {
+        s += g[i] * g[i];
+    }
+
+    shared[index] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = GROUP / 2; stride > 0; stride /= 2) {
+        if (index < stride) {
+            shared[index] += shared[index + stride];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (index == 0) {
+        partials[a[1] + group] = shared[0];
+    }
+}
+
+// global L2 from the partials, then the factor that brings it under the
+// limit. a: partial count, limit
+kernel void clip(
+    device const float* partials [[buffer(0)]],
+    device float* scale [[buffer(1)]],
+    constant uint* a [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i != 0) {
+        return;
+    }
+
+    float sum = 0.0f;
+
+    for (uint k = 0; k < a[0]; k++) {
+        sum += partials[k];
+    }
+
+    const float norm = precise::sqrt(sum);
+    const float limit = word(a, 1);
+    scale[0] = norm > limit ? limit / norm : 1.0f;
+}
+
+// a: n, beta1, beta2, rate, epsilon, decay, correct1, correct2
+kernel void adam(
+    device float* w [[buffer(0)]],
+    device const float* g [[buffer(1)]],
+    device float* m [[buffer(2)]],
+    device float* v [[buffer(3)]],
+    device const float* scale [[buffer(4)]],
+    constant uint* a [[buffer(5)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= a[0]) {
+        return;
+    }
+
+    const float beta1 = word(a, 1);
+    const float beta2 = word(a, 2);
+    const float gi = g[i] * scale[0];
+    const float mi = beta1 * m[i] + (1.0f - beta1) * gi;
+    const float vi = beta2 * v[i] + (1.0f - beta2) * gi * gi;
+    m[i] = mi;
+    v[i] = vi;
+
+    const float wi = w[i];
+    const float update = (mi / word(a, 6)) / (precise::sqrt(vi / word(a, 7)) + word(a, 4));
+    w[i] = wi - word(a, 3) * (update + word(a, 5) * wi);
+}
+
+// a: n, rate, momentum, nesterov
+kernel void sgd(
+    device float* w [[buffer(0)]],
+    device const float* g [[buffer(1)]],
+    device float* velocity [[buffer(2)]],
+    device const float* scale [[buffer(3)]],
+    constant uint* a [[buffer(4)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= a[0]) {
+        return;
+    }
+
+    const float momentum = word(a, 2);
+    const float gi = g[i] * scale[0];
+    float update = gi;
+
+    if (momentum != 0.0f) {
+        float v = momentum * velocity[i] + gi;
+        velocity[i] = v;
+        update = a[3] != 0 ? gi + momentum * v : v;
+    }
+
+    w[i] = w[i] - word(a, 1) * update;
+}
+';
+
+/**
+ * One pipeline per kernel in `KERNELS`.
+ */
+internal struct Kernels
+{
+    internal mtl::ComputePipelineState $matmul;
+    internal mtl::ComputePipelineState $act;
+    internal mtl::ComputePipelineState $slope;
+    internal mtl::ComputePipelineState $columns;
+    internal mtl::ComputePipelineState $gather;
+    internal mtl::ComputePipelineState $loss;
+    internal mtl::ComputePipelineState $squares;
+    internal mtl::ComputePipelineState $clip;
+    internal mtl::ComputePipelineState $adam;
+    internal mtl::ComputePipelineState $sgd;
+}
+
+/**
+ * Compile `KERNELS` and build every pipeline. Fast math stays off so exp,
+ * log and tanh track the CPU path.
+ */
+internal function compile(mtl::Device $device) : result<Kernels, GpuError>
+{
+    $options = mtl::CompileOptions($fastMathEnabled: false, $languageVersion: .v2_3);
+
+    $library = guard $device->newLibrary(source: KERNELS, $options) else ($e) {
+        return .error(.compile($e->message()));
+    }
+
+    $matmul = guard pipeline($device, $library, 'matmul') else ($e) {
+        return .error($e);
+    }
+
+    $act = guard pipeline($device, $library, 'act') else ($e) {
+        return .error($e);
+    }
+
+    $slope = guard pipeline($device, $library, 'slope') else ($e) {
+        return .error($e);
+    }
+
+    $columns = guard pipeline($device, $library, 'columns') else ($e) {
+        return .error($e);
+    }
+
+    $gather = guard pipeline($device, $library, 'gather') else ($e) {
+        return .error($e);
+    }
+
+    $loss = guard pipeline($device, $library, 'loss') else ($e) {
+        return .error($e);
+    }
+
+    $squares = guard pipeline($device, $library, 'squares') else ($e) {
+        return .error($e);
+    }
+
+    $clip = guard pipeline($device, $library, 'clip') else ($e) {
+        return .error($e);
+    }
+
+    $adam = guard pipeline($device, $library, 'adam') else ($e) {
+        return .error($e);
+    }
+
+    $sgd = guard pipeline($device, $library, 'sgd') else ($e) {
+        return .error($e);
+    }
+
+    return .ok(Kernels($matmul, $act, $slope, $columns, $gather, $loss, $squares, $clip, $adam, $sgd));
+}
+
+private function pipeline(mtl::Device $device, mtl::Library $library, string $name) : result<mtl::ComputePipelineState, GpuError>
+{
+    $function = guard $library->newFunction($name) else {
+        return .error(.compile("no kernel named {$name}"));
+    }
+
+    $state = guard $device->newComputePipelineState($function) else ($e) {
+        return .error(.compile($e->message()));
+    }
+
+    return .ok($state);
+}

@@ -1,0 +1,561 @@
+/**
+ * An `ann::Model` mirrored on the GPU. One training step is one command
+ * buffer: forward, loss, backward, clip and the optimizer, then a single
+ * wait. Weights stay on the device until `sync` writes them back into the
+ * host model, so save, load and CPU predict see the trained network only
+ * after that.
+ *
+ *     $net = guard $gpu->mirror($model, $batch: 256) else ($e) {
+ *         die("{$e}");
+ *     }
+ *
+ *     $loss = $net->learn($batch, Objective::mse(MeanSquaredError()), Update::adam($adam));
+ *     $net->sync();
+ *
+ * Dense and Act layers, inside any nesting of Sequential. Batches are at
+ * most `capacity` rows; `predict` takes any number and walks them in
+ * pieces of that size.
+ */
+
+namespace ann::metal;
+
+use ann::{Act, Dataset, Dense, Evaluation, Layer, Metric, Model, Sequential, Tensor};
+
+/**
+ * Buffers for the loss, clipping and gathering. Sized once for `capacity`
+ * rows.
+ */
+internal struct Head
+{
+    internal Matrix $targets;
+    internal Matrix $weights;
+    internal Matrix $losses;
+    internal Matrix $partials;
+    internal Matrix $scale;
+    internal Words $indices;
+    internal Words $lossWords;
+    internal Words $clipWords;
+    internal Words $gatherInputs;
+    internal Words $gatherTargets;
+    internal Words $gatherWeights;
+}
+
+/**
+ * A dataset uploaded once, for `Trainer` to gather batches from without
+ * leaving the device.
+ */
+internal struct Resident
+{
+    internal Matrix $inputs;
+    internal Matrix $targets;
+    internal Matrix $weights;
+}
+
+/**
+ * A flattened layer the GPU can run. `layout` produces these so `build`
+ * never re-checks `kind()`.
+ */
+internal enum Leaf
+{
+    case dense(Dense $dense);
+    case act(Act $act);
+}
+
+/**
+ * What `layout` hands `build`: the input width and the typed stages.
+ */
+internal struct Layout
+{
+    internal usize $inputs;
+    internal array<Leaf> $leaves;
+}
+
+public class Network
+{
+    /**
+     * The host model. Its params catch up on `sync`.
+     */
+    public Model $model;
+
+    /**
+     * Most rows one step takes.
+     */
+    public const usize $capacity;
+
+    /**
+     * Values per input sample, and per output.
+     */
+    public const usize $inputs;
+    public const usize $outputs;
+
+    private Gpu $gpu;
+    private array<Stage> $stages;
+    private array<Slot> $slots;
+    private Matrix $input;
+    private Matrix $output;
+    private Matrix $gradient;
+    private Head $head;
+    private uint64 $steps = 0;
+
+    private constructor(Gpu $gpu, Model $model, usize $capacity, array<Stage> $stages, array<Slot> $slots, array<Matrix> $values, array<Matrix> $grads, Head $head)
+    {
+        $this->gpu = $gpu;
+        $this->model = $model;
+        $this->capacity = $capacity;
+        $this->stages = $stages;
+        $this->slots = $slots;
+        $this->input = $values[0];
+        $this->output = $values[$values->count() - 1];
+        $this->gradient = $grads[$grads->count() - 1];
+        $this->inputs = $this->input->cols;
+        $this->outputs = $this->output->cols;
+        $this->head = $head;
+    }
+
+    internal static function build(Gpu $gpu, Model $model, usize $capacity) : result<Network, GpuError>
+    {
+        if ($capacity == 0) {
+            die('ann::metal: a network needs room for at least one row');
+        }
+
+        $plan = guard layout($model) else ($e) {
+            return .error($e);
+        }
+
+        usize $width = $plan->inputs;
+
+        $first = guard $gpu->matrix($capacity, $width) else ($e) {
+            return .error($e);
+        }
+
+        // nothing reads the gradient of the network's input
+        $none = guard $gpu->matrix(1, 1) else ($e) {
+            return .error($e);
+        }
+
+        $values = [$first];
+        $grads = [$none];
+        $stages = arr::room<Stage>($plan->leaves->count());
+        $slots = array<Slot>();
+        usize $partials = 0;
+
+        foreach ($plan->leaves as $i => $leaf) {
+            $in = $values[$i];
+            $gradIn = $grads[$i];
+            $opened = guard open($gpu, $leaf, $capacity, $width, $in, $gradIn, $partials) else ($e) {
+                return .error($e);
+            }
+
+            $width = $opened->width;
+            $partials = $opened->partials;
+            $values[] = $opened->out;
+            $grads[] = $opened->gradOut;
+            $stages[] = $opened->stage;
+
+            foreach ($opened->slots as $slot) {
+                $slots[] = $slot;
+            }
+        }
+
+        $head = guard head($gpu, $capacity, $width, $partials) else ($e) {
+            return .error($e);
+        }
+
+        return .ok(Network($gpu, $model, $capacity, $stages, $slots, $values, $grads, $head));
+    }
+
+    /**
+     * One supervised step on `$batch`, the GPU twin of `Model::learn`:
+     * forward, weighted loss, backward, clip to global L2 `$clip` when
+     * above zero, optimizer. Returns the batch's loss before the step.
+     */
+    public function learn(const Dataset& $batch, const Objective& $objective, const Update& $update, float64 $clip = 0.0) : float64
+    {
+        usize $rows = $batch->count();
+        $this->expect($batch->inputs, $batch->targets, $rows);
+        $this->input->load($batch->inputs, 0, $rows);
+        $this->head->targets->load($batch->targets, 0, $rows);
+        $this->head->weights->load($batch->weights, 0, $rows);
+        $pass = $this->gpu->pass();
+        return $this->train($pass, $rows, $objective, $update, $clip);
+    }
+
+    /**
+     * Raw network output for every row of `$inputs`, in pieces of
+     * `capacity` rows. Pass it through `Objective::loss()->predict` for what
+     * the loss means by it (softmax, for cross-entropy).
+     */
+    public function predict(const Tensor& $inputs) : Tensor
+    {
+        if ($inputs->cols() != $this->inputs) {
+            die("ann::metal: expected {$this->inputs} values per sample, got {$inputs->cols()}");
+        }
+
+        usize $total = $inputs->rows();
+        array<usize> $shape = [$total, $this->outputs];
+        $out = Tensor($shape);
+        usize $first = 0;
+
+        while ($first < $total) {
+            usize $rows = std::math::min($this->capacity, $total - $first);
+            $this->input->load($inputs, $first, $rows);
+            $pass = $this->gpu->pass();
+
+            foreach ($this->stages as $stage) {
+                $stage->forward($pass, $rows);
+            }
+
+            $pass->finish();
+            $this->output->read($out, $first, $rows);
+            $first = $first + $rows;
+        }
+
+        return $out;
+    }
+
+    /**
+     * Loss and metric over `$data`, like `Model::evaluate`. The network
+     * runs on the GPU; scoring runs on the CPU with the host loss.
+     */
+    public function evaluate(const Dataset& $data, const Objective& $objective, Metric $metric = .none) : Evaluation
+    {
+        $output = $this->predict($data->inputs);
+        $loss = $data->loss($objective->loss(), $output);
+        $score = 0.0;
+
+        if ($metric != Metric::none) {
+            $score = $metric->score($objective->loss()->predict($output), $data->targets);
+        }
+
+        return Evaluation($loss, $score);
+    }
+
+    /**
+     * Device weights into the host model's params. Save, load and CPU
+     * `predict` see the trained network after this.
+     */
+    public function sync() : void
+    {
+        foreach ($this->slots as $slot) {
+            $slot->sync();
+        }
+    }
+
+    /**
+     * Host params onto the device, after changing them on the CPU (a
+     * `loadWeights`, a `copy`). Optimizer state is kept.
+     */
+    public function reload() : void
+    {
+        foreach ($this->slots as $slot) {
+            $slot->reload();
+        }
+    }
+
+    /**
+     * Upload `$data` for `Trainer` to gather from.
+     */
+    internal function upload(const Dataset& $data) : result<Resident, GpuError>
+    {
+        usize $rows = $data->count();
+        $this->expect($data->inputs, $data->targets, std::math::min($rows, $this->capacity));
+
+        $inputs = guard $this->gpu->matrix($rows, $this->inputs) else ($e) {
+            return .error($e);
+        }
+
+        $targets = guard $this->gpu->matrix($rows, $this->outputs) else ($e) {
+            return .error($e);
+        }
+
+        $weights = guard $this->gpu->matrix($rows, 1) else ($e) {
+            return .error($e);
+        }
+
+        $inputs->load($data->inputs, 0, $rows);
+        $targets->load($data->targets, 0, $rows);
+        $weights->load($data->weights, 0, $rows);
+        return .ok(Resident($inputs, $targets, $weights));
+    }
+
+    /**
+     * One step on the named rows of `$data`, gathered on the device.
+     */
+    internal function learn(resident: const Resident& $data, const array<usize>& $indices, const Objective& $objective, const Update& $update, float64 $clip) : float64
+    {
+        usize $rows = $indices->count();
+
+        if ($rows > $this->capacity) {
+            die("ann::metal: a batch of {$rows} rows, but the network was mirrored for {$this->capacity}");
+        }
+
+        Head& $head = $this->head;
+        $head->indices->indices($indices, 0, $rows);
+        $pass = $this->gpu->pass();
+        gather($pass, $head->gatherInputs, $data->inputs, $head->indices, $this->input, $rows);
+        gather($pass, $head->gatherTargets, $data->targets, $head->indices, $head->targets, $rows);
+        gather($pass, $head->gatherWeights, $data->weights, $head->indices, $head->weights, $rows);
+        return $this->train($pass, $rows, $objective, $update, $clip);
+    }
+
+    private function train(Pass& $pass, usize $rows, const Objective& $objective, const Update& $update, float64 $clip) : float64
+    {
+        foreach ($this->stages as $stage) {
+            $stage->forward($pass, $rows);
+        }
+
+        Head& $head = $this->head;
+        $loss = $head->lossWords;
+        $loss->u(0, $rows);
+        $loss->u(1, $this->outputs);
+        $loss->u(2, $objective->kind());
+        $loss->f(3, $objective->param());
+        $loss->f(4, 1.0 / std::math::max($rows as float64, 1.0));
+        $lossBuffers = [$this->output->buffer, $head->targets->buffer, $head->weights->buffer, $head->losses->buffer, $this->gradient->buffer, $loss->buffer];
+        $pass->run($pass->kernels->loss, $lossBuffers, $rows);
+
+        usize $k = $this->stages->count();
+
+        while ($k > 0) {
+            $k = $k - 1;
+            $this->stages[$k]->backward($pass, $rows, $k > 0);
+        }
+
+        if ($clip > 0.0) {
+            foreach ($this->slots as $slot) {
+                $slot->squares($pass, $head->partials);
+            }
+
+            $head->clipWords->u(0, $head->partials->cols);
+            $head->clipWords->f(1, $clip);
+            $clipBuffers = [$head->partials->buffer, $head->scale->buffer, $head->clipWords->buffer];
+            $pass->run($pass->kernels->clip, $clipBuffers, 1);
+        } else {
+            $head->scale->fill(1.0);
+        }
+
+        $this->steps = $this->steps + 1;
+
+        foreach ($this->slots as $slot) {
+            $update->encode($pass, $slot, $head->scale, $this->steps);
+        }
+
+        $pass->finish();
+        return $head->losses->total($rows) / std::math::max($rows as float64, 1.0);
+    }
+
+    private const function expect(const Tensor& $inputs, const Tensor& $targets, usize $rows) : void
+    {
+        if ($rows > $this->capacity) {
+            die("ann::metal: a batch of {$rows} rows, but the network was mirrored for {$this->capacity}");
+        }
+
+        if ($inputs->cols() != $this->inputs) {
+            die("ann::metal: expected {$this->inputs} values per sample, got {$inputs->cols()}");
+        }
+
+        if ($targets->cols() != $this->outputs) {
+            die("ann::metal: expected {$this->outputs} values per target, got {$targets->cols()}");
+        }
+    }
+}
+
+/**
+ * `$model`'s layers as the GPU runs them: Sequential opened all the way
+ * down, everything else Dense or Act, every Dense taking the width the
+ * layer before it gives. Errors name a layer by its index in this list.
+ * Nothing touches the device.
+ */
+internal function layout(const Model& $model) : result<Layout, GpuError>
+{
+    $raw = array<Layer>();
+    flatten($model->root, $raw);
+
+    $leaves = arr::room<Leaf>($raw->count());
+    usize $inputs = 0;
+    usize $width = 0;
+    bool $started = false;
+
+    foreach ($raw as $i => $layer) {
+        usize $index = $i;
+        $kind = $layer->kind();
+
+        if ($kind == 'dense') {
+            $dense = $layer as Dense;
+
+            if (!$started) {
+                $inputs = $dense->inputs;
+                $width = $dense->inputs;
+                $started = true;
+            }
+
+            if ($dense->inputs != $width) {
+                return .error(.shape($index));
+            }
+
+            $width = $dense->outputs;
+            $leaves[] = Leaf::dense($dense);
+        } else if ($kind == 'act') {
+            $leaves[] = Leaf::act($layer as Act);
+        } else {
+            return .error(.unsupported($index));
+        }
+    }
+
+    if (!$started) {
+        return .error(.noDense);
+    }
+
+    return .ok(Layout($inputs, $leaves));
+}
+
+/**
+ * Every leaf layer under `$layer`, in order. Sequential is the only
+ * container the GPU opens; anything else is a leaf.
+ */
+private function flatten(Layer $layer, array<Layer>& $out) : void
+{
+    if ($layer->kind() != 'sequential') {
+        $out[] = $layer;
+        return;
+    }
+
+    $sequential = $layer as Sequential;
+
+    foreach ($sequential->layers as $child) {
+        flatten($child, $out);
+    }
+}
+
+/**
+ * One flattened layer as a stage, plus the matrices it writes.
+ */
+internal struct Opened
+{
+    internal Stage $stage;
+    internal Matrix $out;
+    internal Matrix $gradOut;
+    internal usize $width;
+    internal usize $partials;
+    internal array<Slot> $slots;
+}
+
+private function open(Gpu $gpu, Leaf $leaf, usize $capacity, usize $width, Matrix $in, Matrix $gradIn, usize $partials) : result<Opened, GpuError>
+{
+    return match ($leaf) {
+        .act($act) => openAct($gpu, $act, $capacity, $width, $in, $gradIn, $partials),
+        .dense($dense) => openDense($gpu, $dense, $capacity, $in, $gradIn, $partials),
+    };
+}
+
+private function openAct(Gpu $gpu, Act $act, usize $capacity, usize $width, Matrix $in, Matrix $gradIn, usize $partials) : result<Opened, GpuError>
+{
+    $out = guard $gpu->matrix($capacity, $width) else ($e) {
+        return .error($e);
+    }
+
+    $gradOut = guard $gpu->matrix($capacity, $width) else ($e) {
+        return .error($e);
+    }
+
+    $forward = guard $gpu->words() else ($e) {
+        return .error($e);
+    }
+
+    $backward = guard $gpu->words() else ($e) {
+        return .error($e);
+    }
+
+    usize $code = $act->activation->value() as usize;
+    Stage $stage = ActStage($code, $width, $in, $out, $gradIn, $gradOut, $forward, $backward);
+    $slots = array<Slot>();
+    return .ok(Opened($stage, $out, $gradOut, $width, $partials, $slots));
+}
+
+private function openDense(Gpu $gpu, Dense $dense, usize $capacity, Matrix $in, Matrix $gradIn, usize $partials) : result<Opened, GpuError>
+{
+    usize $width = $dense->outputs;
+
+    $out = guard $gpu->matrix($capacity, $width) else ($e) {
+        return .error($e);
+    }
+
+    $gradOut = guard $gpu->matrix($capacity, $width) else ($e) {
+        return .error($e);
+    }
+
+    $weight = guard Slot::make($gpu, $dense->weight, $partials) else ($e) {
+        return .error($e);
+    }
+
+    $partials = $partials + $weight->groups;
+
+    $bias = guard Slot::make($gpu, $dense->bias, $partials) else ($e) {
+        return .error($e);
+    }
+
+    $partials = $partials + $bias->groups;
+    $words = arr::room<Words>(4);
+
+    for (int32 $w = 0; $w < 4; $w++) {
+        $each = guard $gpu->words() else ($e) {
+            return .error($e);
+        }
+
+        $words[] = $each;
+    }
+
+    $slots = [$weight, $bias];
+    Stage $stage = DenseStage($dense->inputs, $dense->outputs, $weight, $bias, $in, $out, $gradIn, $gradOut, $words);
+    return .ok(Opened($stage, $out, $gradOut, $width, $partials, $slots));
+}
+
+private function head(Gpu $gpu, usize $capacity, usize $width, usize $partials) : result<Head, GpuError>
+{
+    $targets = guard $gpu->matrix($capacity, $width) else ($e) {
+        return .error($e);
+    }
+
+    $weights = guard $gpu->matrix($capacity, 1) else ($e) {
+        return .error($e);
+    }
+
+    $losses = guard $gpu->matrix($capacity, 1) else ($e) {
+        return .error($e);
+    }
+
+    $sums = guard $gpu->matrix(1, $partials) else ($e) {
+        return .error($e);
+    }
+
+    $scale = guard $gpu->matrix(1, 1) else ($e) {
+        return .error($e);
+    }
+
+    $indices = guard $gpu->words($capacity) else ($e) {
+        return .error($e);
+    }
+
+    $words = arr::room<Words>(5);
+
+    for (int32 $i = 0; $i < 5; $i++) {
+        $each = guard $gpu->words() else ($e) {
+            return .error($e);
+        }
+
+        $words[] = $each;
+    }
+
+    return .ok(Head($targets, $weights, $losses, $sums, $scale, $indices, $words[0], $words[1], $words[2], $words[3], $words[4]));
+}
+
+/**
+ * Rows `idx[0 ..< $rows]` of `$source` into the top of `$into`.
+ */
+private function gather(Pass& $pass, Words $words, Matrix $source, Words $indices, Matrix $into, usize $rows) : void
+{
+    $words->u(0, $rows);
+    $words->u(1, $into->cols);
+    $buffers = [$source->buffer, $indices->buffer, $into->buffer, $words->buffer];
+    $pass->run($pass->kernels->gather, $buffers, $into->cols, $rows);
+}

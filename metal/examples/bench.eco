@@ -1,0 +1,110 @@
+/*
+ * Training steps per second, CPU against GPU, on a three-layer MLP as it
+ * gets wider. Where the GPU starts to win is the point of the module.
+ * Release builds only; the jit's debug checks would measure themselves.
+ *
+ *   echoc build --package-dir ../vendor --target bench --optimize whole && ./bench
+ */
+
+use std::time;
+use ann::{Act, Adam, Dataset, Dense, MeanSquaredError, Model, Random, Sequential, Tensor};
+use ann::metal::{Gpu, Objective, Update};
+
+internal function noise(Random& $rng, usize $rows, usize $cols) : Tensor
+{
+    array<usize> $shape = [$rows, $cols];
+    $t = Tensor($shape);
+
+    foreach (0 .. $t->data->count() as $i) {
+        $t->data[$i] = $rng->uniform(-1.0, 1.0);
+    }
+
+    return $t;
+}
+
+internal function mlp(usize $width) : Model
+{
+    $net = Sequential()
+        ->add(Dense($width, $width, .he))
+        ->add(Act(.relu))
+        ->add(Dense($width, $width, .he))
+        ->add(Act(.relu))
+        ->add(Dense($width, 10));
+    return Model($net, $seed: 1);
+}
+
+// milliseconds per step: as many steps as fit in about half a second, at least two
+internal function cpu(usize $width, const Dataset& $data) : float64
+{
+    $model = mlp($width);
+    $loss = MeanSquaredError();
+    $adam = Adam();
+    $model->learn($data, $loss, $adam);
+    int32 $reps = 0;
+    time::instant $t = time::instant::now();
+
+    while ($reps < 2 || $t->elapsed()->as_float_secs() < 0.5) {
+        $model->learn($data, $loss, $adam);
+        $reps++;
+    }
+
+    return $t->elapsed()->as_float_secs() * 1000.0 / ($reps as float64);
+}
+
+internal function gpu(Gpu $gpu, usize $width, const Dataset& $data) : float64
+{
+    $net = guard $gpu->mirror(mlp($width), $data->count()) else ($e) {
+        die("{$e}");
+    }
+
+    $objective = Objective::mse(MeanSquaredError());
+    $update = Update::adam(Adam());
+    $net->learn($data, $objective, $update);
+    int32 $reps = 0;
+    time::instant $t = time::instant::now();
+
+    while ($reps < 2 || $t->elapsed()->as_float_secs() < 0.5) {
+        $net->learn($data, $objective, $update);
+        $reps++;
+    }
+
+    return $t->elapsed()->as_float_secs() * 1000.0 / ($reps as float64);
+}
+
+// right-aligned in `$width` columns, two decimals for floats
+internal function cell(float64 $value, usize $width) : string
+{
+    $rounded = std::math::round($value * 100.0) / 100.0;
+    return str::lpad(str::from($rounded), $width, 32);
+}
+
+internal function count(usize $value, usize $width) : string
+{
+    return str::lpad(str::from($value as uint64), $width, 32);
+}
+
+$device = guard Gpu::open() else ($e) {
+    die("{$e}");
+}
+
+echo "{$device->name()}, ms per training step (forward, backward, Adam), 3 dense layers";
+echo 'width  batch        cpu        gpu   speedup';
+
+$rng = Random(4);
+array<usize> $widths = [64, 128, 256, 512, 1024, 2048];
+array<usize> $batches = [64, 256];
+
+foreach ($batches as $batch) {
+    foreach ($widths as $width) {
+        $data = Dataset(noise($rng, $batch, $width), noise($rng, $batch, 10));
+        $c = cpu($width, $data);
+        $g = gpu($device, $width, $data);
+        $x = $c / $g;
+        $w = count($width, 5);
+        $b = count($batch, 5);
+        $cs = cell($c, 9);
+        $gs = cell($g, 9);
+        $xs = cell($x, 8);
+        echo "{$w}  {$b}  {$cs}  {$gs}  {$xs}x";
+    }
+}

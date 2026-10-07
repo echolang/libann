@@ -1,0 +1,20 @@
+#[if: os == darwin || os == ios]
+use ann::{BinaryCrossEntropy, CrossEntropy, Huber, MeanAbsoluteError, MeanSquaredError};
+use ann::metal::Objective;
+
+test objective_codes_match_the_loss_kernel
+{
+    assert(Objective::mse(MeanSquaredError())->kind() == 0);
+    assert(Objective::mae(MeanAbsoluteError())->kind() == 1);
+    assert(Objective::huber(Huber())->kind() == 2);
+    assert(Objective::bce(BinaryCrossEntropy())->kind() == 3);
+    assert(Objective::crossEntropy(CrossEntropy())->kind() == 4);
+}
+
+test objective_carries_the_loss_settings
+{
+    assert(Objective::huber(Huber($delta: 0.25))->param() == 0.25);
+    assert(Objective::crossEntropy(CrossEntropy($smoothing: 0.1))->param() == 0.1);
+    assert(Objective::mse(MeanSquaredError())->param() == 0.0);
+}
+#[end]

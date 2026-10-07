@@ -1,0 +1,96 @@
+#[if: os == darwin || os == ios]
+use ann::{Act, Dense, Dropout, LayerNorm, Model, Sequential};
+use ann::metal::{layout, Leaf};
+
+internal function leafKind(const Leaf& $leaf) : string
+{
+    return match ($leaf) {
+        .dense($dense) => 'dense',
+        .act($act) => 'act',
+    };
+}
+
+test layout_opens_nested_sequentials
+{
+    $net = Sequential()
+        ->add(Dense(4, 8))
+        ->add(Sequential()->add(Act(.relu))->add(Sequential()->add(Dense(8, 3))))
+        ->add(Act(.sigmoid));
+
+    $plan = guard layout(Model($net)) else ($e) {
+        die("{$e}");
+    };
+
+    assert($plan->leaves->count() == 4);
+    assert(leafKind($plan->leaves[0]) == 'dense');
+    assert(leafKind($plan->leaves[1]) == 'act');
+    assert(leafKind($plan->leaves[2]) == 'dense');
+    assert(leafKind($plan->leaves[3]) == 'act');
+}
+
+test layout_takes_a_bare_dense
+{
+    $plan = guard layout(Model(Dense(3, 2))) else ($e) {
+        die("{$e}");
+    };
+
+    assert($plan->leaves->count() == 1);
+    assert(leafKind($plan->leaves[0]) == 'dense');
+}
+
+test layout_names_the_unsupported_layer
+{
+    $net = Sequential()
+        ->add(Dense(4, 8))
+        ->add(Act(.relu))
+        ->add(Sequential()->add(Dropout(0.5)))
+        ->add(Dense(8, 1));
+
+    $got = layout(Model($net));
+    assert($got->failed());
+
+    $right = match ($got->failure()) {
+        .unsupported($index) => $index == 2,
+        else => false,
+    };
+    assert($right);
+}
+
+test layout_needs_a_dense_to_know_the_width
+{
+    $got = layout(Model(Sequential()->add(Act(.relu))));
+    assert($got->failed());
+
+    $right = match ($got->failure()) {
+        .noDense => true,
+        else => false,
+    };
+    assert($right);
+    assert($got->failure()->message()->contains('Dense'));
+}
+
+test layout_catches_a_width_mismatch
+{
+    $net = Sequential()
+        ->add(Dense(4, 8))
+        ->add(Act(.tanh))
+        ->add(Dense(7, 2));
+
+    $got = layout(Model($net));
+    assert($got->failed());
+
+    $right = match ($got->failure()) {
+        .shape($index) => $index == 2,
+        else => false,
+    };
+    assert($right);
+}
+
+test layout_refuses_layernorm
+{
+    $net = Sequential()->add(Dense(4, 4))->add(LayerNorm(4));
+    $got = layout(Model($net));
+    assert($got->failed());
+    assert($got->failure()->message()->contains('layer 1'));
+}
+#[end]

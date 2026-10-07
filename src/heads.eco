@@ -1,0 +1,213 @@
+/**
+ * Several losses over one output. A network that answers a class, a few
+ * yes/no flags and some numbers at once ends in one plain `Dense`; `Heads`
+ * cuts its columns into slices and scores each slice with its own loss.
+ *
+ *     $loss = Heads()
+ *         ->add(7, CrossEntropy())                         // columns 0..7
+ *         ->add(3, MeanSquaredError(), gate: 12)           // columns 7..10
+ *         ->add(2, SigmoidCrossEntropy(), $weight: 0.5);   // columns 10..12
+ *
+ * Targets carry the same columns, then gate columns past the end: a gated
+ * head only scores rows whose gate holds 1. That is how a value which is
+ * sometimes absent (a second colour, say) trains without inventing one.
+ */
+
+namespace ann;
+
+/**
+ * One slice of a `Heads` output.
+ */
+public struct Head
+{
+    /**
+     * Output columns this head owns, taken in `add` order.
+     */
+    public usize $width;
+
+    public Loss $loss;
+
+    /**
+     * Scales the head's loss and gradient against the others.
+     */
+    public float64 $weight = 1.0;
+
+    /**
+     * Target column (past the outputs) that switches the head on per row,
+     * or null when it always scores.
+     */
+    public usize? $gate = null;
+}
+
+public class Heads : Loss
+{
+    /**
+     * In column order. Append with `add`.
+     */
+    public array<Head> $heads = array<Head>();
+
+    /**
+     * Append a head over the next `$width` columns. Returns `$this` so
+     * calls chain.
+     */
+    public function add(usize $width, Loss $loss, float64 $weight = 1.0) : Heads
+    {
+        Heads::expectWidth($width);
+        $this->heads[] = Head($width, $loss, $weight);
+        return $this;
+    }
+
+    /**
+     * Append a head that only scores rows whose target column `$gate`
+     * holds 1.
+     */
+    public function add(usize $width, Loss $loss, gate: usize $gate, float64 $weight = 1.0) : Heads
+    {
+        Heads::expectWidth($width);
+        $this->heads[] = Head($width, $loss, $weight, $gate);
+        return $this;
+    }
+
+    /**
+     * Output columns over all heads: what the network's last layer must
+     * produce.
+     */
+    public const function outputs() : usize
+    {
+        usize $total = 0;
+
+        foreach ($this->heads as $head) {
+            $total = $total + $head->width;
+        }
+
+        return $total;
+    }
+
+    /**
+     * First output column of head `$index`.
+     */
+    public const function offset(usize $index) : usize
+    {
+        usize $at = 0;
+
+        foreach (0 .. $index as $i) {
+            $at = $at + $this->heads[$i]->width;
+        }
+
+        return $at;
+    }
+
+    public const function losses(const Tensor& $output, const Tensor& $target) : Tensor
+    {
+        $this->expectFit($output, $target);
+        usize $rows = $output->rows();
+        array<usize> $shape = [$rows, 1];
+        Tensor $total = Tensor($shape);
+        usize $at = 0;
+
+        foreach ($this->heads as $head) {
+            Tensor $each = $head->loss->losses($output->columns($at, $head->width), $target->columns($at, $head->width));
+
+            foreach (0 .. $rows as $r) {
+                float64 $scale = $head->weight * Heads::gated($head, $target, $r);
+                $total->data[$r] = $total->data[$r] + $scale * $each->data[$r];
+            }
+
+            $at = $at + $head->width;
+        }
+
+        return $total;
+    }
+
+    public const function gradients(const Tensor& $output, const Tensor& $target) : Tensor
+    {
+        $this->expectFit($output, $target);
+        usize $rows = $output->rows();
+        Tensor $out = Tensor($output->shape);
+        usize $at = 0;
+
+        foreach ($this->heads as $head) {
+            Tensor $part = $head->loss->gradients($output->columns($at, $head->width), $target->columns($at, $head->width));
+
+            foreach (0 .. $rows as $r) {
+                float64 $scale = $head->weight * Heads::gated($head, $target, $r);
+
+                foreach (0 .. $head->width as $c) {
+                    $part->data[$r * $head->width + $c] = $part->data[$r * $head->width + $c] * $scale;
+                }
+            }
+
+            $out->put(columns: $at, $part);
+            $at = $at + $head->width;
+        }
+
+        return $out;
+    }
+
+    /**
+     * Each head's own `predict` over its slice: probabilities for the
+     * cross-entropy heads, values as they are for regression heads.
+     */
+    public const function predict(const Tensor& $output) : Tensor
+    {
+        Tensor $out = $output;
+        usize $at = 0;
+
+        foreach ($this->heads as $head) {
+            $out->put(columns: $at, $head->loss->predict($output->columns($at, $head->width)));
+            $at = $at + $head->width;
+        }
+
+        return $out;
+    }
+
+    private const function expectFit(const Tensor& $output, const Tensor& $target) : void
+    {
+        usize $outputs = $this->outputs();
+
+        if ($output->cols() != $outputs) {
+            die("ann::Heads: the heads cover {$outputs} columns, the output has {$output->cols()}");
+        }
+
+        if ($target->rows() != $output->rows() || $target->cols() < $outputs) {
+            die("ann::Heads: a [{$target->rows()}, {$target->cols()}] target does not cover [{$output->rows()}, {$outputs}]");
+        }
+
+        foreach ($this->heads as $head) {
+            usize $gate = guard $head->gate else {
+                continue;
+            };
+
+            if ($gate < $outputs) {
+                die("ann::Heads: gate column {$gate} sits inside the {$outputs} output columns; gates go past the outputs");
+            }
+
+            if ($gate >= $target->cols()) {
+                die("ann::Heads: gate column {$gate} is outside a [{$target->rows()}, {$target->cols()}] target");
+            }
+        }
+    }
+
+    private static function expectWidth(usize $width) : void
+    {
+        if ($width == 0) {
+            die('ann::Heads: a head needs at least one column');
+        }
+    }
+
+    /**
+     * 1 when `$head` scores row `$r` of `$target`, else 0.
+     */
+    private static function gated(const Head& $head, const Tensor& $target, usize $r) : float64
+    {
+        usize $gate = guard $head->gate else {
+            return 1.0;
+        }
+
+        if ($target->data[$r * $target->cols() + $gate] > 0.5) {
+            return 1.0;
+        }
+
+        return 0.0;
+    }
+}

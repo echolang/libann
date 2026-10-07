@@ -1,0 +1,77 @@
+/**
+ * What can go wrong putting a model on the GPU. Shape bugs in a call
+ * (a batch wider than the network) still `die`, the way libann does.
+ */
+
+namespace ann::metal;
+
+public enum GpuError
+{
+    /**
+     * No Metal device on this machine, or it would not give a command
+     * queue.
+     */
+    case unavailable;
+
+    /**
+     * The kernels did not compile, or a pipeline could not be built. The
+     * message is Metal's.
+     */
+    case compile(string $message);
+
+    /**
+     * The device refused a buffer of this many bytes.
+     */
+    case memory(usize $bytes);
+
+    /**
+     * Layer `$index` of the flattened network is a kind the GPU does not
+     * run yet. Dense and Act only, inside any nesting of Sequential.
+     */
+    case unsupported(usize $index);
+
+    /**
+     * The flattened net has no Dense, so there is no width to start from.
+     */
+    case noDense;
+
+    /**
+     * Layer `$index` takes a different width than the layer before it
+     * gives.
+     */
+    case shape(usize $index);
+
+    public const function message() : string
+    {
+        return match ($this) {
+            .unavailable => 'no Metal device',
+            .compile($message) => GpuError::compiled($message),
+            .memory($bytes) => GpuError::refused($bytes),
+            .unsupported($index) => GpuError::foreign($index),
+            .noDense => 'the GPU needs at least one Dense, to know the width',
+            .shape($index) => GpuError::misfit($index),
+        };
+    }
+
+    private static function refused(usize $bytes) : string
+    {
+        return "the device refused a buffer of {$bytes} bytes";
+    }
+
+    private static function foreign(usize $index) : string
+    {
+        return "layer {$index} is not Dense or Act, which is all the GPU runs";
+    }
+
+    private static function misfit(usize $index) : string
+    {
+        return "layer {$index} does not take the width the layer before it gives";
+    }
+
+    private static function compiled(const string& $message) : string
+    {
+        $out = 'kernels did not compile: ';
+        $out->append($message);
+        return $out;
+    }
+}

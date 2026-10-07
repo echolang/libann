@@ -1,0 +1,7 @@
+#[module: "libann-metal-examples"]
+#[depends: ".."]
+#[sources: ["parity.eco", "bench.eco", "classify.eco"]]
+
+#[target: exe { name: "parity", entry: "parity.eco" }]
+#[target: exe { name: "bench", entry: "bench.eco" }]
+#[target: exe { name: "classify", entry: "classify.eco" }]

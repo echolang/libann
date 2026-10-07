@@ -1,0 +1,26 @@
+/*
+ * libann-metal: train libann models on the GPU through Metal.
+ *
+ * Mirrors a supported `ann::Model` on the device, runs whole training
+ * steps there in float32, and syncs the weights back into the float64
+ * params when asked. Apple platforms only; elsewhere `available` is false
+ * and nothing else is compiled.
+ */
+
+#[module: "libann-metal"]
+#[version: "0.1.0"]
+#[epm::license: "MIT"]
+#[epm::description: "Metal GPU training for libann models."]
+
+#[depends: ".."]
+
+#[if: os == darwin || os == ios]
+#[requires: "echolang/libmetal" { version: "^0.1", source: git "https://github.com/echolang/libmetal" }]
+#[sources: "src/*.eco"]
+#[else]
+#[sources: "unsupported.eco"]
+#[end]
+
+#[target: test] {
+    #[sources: "tests/*.eco"]
+}

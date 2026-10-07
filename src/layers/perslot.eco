@@ -1,0 +1,115 @@
+/**
+ * One layer, shared by every slot. A row of `slots` equal-width slots
+ * packed side by side, `[rows, slots * w]`, runs through `inner` as
+ * `[rows * slots, w]` and comes back as `[rows, slots * h]`.
+ *
+ *     PerSlot(5, Sequential()->add(Dense(3, 16, .he))->add(Act(.relu)))
+ *
+ * The phi of Deep Sets: every item of a set gets the same encoder, so
+ * the weights do not care which slot an item sits in.
+ */
+
+namespace ann;
+
+public class PerSlot : Layer
+{
+    /**
+     * Slots per row. The input width must be a multiple of it.
+     */
+    public const usize $slots;
+
+    /**
+     * Sees one slot per row.
+     */
+    public Layer $inner;
+
+    // input shape of the last .train forward
+    private array<usize> $input = array<usize>();
+
+    init
+    {
+        if ($this->slots == 0) {
+            die('ann::PerSlot: needs at least one slot');
+        }
+    }
+
+    public static function decode(Decoder $in, Registry $registry) : result<Layer, ModelError>
+    {
+        usize $slots = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        if ($slots == 0) {
+            return .error(.badValue(0));
+        }
+
+        Layer $inner = guard $registry->decode($in) else ($e) {
+            return .error($e);
+        }
+
+        Layer $layer = PerSlot($slots, $inner);
+        return .ok($layer);
+    }
+
+    public function forward(const Tensor& $input, Mode $mode) : Tensor
+    {
+        usize $rows = $input->rows();
+        usize $width = $input->cols();
+
+        if ($width % $this->slots != 0) {
+            die("ann::PerSlot: {$width} values per sample do not split into {$this->slots} slots");
+        }
+
+        // row-major already lays slot s of row r out as row r * slots + s
+        array<usize> $stacked = [$rows * $this->slots, $width / $this->slots];
+        Tensor $out = $this->inner->forward($input->reshape($stacked), $mode);
+
+        if ($out->rows() != $rows * $this->slots) {
+            die("ann::PerSlot: the inner layer turned {$rows * $this->slots} rows into {$out->rows()}");
+        }
+
+        if ($mode == Mode::train) {
+            $this->input = $input->shape;
+        }
+
+        array<usize> $shape = [$rows, $this->slots * $out->cols()];
+        return $out->reshape($shape);
+    }
+
+    public function backward(const Tensor& $gradient) : Tensor
+    {
+        usize $rows = $gradient->rows();
+        array<usize> $stacked = [$rows * $this->slots, $gradient->cols() / $this->slots];
+        Tensor $back = $this->inner->backward($gradient->reshape($stacked));
+        return $back->reshape($this->input);
+    }
+
+    public const function params() : array<Param>
+    {
+        return $this->inner->params();
+    }
+
+    public function initialize(Random& $rng) : void
+    {
+        $this->inner->initialize($rng);
+    }
+
+    public const function kind() : string
+    {
+        return 'perslot';
+    }
+
+    public const function encode(Encoder $out) : void
+    {
+        $out->size($this->slots);
+        $out->layer($this->inner);
+    }
+
+    public const function summary() : string
+    {
+        string $out = "per slot, {$this->slots} slots";
+        $out->append("\n");
+        $out->append(indent($this->inner->summary()));
+        return $out;
+    }
+}

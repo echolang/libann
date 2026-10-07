@@ -1,0 +1,354 @@
+/**
+ * Multi-head self-attention over the slots of a row. The input is
+ * `[rows, slots * width]`, slot after slot as in `PerSlot`, and so is
+ * the output. Per row: queries, keys and values are learned projections
+ * of every slot, each head softmaxes `q · k / sqrt(width / heads)` over
+ * the slots, the weighted values of all heads are concatenated, and one
+ * more projection mixes them.
+ *
+ *     Residual(SelfAttention(9, 32, $heads: 4))
+ *
+ * No residual and no normalisation inside; wrap it in `Residual` and
+ * follow it with `PerSlot(LayerNorm)` for a transformer block. Nothing
+ * marks a slot's position, so shuffling the slots shuffles the output
+ * the same way.
+ */
+
+namespace ann;
+
+public class SelfAttention : Layer
+{
+    /**
+     * Slots per row: the items that attend to each other.
+     */
+    public const usize $slots;
+
+    /**
+     * Values per slot, in and out. Must split evenly into `heads`.
+     */
+    public const usize $width;
+
+    /**
+     * Independent attention patterns, each over `width / heads` values of
+     * every slot.
+     */
+    public const usize $heads = 1;
+
+    /**
+     * `[width, width]` query projection.
+     */
+    public Param $query;
+
+    /**
+     * `[1, width]`.
+     */
+    public Param $queryBias;
+
+    /**
+     * `[width, width]` key projection.
+     */
+    public Param $key;
+
+    /**
+     * `[1, width]`.
+     */
+    public Param $keyBias;
+
+    /**
+     * `[width, width]` value projection.
+     */
+    public Param $value;
+
+    /**
+     * `[1, width]`.
+     */
+    public Param $valueBias;
+
+    /**
+     * `[width, width]` projection of the concatenated heads.
+     */
+    public Param $output;
+
+    /**
+     * `[1, width]`.
+     */
+    public Param $outputBias;
+
+    // the last .train forward, one row per slot: input, projections, attention weights, mixed heads
+    private Tensor $input;
+    private Tensor $queries;
+    private Tensor $keys;
+    private Tensor $values;
+    private Tensor $mixed;
+    private array<float64> $weights;
+    private array<usize> $shape;
+
+    init
+    {
+        if ($this->slots == 0 || $this->width == 0) {
+            die('ann::SelfAttention: needs at least one slot and one value per slot');
+        }
+
+        if ($this->heads == 0 || $this->width % $this->heads != 0) {
+            die("ann::SelfAttention: a width of {$this->width} does not split into {$this->heads} heads");
+        }
+
+        array<usize> $square = [$this->width, $this->width];
+        array<usize> $row = [1, $this->width];
+        array<usize> $empty = [0, $this->width];
+
+        $this->query = Param('query', $square);
+        $this->queryBias = Param('queryBias', $row);
+        $this->key = Param('key', $square);
+        $this->keyBias = Param('keyBias', $row);
+        $this->value = Param('value', $square);
+        $this->valueBias = Param('valueBias', $row);
+        $this->output = Param('output', $square);
+        $this->outputBias = Param('outputBias', $row);
+        $this->input = Tensor($empty);
+        $this->queries = Tensor($empty);
+        $this->keys = Tensor($empty);
+        $this->values = Tensor($empty);
+        $this->mixed = Tensor($empty);
+        $this->weights = array<float64>();
+        $this->shape = array<usize>();
+    }
+
+    public static function decode(Decoder $in, Registry $registry) : result<Layer, ModelError>
+    {
+        usize $slots = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        usize $width = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        usize $heads = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        if ($slots == 0 || $width == 0 || $heads == 0 || $width % $heads != 0) {
+            return .error(.badValue($heads as uint64));
+        }
+
+        Layer $layer = SelfAttention($slots, $width, $heads);
+        return .ok($layer);
+    }
+
+    /**
+     * Values per sample, in and out: `slots * width`.
+     */
+    public const function outputs() : usize
+    {
+        return $this->slots * $this->width;
+    }
+
+    public function forward(const Tensor& $input, Mode $mode) : Tensor
+    {
+        if ($input->cols() != $this->outputs()) {
+            die("ann::SelfAttention: expected {$this->slots} slots of {$this->width} = {$this->outputs()} values per sample, got {$input->cols()}");
+        }
+
+        usize $rows = $input->rows();
+        array<usize> $stacked = [$rows * $this->slots, $this->width];
+        Tensor $x = $input->reshape($stacked);
+        Tensor $q = $x->matmul($this->query->value)->addRow($this->queryBias->value);
+        Tensor $k = $x->matmul($this->key->value)->addRow($this->keyBias->value);
+        Tensor $v = $x->matmul($this->value->value)->addRow($this->valueBias->value);
+        array<float64> $weights = arr::room<float64>($rows * $this->heads * $this->slots * $this->slots);
+        Tensor $mixed = Tensor($stacked);
+
+        for (usize $r = 0; $r < $rows; $r++) {
+            for (usize $h = 0; $h < $this->heads; $h++) {
+                $this->attend($q, $k, $v, $r, $h, $weights, $mixed);
+            }
+        }
+
+        Tensor $out = $mixed->matmul($this->output->value)->addRow($this->outputBias->value);
+
+        if ($mode == Mode::train) {
+            $this->input = $x;
+            $this->queries = $q;
+            $this->keys = $k;
+            $this->values = $v;
+            $this->mixed = $mixed;
+            $this->weights = $weights;
+            $this->shape = $input->shape;
+        }
+
+        return $out->reshape($input->shape);
+    }
+
+    public function backward(const Tensor& $gradient) : Tensor
+    {
+        array<usize> $stacked = [$this->input->rows(), $this->width];
+        Tensor $g = $gradient->reshape($stacked);
+        $this->output->grad->accumulate(outer: $this->mixed, $g);
+        $this->outputBias->grad->accumulate($g->sumRows());
+        Tensor $dMixed = $g->matmul(transposed: $this->output->value);
+
+        Tensor $dq = Tensor($stacked);
+        Tensor $dk = Tensor($stacked);
+        Tensor $dv = Tensor($stacked);
+        usize $rows = $this->shape[0];
+
+        for (usize $r = 0; $r < $rows; $r++) {
+            for (usize $h = 0; $h < $this->heads; $h++) {
+                $this->unattend($dMixed, $r, $h, $dq, $dk, $dv);
+            }
+        }
+
+        $this->query->grad->accumulate(outer: $this->input, $dq);
+        $this->queryBias->grad->accumulate($dq->sumRows());
+        $this->key->grad->accumulate(outer: $this->input, $dk);
+        $this->keyBias->grad->accumulate($dk->sumRows());
+        $this->value->grad->accumulate(outer: $this->input, $dv);
+        $this->valueBias->grad->accumulate($dv->sumRows());
+
+        Tensor $dx = $dq->matmul(transposed: $this->query->value);
+        $dx->accumulate($dk->matmul(transposed: $this->key->value));
+        $dx->accumulate($dv->matmul(transposed: $this->value->value));
+        return $dx->reshape($this->shape);
+    }
+
+    public const function params() : array<Param>
+    {
+        array<Param> $all = [$this->query, $this->queryBias, $this->key, $this->keyBias, $this->value, $this->valueBias, $this->output, $this->outputBias];
+        return $all;
+    }
+
+    public function initialize(Random& $rng) : void
+    {
+        Init $xavier = .xavier;
+        $xavier->fill($this->query->value, $this->width, $this->width, $rng);
+        $xavier->fill($this->key->value, $this->width, $this->width, $rng);
+        $xavier->fill($this->value->value, $this->width, $this->width, $rng);
+        $xavier->fill($this->output->value, $this->width, $this->width, $rng);
+        $this->queryBias->value->fill(0.0);
+        $this->keyBias->value->fill(0.0);
+        $this->valueBias->value->fill(0.0);
+        $this->outputBias->value->fill(0.0);
+    }
+
+    public const function kind() : string
+    {
+        return 'attention';
+    }
+
+    public const function encode(Encoder $out) : void
+    {
+        $out->size($this->slots);
+        $out->size($this->width);
+        $out->size($this->heads);
+    }
+
+    public const function summary() : string
+    {
+        usize $count = 4 * ($this->width * $this->width + $this->width);
+        return "attention {$this->slots} slots of {$this->width}, {$this->heads} heads ({$count} params)";
+    }
+
+    /**
+     * Head `$h` of row `$r`: softmax weights of every query slot over the
+     * key slots, appended to `$weights`, and the weighted values written
+     * into that head's columns of `$mixed`.
+     */
+    private const function attend(const Tensor& $q, const Tensor& $k, const Tensor& $v, usize $r, usize $h, array<float64>& $weights, Tensor& $mixed) : void
+    {
+        usize $d = $this->width / $this->heads;
+        float64 $scale = 1.0 / std::math::sqrt($d as float64);
+        usize $first = $r * $this->slots;
+        usize $offset = $h * $d;
+
+        for (usize $i = 0; $i < $this->slots; $i++) {
+            usize $qi = ($first + $i) * $this->width + $offset;
+            usize $from = $weights->count();
+            float64 $peak = 0.0;
+
+            for (usize $j = 0; $j < $this->slots; $j++) {
+                usize $kj = ($first + $j) * $this->width + $offset;
+                float64 $score = 0.0;
+
+                for (usize $t = 0; $t < $d; $t++) {
+                    $score = $score + $q->data[$qi + $t] * $k->data[$kj + $t];
+                }
+
+                $score = $score * $scale;
+
+                if ($j == 0 || $score > $peak) {
+                    $peak = $score;
+                }
+
+                $weights[] = $score;
+            }
+
+            // stable softmax over the key slots
+            float64 $total = 0.0;
+
+            for (usize $j = 0; $j < $this->slots; $j++) {
+                float64 $e = std::math::exp($weights[$from + $j] - $peak);
+                $weights[$from + $j] = $e;
+                $total = $total + $e;
+            }
+
+            for (usize $j = 0; $j < $this->slots; $j++) {
+                float64 $a = $weights[$from + $j] / $total;
+                $weights[$from + $j] = $a;
+                usize $vj = ($first + $j) * $this->width + $offset;
+
+                for (usize $t = 0; $t < $d; $t++) {
+                    $mixed->data[$qi + $t] = $mixed->data[$qi + $t] + $a * $v->data[$vj + $t];
+                }
+            }
+        }
+    }
+
+    /**
+     * Reverse of `attend` for head `$h` of row `$r`: from the gradient of
+     * the mixed heads, add the gradients of that head's queries, keys and
+     * values into `$dq`, `$dk` and `$dv`.
+     */
+    private const function unattend(const Tensor& $dMixed, usize $r, usize $h, Tensor& $dq, Tensor& $dk, Tensor& $dv) : void
+    {
+        usize $d = $this->width / $this->heads;
+        float64 $scale = 1.0 / std::math::sqrt($d as float64);
+        usize $first = $r * $this->slots;
+        usize $offset = $h * $d;
+        usize $base = ($r * $this->heads + $h) * $this->slots * $this->slots;
+        array<float64> $dWeights = arr::room<float64>($this->slots);
+
+        for (usize $i = 0; $i < $this->slots; $i++) {
+            usize $qi = ($first + $i) * $this->width + $offset;
+            usize $row = $base + $i * $this->slots;
+            float64 $expected = 0.0;
+            $dWeights->clear();
+
+            // d(loss)/d(weight i j) is the mixed gradient of slot i against value j
+            for (usize $j = 0; $j < $this->slots; $j++) {
+                usize $vj = ($first + $j) * $this->width + $offset;
+                float64 $a = $this->weights[$row + $j];
+                float64 $da = 0.0;
+
+                for (usize $t = 0; $t < $d; $t++) {
+                    $da = $da + $dMixed->data[$qi + $t] * $this->values->data[$vj + $t];
+                    $dv->data[$vj + $t] = $dv->data[$vj + $t] + $a * $dMixed->data[$qi + $t];
+                }
+
+                $dWeights[] = $da;
+                $expected = $expected + $a * $da;
+            }
+
+            // through the softmax, then the scaled dot product
+            for (usize $j = 0; $j < $this->slots; $j++) {
+                usize $kj = ($first + $j) * $this->width + $offset;
+                float64 $ds = $this->weights[$row + $j] * ($dWeights[$j] - $expected) * $scale;
+
+                for (usize $t = 0; $t < $d; $t++) {
+                    $dq->data[$qi + $t] = $dq->data[$qi + $t] + $ds * $this->keys->data[$kj + $t];
+                    $dk->data[$kj + $t] = $dk->data[$kj + $t] + $ds * $this->queries->data[$qi + $t];
+                }
+            }
+        }
+    }
+}

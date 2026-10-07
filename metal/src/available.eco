@@ -1,0 +1,11 @@
+/**
+ * Whether this machine has a Metal device. False on every other platform,
+ * where nothing else in `ann::metal` is compiled.
+ */
+
+namespace ann::metal;
+
+public function available() : bool
+{
+    return mtl::available();
+}

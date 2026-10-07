@@ -1,0 +1,112 @@
+/**
+ * The Metal device, its queue and the compiled kernels. Open one per
+ * program; every `Network` mirrored from it shares the kernels.
+ *
+ *     $gpu = guard ann::metal::Gpu::open() else ($e) {
+ *         die("{$e}");
+ *     }
+ */
+
+namespace ann::metal;
+
+use ann::Model;
+
+public class Gpu
+{
+    internal mtl::Device $device;
+    internal mtl::CommandQueue $queue;
+    internal Kernels $kernels;
+
+    private constructor(mtl::Device $device, mtl::CommandQueue $queue, Kernels $kernels)
+    {
+        $this->device = $device;
+        $this->queue = $queue;
+        $this->kernels = $kernels;
+    }
+
+    /**
+     * The system's default device, with the kernels compiled. Compiling
+     * takes a moment; do it once.
+     */
+    public static function open() : result<Gpu, GpuError>
+    {
+        $device = guard mtl::Device::systemDefault() else {
+            return .error(.unavailable);
+        }
+
+        $queue = guard $device->newCommandQueue('libann') else {
+            return .error(.unavailable);
+        }
+
+        $kernels = guard compile($device) else ($e) {
+            return .error($e);
+        }
+
+        return .ok(Gpu($device, $queue, $kernels));
+    }
+
+    /**
+     * What Metal calls the device, `Apple M2 Pro` and the like.
+     */
+    public function name() : string
+    {
+        return $this->device->name();
+    }
+
+    /**
+     * Copy `$model` to the device, ready to train on batches of up to
+     * `$batch` rows. Fails on a layer the GPU does not run.
+     */
+    public function mirror(Model $model, usize $batch = 256) : result<Network, GpuError>
+    {
+        return Network::build($this, $model, $batch);
+    }
+
+    /**
+     * `$rows` x `$cols` floats, zeroed.
+     */
+    internal function matrix(usize $rows, usize $cols) : result<Matrix, GpuError>
+    {
+        usize $one = 1;
+        usize $bytes = std::math::max($rows * $cols, $one) * 4;
+
+        $buffer = guard $this->device->newBuffer($bytes) else {
+            return .error(.memory($bytes));
+        }
+
+        $m = Matrix($buffer, $rows, $cols);
+        $m->fill(0.0);
+        return .ok($m);
+    }
+
+    /**
+     * `$count` words, for kernel constants or an index list.
+     */
+    internal function words(usize $count = 16) : result<Words, GpuError>
+    {
+        usize $bytes = $count * 4;
+
+        $buffer = guard $this->device->newBuffer($bytes) else {
+            return .error(.memory($bytes));
+        }
+
+        return .ok(Words($buffer));
+    }
+
+    /**
+     * A fresh command buffer and compute encoder. Running out of either is
+     * not something a caller can handle, so it stops.
+     */
+    internal function pass() : Pass
+    {
+        $command = guard $this->queue->commandBuffer() else {
+            die('ann::metal: the queue gave no command buffer');
+        }
+
+        $encoder = guard $command->computeCommandEncoder() else {
+            die('ann::metal: the command buffer gave no compute encoder');
+        }
+
+        return Pass($this->kernels, $command, $encoder);
+    }
+}

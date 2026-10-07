@@ -1,0 +1,146 @@
+use ann::{CrossEntropy, Heads, MeanSquaredError, SigmoidCrossEntropy, Tensor};
+
+const HEADS_TOLERANCE = 0.000001;
+
+// 3 class logits, 2 values gated by target column 7, 2 flags
+internal function mixed() : Heads
+{
+    return Heads()
+        ->add(3, CrossEntropy())
+        ->add(2, MeanSquaredError(), gate: 7, $weight: 2.0)
+        ->add(2, SigmoidCrossEntropy(), $weight: 0.5);
+}
+
+internal function mixedTargets() : Tensor
+{
+    // one-hot, two values, two flags, then the gate
+    array<array<float64>> $rows = [
+        [0.0, 1.0, 0.0, 0.3, -0.2, 1.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0, 0.7, 0.1, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, -0.4, 0.5, 1.0, 1.0, 1.0],
+    ];
+    return Tensor(rows: $rows);
+}
+
+#[group: "losses"]
+test heads_cover_their_columns
+{
+    $heads = mixed();
+    assert($heads->outputs() == 7);
+    assert($heads->offset(0) == 0 && $heads->offset(1) == 3 && $heads->offset(2) == 5);
+}
+
+#[group: "losses"]
+test heads_gradient_matches_finite_differences
+{
+    assert(lossGradientError(mixed(), noise(shape(3, 7), 21), mixedTargets()) < HEADS_TOLERANCE);
+}
+
+#[group: "losses"]
+test heads_gate_silences_rows
+{
+    $heads = mixed();
+    $targets = mixedTargets();
+    $output = noise(shape(3, 7), 22);
+    $g = $heads->gradients($output, $targets);
+    // row 1 has its gate at 0: the regression columns get nothing
+    assert($g->at(1, 3) == 0.0 && $g->at(1, 4) == 0.0);
+    assert($g->at(0, 3) != 0.0 && $g->at(2, 4) != 0.0);
+
+    // moving a gated-off value changes no loss
+    Tensor $moved = $output;
+    $moved->set(1, 3, 9.0);
+    assert(near($heads->losses($output, $targets)->sum(), $heads->losses($moved, $targets)->sum()));
+}
+
+#[group: "losses"]
+test heads_sum_their_weighted_parts
+{
+    $output = noise(shape(3, 7), 23);
+    $targets = mixedTargets();
+    $whole = mixed()->losses($output, $targets);
+    $ce = CrossEntropy()->losses($output->columns(0, 3), $targets->columns(0, 3));
+    $mse = MeanSquaredError()->losses($output->columns(3, 2), $targets->columns(3, 2));
+    $flags = SigmoidCrossEntropy()->losses($output->columns(5, 2), $targets->columns(5, 2));
+    array<float64> $gates = [1.0, 0.0, 1.0];
+
+    foreach (0 .. 3 as $r) {
+        float64 $expected = $ce->data[$r] + 2.0 * $gates[$r] * $mse->data[$r] + 0.5 * $flags->data[$r];
+        assert(near($whole->data[$r], $expected));
+    }
+}
+
+#[group: "losses"]
+test heads_predict_per_slice
+{
+    $output = noise(shape(3, 7), 24);
+    $p = mixed()->predict($output);
+
+    foreach (0 .. 3 as $r) {
+        // softmax slice sums to one, regression slice untouched, flags in (0, 1)
+        assert(near($p->at($r, 0) + $p->at($r, 1) + $p->at($r, 2), 1.0));
+        assert($p->at($r, 3) == $output->at($r, 3) && $p->at($r, 4) == $output->at($r, 4));
+        assert($p->at($r, 5) > 0.0 && $p->at($r, 5) < 1.0);
+    }
+}
+
+#[group: "losses"]
+#[tests: expects death]
+test heads_refuse_a_gate_past_the_target
+{
+    mixed()->losses(noise(shape(3, 7), 27), noise(shape(3, 7), 28));
+}
+
+#[group: "losses"]
+#[tests: expects death]
+test heads_refuse_a_gate_on_the_outputs
+{
+    Heads()->add(3, MeanSquaredError(), gate: 1)->losses(noise(shape(1, 3), 29), noise(shape(1, 4), 30));
+}
+
+#[group: "losses"]
+#[tests: expects death]
+test heads_refuse_a_zero_width
+{
+    Heads()->add(0, MeanSquaredError());
+}
+
+#[group: "losses"]
+test sigmoid_cross_entropy_on_logits
+{
+    array<array<float64>> $t = [[0.0, 1.0], [1.0, 1.0], [0.0, 0.0]];
+    assert(lossGradientError(SigmoidCrossEntropy(), noise(shape(3, 2), 25)->scale(4.0), Tensor(rows: $t)) < HEADS_TOLERANCE);
+
+    // a zero logit costs ln 2 whatever the target
+    array<usize> $s = [1, 2];
+    array<array<float64>> $one = [[0.0, 1.0]];
+    $each = SigmoidCrossEntropy()->losses(Tensor($s), Tensor(rows: $one));
+    assert(near($each->data[0], std::math::log(2.0)));
+}
+
+#[group: "losses"]
+test sigmoid_cross_entropy_stays_finite_on_large_logits
+{
+    array<array<float64>> $x = [[80.0, -80.0]];
+    array<array<float64>> $t = [[1.0, 0.0]];
+    $out = Tensor(rows: $x);
+    $p = SigmoidCrossEntropy()->predict($out);
+    assert($p->at(0, 0) > 0.99 && $p->at(0, 1) < 0.01);
+    $g = SigmoidCrossEntropy()->gradients($out, Tensor(rows: $t));
+    assert(std::math::abs($g->at(0, 0)) < 1.0 && std::math::abs($g->at(0, 1)) < 1.0);
+}
+
+#[group: "tensor"]
+test columns_round_trip
+{
+    $t = noise(shape(4, 5), 26);
+    $part = $t->columns(1, 3);
+    assert($part->rows() == 4 && $part->cols() == 3);
+    assert($part->at(2, 0) == $t->at(2, 1));
+
+    Tensor $copy = Tensor($t->shape);
+    $copy->put(columns: 0, $t->columns(0, 1));
+    $copy->put(columns: 1, $part);
+    $copy->put(columns: 4, $t->columns(4, 1));
+    assert(identical($copy, $t));
+}

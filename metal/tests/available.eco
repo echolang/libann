@@ -1,0 +1,11 @@
+#[if: os == darwin || os == ios]
+test available_follows_libmetal
+{
+    assert(ann::metal::available() == mtl::available());
+}
+#[else]
+test available_is_false_off_apple
+{
+    assert(!ann::metal::available());
+}
+#[end]

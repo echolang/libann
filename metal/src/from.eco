@@ -1,0 +1,10 @@
+/**
+ * `str::from` for this module's types, so `"{$e}"` works.
+ */
+
+namespace str;
+
+public function from(const ann::metal::GpuError& $e) : string
+{
+    return $e->message();
+}

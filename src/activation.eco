@@ -240,7 +240,7 @@ public enum Activation : uint8
         return 0.01 * $x;
     }
 
-    private static function logistic(float64 $x) : float64
+    internal static function logistic(float64 $x) : float64
     {
         // split by sign so exp never overflows
         if ($x >= 0.0) {

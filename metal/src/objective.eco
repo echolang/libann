@@ -1,0 +1,78 @@
+/**
+ * A libann loss the GPU knows how to run. Built from the host loss itself,
+ * which it keeps for what runs on the CPU: `predict` for metrics, and
+ * scoring a validation set.
+ *
+ *     $o = Objective::crossEntropy(CrossEntropy($smoothing: 0.1));
+ *
+ * Binary cross-entropy clips probabilities to 1e-7 rather than the host's
+ * 1e-12, the nearest float32 can get to one.
+ */
+
+namespace ann::metal;
+
+use ann::{BinaryCrossEntropy, CrossEntropy, Huber, Loss, MeanAbsoluteError, MeanSquaredError};
+
+public enum Objective
+{
+    case mse(MeanSquaredError $loss);
+    case mae(MeanAbsoluteError $loss);
+    case huber(Huber $loss);
+    case bce(BinaryCrossEntropy $loss);
+    case crossEntropy(CrossEntropy $loss);
+
+    /**
+     * The host loss, for CPU-side `predict` and scoring.
+     */
+    public const function loss() : Loss
+    {
+        match ($this) {
+            .mse($loss) => {
+                MeanSquaredError $held = $loss;
+                return $held;
+            }
+            .mae($loss) => {
+                MeanAbsoluteError $held = $loss;
+                return $held;
+            }
+            .huber($loss) => {
+                Huber $held = $loss;
+                return $held;
+            }
+            .bce($loss) => {
+                BinaryCrossEntropy $held = $loss;
+                return $held;
+            }
+            .crossEntropy($loss) => {
+                CrossEntropy $held = $loss;
+                return $held;
+            }
+        };
+    }
+
+    /**
+     * The `loss` kernel's code.
+     */
+    internal const function kind() : usize
+    {
+        return match ($this) {
+            .mse($loss) => 0,
+            .mae($loss) => 1,
+            .huber($loss) => 2,
+            .bce($loss) => 3,
+            .crossEntropy($loss) => 4,
+        };
+    }
+
+    /**
+     * Huber's delta, or cross-entropy's smoothing.
+     */
+    internal const function param() : float64
+    {
+        return match ($this) {
+            .huber($loss) => $loss->delta,
+            .crossEntropy($loss) => $loss->smoothing,
+            else => 0.0,
+        };
+    }
+}

@@ -195,6 +195,54 @@ public class BinaryCrossEntropy : Loss
 }
 
 /**
+ * Binary cross-entropy over logits: the network ends in a plain `Dense`
+ * and this loss applies the sigmoid itself, which keeps it stable for large
+ * logits and lets yes/no outputs share a linear layer with other heads.
+ * `predict` answers probabilities.
+ */
+public class SigmoidCrossEntropy : Loss
+{
+    public const function losses(const Tensor& $output, const Tensor& $target) : Tensor
+    {
+        $output->expectSize($target, 'SigmoidCrossEntropy');
+        Tensor $out = $output;
+
+        foreach (0 .. $out->data->count() as $i) {
+            float64 $x = $output->data[$i];
+            // max(x, 0) - x t + log(1 + e^-|x|), the overflow-free form
+            float64 $loss = std::math::max($x, 0.0) - $x * $target->data[$i];
+            $out->data[$i] = $loss + std::math::log(1.0 + std::math::exp(-std::math::abs($x)));
+        }
+
+        return perSample($out);
+    }
+
+    public const function gradients(const Tensor& $output, const Tensor& $target) : Tensor
+    {
+        $output->expectSize($target, 'SigmoidCrossEntropy');
+        float64 $n = $output->cols() as float64;
+        Tensor $out = $output;
+
+        foreach (0 .. $out->data->count() as $i) {
+            $out->data[$i] = (Activation::logistic($output->data[$i]) - $target->data[$i]) / $n;
+        }
+
+        return $out;
+    }
+
+    public const function predict(const Tensor& $output) : Tensor
+    {
+        Tensor $out = $output;
+
+        foreach (0 .. $out->data->count() as $i) {
+            $out->data[$i] = Activation::logistic($output->data[$i]);
+        }
+
+        return $out;
+    }
+}
+
+/**
  * Softmax cross-entropy over logits: the network ends in a plain `Dense`
  * and this loss applies softmax itself, so the value and the gradient
  * (`softmax - target`) stay numerically stable. Targets are one-hot rows,

@@ -1,0 +1,274 @@
+/**
+ * The device side of each layer. A stage reads the matrix before it and
+ * writes the one after; backward reads the gradient after it and writes
+ * the one before, plus its params' gradients. Every gradient is written,
+ * not accumulated: one backward per step.
+ */
+
+namespace ann::metal;
+
+use ann::Param;
+
+/**
+ * Most squares partials one param writes. More groups than this only
+ * shortens loops that are already short.
+ */
+internal const usize MAX_GROUPS = 64;
+
+/**
+ * A host `Param` mirrored on the device, with its gradient and the
+ * optimizer's running state.
+ */
+internal class Slot
+{
+    internal Param $param;
+    internal usize $size;
+    internal Matrix $value;
+    internal Matrix $grad;
+
+    /**
+     * Adam's first moment, or SGD's velocity.
+     */
+    internal Matrix $first;
+
+    /**
+     * Adam's second moment.
+     */
+    internal Matrix $second;
+
+    /**
+     * Constants for the optimizer kernel.
+     */
+    internal Words $step;
+
+    /**
+     * Constants for the squares kernel.
+     */
+    internal Words $norm;
+
+    /**
+     * Squares threadgroups, and where their partials start.
+     */
+    internal usize $groups;
+    internal usize $offset;
+
+    internal constructor(Param $param, Matrix $value, Matrix $grad, Matrix $first, Matrix $second, Words $step, Words $norm, usize $offset)
+    {
+        $this->param = $param;
+        $this->size = $param->size();
+        $this->value = $value;
+        $this->grad = $grad;
+        $this->first = $first;
+        $this->second = $second;
+        $this->step = $step;
+        $this->norm = $norm;
+        usize $one = 1;
+        $this->groups = std::math::max(std::math::min(($this->size + 255) / 256, MAX_GROUPS), $one);
+        $this->offset = $offset;
+        $this->reload();
+    }
+
+    internal static function make(Gpu $gpu, Param $param, usize $offset) : result<Slot, GpuError>
+    {
+        usize $n = $param->size();
+
+        $value = guard $gpu->matrix(1, $n) else ($e) {
+            return .error($e);
+        }
+
+        $grad = guard $gpu->matrix(1, $n) else ($e) {
+            return .error($e);
+        }
+
+        $first = guard $gpu->matrix(1, $n) else ($e) {
+            return .error($e);
+        }
+
+        $second = guard $gpu->matrix(1, $n) else ($e) {
+            return .error($e);
+        }
+
+        $step = guard $gpu->words() else ($e) {
+            return .error($e);
+        }
+
+        $norm = guard $gpu->words() else ($e) {
+            return .error($e);
+        }
+
+        return .ok(Slot($param, $value, $grad, $first, $second, $step, $norm, $offset));
+    }
+
+    /**
+     * Device weights into the host param.
+     */
+    internal function sync() : void
+    {
+        $this->value->read($this->param->value, 0, 1);
+    }
+
+    /**
+     * Host param onto the device. Optimizer state stays.
+     */
+    internal function reload() : void
+    {
+        $this->value->load($this->param->value, 0, 1);
+    }
+
+    internal function squares(Pass& $pass, Matrix $partials) : void
+    {
+        $this->norm->u(0, $this->size);
+        $this->norm->u(1, $this->offset);
+        $buffers = [$this->grad->buffer, $partials->buffer, $this->norm->buffer];
+        $pass->groups($pass->kernels->squares, $buffers, $this->groups, 256);
+    }
+}
+
+internal interface Stage
+{
+    function forward(Pass& $pass, usize $rows) : void;
+
+    /**
+     * `$input` is false on the first stage: nothing upstream needs the
+     * gradient of the network's input.
+     */
+    function backward(Pass& $pass, usize $rows, bool $input) : void;
+}
+
+/**
+ * `out = in . weight + bias`, and back: `dW = in' . g`, `db` the column
+ * sums of `g`, `d(in) = g . weight'`.
+ */
+internal class DenseStage : Stage
+{
+    internal usize $inputs;
+    internal usize $outputs;
+    internal Slot $weight;
+    internal Slot $bias;
+
+    private Matrix $in;
+    private Matrix $out;
+    private Matrix $gradIn;
+    private Matrix $gradOut;
+    private Words $forwardWords;
+    private Words $weightWords;
+    private Words $biasWords;
+    private Words $inputWords;
+
+    internal constructor(usize $inputs, usize $outputs, Slot $weight, Slot $bias, Matrix $in, Matrix $out, Matrix $gradIn, Matrix $gradOut, array<Words> $words)
+    {
+        $this->inputs = $inputs;
+        $this->outputs = $outputs;
+        $this->weight = $weight;
+        $this->bias = $bias;
+        $this->in = $in;
+        $this->out = $out;
+        $this->gradIn = $gradIn;
+        $this->gradOut = $gradOut;
+        $this->forwardWords = $words[0];
+        $this->weightWords = $words[1];
+        $this->biasWords = $words[2];
+        $this->inputWords = $words[3];
+    }
+
+    public function forward(Pass& $pass, usize $rows) : void
+    {
+        // in [rows, inputs] . weight [inputs, outputs] + bias
+        strides($this->forwardWords, $rows, $this->outputs, $this->inputs, $this->inputs, 1, $this->outputs, 1, true);
+        $buffers = [$this->in->buffer, $this->weight->value->buffer, $this->out->buffer, $this->bias->value->buffer, $this->forwardWords->buffer];
+        $pass->matmul($buffers, $rows, $this->outputs);
+    }
+
+    public function backward(Pass& $pass, usize $rows, bool $input) : void
+    {
+        // in' [inputs, rows] . g [rows, outputs]
+        strides($this->weightWords, $this->inputs, $this->outputs, $rows, 1, $this->inputs, $this->outputs, 1, false);
+        $weight = [$this->in->buffer, $this->gradOut->buffer, $this->weight->grad->buffer, $this->bias->value->buffer, $this->weightWords->buffer];
+        $pass->matmul($weight, $this->inputs, $this->outputs);
+
+        $this->biasWords->u(0, $rows);
+        $this->biasWords->u(1, $this->outputs);
+        $bias = [$this->gradOut->buffer, $this->bias->grad->buffer, $this->biasWords->buffer];
+        $pass->run($pass->kernels->columns, $bias, $this->outputs);
+
+        if (!$input) {
+            return;
+        }
+
+        // g [rows, outputs] . weight' [outputs, inputs]
+        strides($this->inputWords, $rows, $this->inputs, $this->outputs, $this->outputs, 1, 1, $this->outputs, false);
+        $back = [$this->gradOut->buffer, $this->weight->value->buffer, $this->gradIn->buffer, $this->bias->value->buffer, $this->inputWords->buffer];
+        $pass->matmul($back, $rows, $this->inputs);
+    }
+}
+
+/**
+ * An `ann::Activation` on every value, and its slope on the way back.
+ */
+internal class ActStage : Stage
+{
+    private usize $code;
+    private usize $width;
+    private Matrix $in;
+    private Matrix $out;
+    private Matrix $gradIn;
+    private Matrix $gradOut;
+    private Words $forwardWords;
+    private Words $backwardWords;
+
+    internal constructor(usize $code, usize $width, Matrix $in, Matrix $out, Matrix $gradIn, Matrix $gradOut, Words $forwardWords, Words $backwardWords)
+    {
+        $this->code = $code;
+        $this->width = $width;
+        $this->in = $in;
+        $this->out = $out;
+        $this->gradIn = $gradIn;
+        $this->gradOut = $gradOut;
+        $this->forwardWords = $forwardWords;
+        $this->backwardWords = $backwardWords;
+    }
+
+    public function forward(Pass& $pass, usize $rows) : void
+    {
+        usize $n = $rows * $this->width;
+        $this->forwardWords->u(0, $n);
+        $this->forwardWords->u(1, $this->code);
+        $buffers = [$this->in->buffer, $this->out->buffer, $this->forwardWords->buffer];
+        $pass->run($pass->kernels->act, $buffers, $n);
+    }
+
+    public function backward(Pass& $pass, usize $rows, bool $input) : void
+    {
+        if (!$input) {
+            return;
+        }
+
+        usize $n = $rows * $this->width;
+        $this->backwardWords->u(0, $n);
+        $this->backwardWords->u(1, $this->code);
+        $buffers = [$this->in->buffer, $this->out->buffer, $this->gradOut->buffer, $this->gradIn->buffer, $this->backwardWords->buffer];
+        $pass->run($pass->kernels->slope, $buffers, $n);
+    }
+}
+
+/**
+ * The matmul kernel's words: sizes, then A's strides along m and k, then
+ * B's along k and n.
+ */
+private function strides(Words $w, usize $m, usize $n, usize $k, usize $sam, usize $sak, usize $sbk, usize $sbn, bool $bias) : void
+{
+    usize $flag = 0;
+
+    if ($bias) {
+        $flag = 1;
+    }
+
+    $w->u(0, $m);
+    $w->u(1, $n);
+    $w->u(2, $k);
+    $w->u(3, $sam);
+    $w->u(4, $sak);
+    $w->u(5, $sbk);
+    $w->u(6, $sbn);
+    $w->u(7, $flag);
+}

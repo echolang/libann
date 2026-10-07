@@ -1,0 +1,321 @@
+/**
+ * 2D convolution over images stored flat, one image per row, in HWC
+ * order: pixel `(y, x)` channel `c` sits at `(y * width + x) * channels + c`.
+ * The output is HWC again, `filters` channels per pixel.
+ *
+ *     Conv2D(4, 16, 32, 32)                    // 3x3, stride 1, same size out
+ *     Conv2D(16, 32, 32, 32, $stride: 2)       // halves height and width
+ *
+ * Runs as im2col plus one matmul: every output pixel's `kernel x kernel`
+ * patch becomes a row, and those rows times the one weight matrix is the
+ * whole layer. The patches stay cached for `backward`.
+ */
+
+namespace ann;
+
+public class Conv2D : Layer
+{
+    /**
+     * Channels per input pixel.
+     */
+    public const usize $channels;
+
+    /**
+     * Channels per output pixel: one learned kernel each.
+     */
+    public const usize $filters;
+
+    /**
+     * Input image height in pixels.
+     */
+    public const usize $height;
+
+    /**
+     * Input image width in pixels.
+     */
+    public const usize $width;
+
+    /**
+     * Side of the square kernel.
+     */
+    public const usize $kernel = 3;
+
+    /**
+     * Pixels between two kernel positions, the same along both axes.
+     */
+    public const usize $stride = 1;
+
+    /**
+     * Zero pixels added on every side. The default 1 keeps a 3x3, stride 1
+     * output the size of the input.
+     */
+    public const usize $padding = 1;
+
+    /**
+     * How `initialize` fills the weight, with a fan in of one patch,
+     * `kernel * kernel * channels`. Bias always starts at zero.
+     */
+    public const Init $init = .he;
+
+    /**
+     * `[kernel * kernel * channels, filters]`. Kernel position `(ky, kx)`
+     * and input channel `c` is row `(ky * kernel + kx) * channels + c`.
+     */
+    public Param $weight;
+
+    /**
+     * `[1, filters]`.
+     */
+    public Param $bias;
+
+    // the patches of the last .train forward, one row per output pixel
+    private Tensor $columns;
+
+    // samples in the last .train forward
+    private usize $rows;
+
+    init
+    {
+        if ($this->channels == 0 || $this->filters == 0) {
+            die('ann::Conv2D: needs at least one channel and one filter');
+        }
+
+        if ($this->kernel == 0 || $this->stride == 0) {
+            die('ann::Conv2D: kernel and stride must be at least 1');
+        }
+
+        if ($this->height + 2 * $this->padding < $this->kernel || $this->width + 2 * $this->padding < $this->kernel) {
+            die("ann::Conv2D: a {$this->kernel}x{$this->kernel} kernel does not fit a {$this->height}x{$this->width} image padded by {$this->padding}");
+        }
+
+        usize $patch = $this->kernel * $this->kernel * $this->channels;
+        array<usize> $weightShape = [$patch, $this->filters];
+        array<usize> $biasShape = [1, $this->filters];
+        array<usize> $empty = [0, $patch];
+
+        $this->weight = Param('weight', $weightShape);
+        $this->bias = Param('bias', $biasShape);
+        $this->columns = Tensor($empty);
+        $this->rows = 0;
+    }
+
+    public static function decode(Decoder $in, Registry $registry) : result<Layer, ModelError>
+    {
+        array<usize> $sizes = arr::room<usize>(7);
+
+        // channels, filters, height, width, kernel, stride, padding
+        for (usize $i = 0; $i < 7; $i++) {
+            usize $v = guard $in->size() else ($e) {
+                return .error($e);
+            }
+
+            $sizes[] = $v;
+        }
+
+        uint8 $code = guard $in->u8() else ($e) {
+            return .error($e);
+        }
+
+        Init $init = guard Init::from($code) else {
+            return .error(.badValue($code as uint64));
+        }
+
+        // what init would die on is a corrupt file here
+        for (usize $i = 0; $i < 6; $i++) {
+            if ($i != 2 && $i != 3 && $sizes[$i] == 0) {
+                return .error(.badValue(0));
+            }
+        }
+
+        if ($sizes[2] + 2 * $sizes[6] < $sizes[4] || $sizes[3] + 2 * $sizes[6] < $sizes[4]) {
+            return .error(.badValue($sizes[4] as uint64));
+        }
+
+        Layer $layer = Conv2D($sizes[0], $sizes[1], $sizes[2], $sizes[3], $sizes[4], $sizes[5], $sizes[6], $init);
+        return .ok($layer);
+    }
+
+    /**
+     * Output image height: `(height + 2 * padding - kernel) / stride + 1`.
+     */
+    public const function outputHeight() : usize
+    {
+        return ($this->height + 2 * $this->padding - $this->kernel) / $this->stride + 1;
+    }
+
+    /**
+     * Output image width: `(width + 2 * padding - kernel) / stride + 1`.
+     */
+    public const function outputWidth() : usize
+    {
+        return ($this->width + 2 * $this->padding - $this->kernel) / $this->stride + 1;
+    }
+
+    /**
+     * Values per input sample, `height * width * channels`.
+     */
+    public const function inputs() : usize
+    {
+        return $this->height * $this->width * $this->channels;
+    }
+
+    /**
+     * Values per output sample, `outputHeight() * outputWidth() * filters`.
+     * What the next layer takes in.
+     */
+    public const function outputs() : usize
+    {
+        return $this->outputHeight() * $this->outputWidth() * $this->filters;
+    }
+
+    public function forward(const Tensor& $input, Mode $mode) : Tensor
+    {
+        if ($input->cols() != $this->inputs()) {
+            die("ann::Conv2D: expected {$this->height}x{$this->width}x{$this->channels} = {$this->inputs()} values per sample, got {$input->cols()}");
+        }
+
+        usize $rows = $input->rows();
+        array<usize> $shape = [$rows, $this->outputs()];
+
+        // one row per output pixel times the kernels is already HWC
+        if ($mode == Mode::train) {
+            $this->columns = $this->unfold($input);
+            $this->rows = $rows;
+            return $this->columns->matmul($this->weight->value)->addRow($this->bias->value)->reshape($shape);
+        }
+
+        Tensor $columns = $this->unfold($input);
+        return $columns->matmul($this->weight->value)->addRow($this->bias->value)->reshape($shape);
+    }
+
+    public function backward(const Tensor& $gradient) : Tensor
+    {
+        array<usize> $pixelShape = [$this->rows * $this->outputHeight() * $this->outputWidth(), $this->filters];
+        Tensor $pixels = $gradient->reshape($pixelShape);
+        $this->weight->grad->accumulate(outer: $this->columns, $pixels);
+        $this->bias->grad->accumulate($pixels->sumRows());
+        Tensor $patches = $pixels->matmul(transposed: $this->weight->value);
+        return $this->fold($patches);
+    }
+
+    public const function params() : array<Param>
+    {
+        array<Param> $all = [$this->weight, $this->bias];
+        return $all;
+    }
+
+    public function initialize(Random& $rng) : void
+    {
+        usize $fanIn = $this->kernel * $this->kernel * $this->channels;
+        usize $fanOut = $this->kernel * $this->kernel * $this->filters;
+        $this->init->fill($this->weight->value, $fanIn, $fanOut, $rng);
+        $this->bias->value->fill(0.0);
+    }
+
+    public const function kind() : string
+    {
+        return 'conv2d';
+    }
+
+    public const function encode(Encoder $out) : void
+    {
+        $out->size($this->channels);
+        $out->size($this->filters);
+        $out->size($this->height);
+        $out->size($this->width);
+        $out->size($this->kernel);
+        $out->size($this->stride);
+        $out->size($this->padding);
+        $out->u8($this->init->value());
+    }
+
+    public const function summary() : string
+    {
+        usize $count = $this->weight->size() + $this->bias->size();
+        usize $outH = $this->outputHeight();
+        usize $outW = $this->outputWidth();
+        return "conv2d {$this->height}x{$this->width}x{$this->channels} -> {$outH}x{$outW}x{$this->filters}, {$this->kernel}x{$this->kernel} stride {$this->stride} padding {$this->padding} ({$count} params)";
+    }
+
+    /**
+     * im2col: the patch under every output pixel of every sample as one
+     * row of `kernel * kernel * channels` values. Positions in the
+     * padding stay zero.
+     */
+    private const function unfold(const Tensor& $input) : Tensor
+    {
+        usize $rows = $input->rows();
+        usize $patch = $this->kernel * $this->kernel * $this->channels;
+        array<usize> $shape = [$rows * $this->outputHeight() * $this->outputWidth(), $patch];
+        Tensor $columns = Tensor($shape);
+        $this->project($rows, $input, $columns, false);
+        return $columns;
+    }
+
+    /**
+     * col2im: the reverse of `unfold`. Every patch value is added back
+     * onto the input pixel it was copied from, so a pixel under several
+     * kernel positions collects all of their gradients.
+     */
+    private const function fold(const Tensor& $patches) : Tensor
+    {
+        array<usize> $shape = [$this->rows, $this->inputs()];
+        Tensor $image = Tensor($shape);
+        $this->project($this->rows, $patches, $image, true);
+        return $image;
+    }
+
+    /**
+     * Walk every in-bounds `(patch, image)` pair. `$addBack` false copies
+     * image into patches (unfold); true adds patches into the image (fold).
+     */
+    private const function project(usize $rows, const Tensor& $src, Tensor& $dst, bool $addBack) : void
+    {
+        usize $outH = $this->outputHeight();
+        usize $outW = $this->outputWidth();
+        usize $c = $this->channels;
+        usize $k = $this->kernel;
+        usize $patch = $k * $k * $c;
+        usize $sample = $this->inputs();
+
+        for (usize $n = 0; $n < $rows; $n++) {
+            for (usize $oy = 0; $oy < $outH; $oy++) {
+                for (usize $ox = 0; $ox < $outW; $ox++) {
+                    usize $at = (($n * $outH + $oy) * $outW + $ox) * $patch;
+
+                    for (usize $ky = 0; $ky < $k; $ky++) {
+                        // padded coordinates, so nothing goes below zero
+                        usize $y = $oy * $this->stride + $ky;
+
+                        if ($y < $this->padding || $y - $this->padding >= $this->height) {
+                            continue;
+                        }
+
+                        usize $line = $n * $sample + ($y - $this->padding) * $this->width * $c;
+
+                        for (usize $kx = 0; $kx < $k; $kx++) {
+                            usize $x = $ox * $this->stride + $kx;
+
+                            if ($x < $this->padding || $x - $this->padding >= $this->width) {
+                                continue;
+                            }
+
+                            usize $image = $line + ($x - $this->padding) * $c;
+                            usize $col = $at + ($ky * $k + $kx) * $c;
+
+                            if ($addBack) {
+                                for (usize $ch = 0; $ch < $c; $ch++) {
+                                    $dst->data[$image + $ch] = $dst->data[$image + $ch] + $src->data[$col + $ch];
+                                }
+                            } else {
+                                for (usize $ch = 0; $ch < $c; $ch++) {
+                                    $dst->data[$col + $ch] = $src->data[$image + $ch];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

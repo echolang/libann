@@ -1,0 +1,124 @@
+// a set of 5 items, 3 features each, in one flat row. two answers:
+// which item has the largest feature 0 (a pointer into the set), and
+// how far each item's feature 1 sits from the set's mean of feature 1.
+// both need every item judged against the whole set, which is what the
+// pooled context handed back to each slot is for
+//
+//   echoc run -m . examples/sets.eco
+
+use ann::{Act, Adam, Broadcast, CrossEntropy, Dataset, Dense, Heads, MeanSquaredError, Model, Parallel, Permute, PerSlot, Pool, Random, Sequential, Tensor, Trainer};
+
+const SAMPLES = 3000;
+const SLOTS = 5;
+const FEATURES = 3;
+
+// target columns: 5 one-hot (the pointer), then 5 centred values
+internal function sets(uint64 $seed) : Dataset
+{
+    $rng = Random($seed);
+    array<array<float64>> $inputs = array<array<float64>>();
+    array<array<float64>> $targets = array<array<float64>>();
+
+    foreach (0 .. SAMPLES as $i) {
+        array<float64> $items = arr::room<float64>(SLOTS * FEATURES);
+
+        foreach (0 .. SLOTS * FEATURES as $k) {
+            $items[] = $rng->uniform(-1.0, 1.0);
+        }
+
+        usize $best = 0;
+        float64 $mean = 0.0;
+
+        foreach (0 .. SLOTS as $s) {
+            if ($items[$s * FEATURES] > $items[$best * FEATURES]) {
+                $best = $s;
+            }
+
+            $mean = $mean + $items[$s * FEATURES + 1] / (SLOTS as float64);
+        }
+
+        array<float64> $row = arr::room<float64>(2 * SLOTS);
+
+        foreach (0 .. SLOTS as $s) {
+            float64 $hit = 0.0;
+
+            if ($s == $best) {
+                $hit = 1.0;
+            }
+
+            $row[] = $hit;
+        }
+
+        foreach (0 .. SLOTS as $s) {
+            $row[] = $items[$s * FEATURES + 1] - $mean;
+        }
+
+        $inputs[] = $items;
+        $targets[] = $row;
+    }
+
+    return Dataset(Tensor(rows: $inputs), Tensor(rows: $targets));
+}
+
+// every item through the same encoder: [n, 5 * 16]
+$encoder = Sequential()
+    ->add(Dense(FEATURES, 16, .he))
+    ->add(Act(.relu));
+
+// a summary of the whole set: mean and max over the items, squeezed to 16
+$context = Sequential()
+    ->add(Pool(SLOTS, .meanMax))
+    ->add(Dense(32, 16, .he))
+    ->add(Act(.relu));
+
+// each item next to the context, scored on its own: a logit and a value
+$scorer = Sequential()
+    ->add(Dense(32, 32, .he))
+    ->add(Act(.relu))
+    ->add(Dense(32, 2));
+
+$net = Sequential()
+    ->add(PerSlot(SLOTS, $encoder))
+    ->add(Parallel()->add(0, SLOTS * 16, $context)->pass(0, SLOTS * 16))
+    ->add(Broadcast(16, SLOTS))
+    ->add(PerSlot(SLOTS, $scorer))
+    ->add(Permute(slots: SLOTS, width: 2));
+
+// the 5 logits are one softmax over the items, the 5 values plain regression
+$heads = Heads()
+    ->add(SLOTS, CrossEntropy())
+    ->add(SLOTS, MeanSquaredError());
+
+$split = sets(7)->split(0.2, $seed: 3);
+$model = Model($net, $seed: 1);
+echo $model->summary();
+Trainer($epochs: 30, $batchSize: 32)->fit($model, $heads, Adam(0.003), $split->train);
+
+$holdout = $split->holdout;
+$p = $heads->predict($model->predict($holdout->inputs));
+usize $hits = 0;
+float64 $error = 0.0;
+
+foreach (0 .. $holdout->count() as $r) {
+    usize $best = 0;
+
+    foreach (1 .. SLOTS as $s) {
+        if ($p->at($r, $s) > $p->at($r, $best)) {
+            $best = $s;
+        }
+    }
+
+    if ($holdout->targets->at($r, $best) == 1.0) {
+        $hits = $hits + 1;
+    }
+
+    foreach (SLOTS .. 2 * SLOTS as $c) {
+        $error = $error + std::math::abs($p->at($r, $c) - $holdout->targets->at($r, $c));
+    }
+}
+
+float64 $n = $holdout->count() as float64;
+float64 $accuracy = ($hits as float64) / $n;
+float64 $mae = $error / ($n * (SLOTS as float64));
+echo "pointer accuracy {$accuracy:.3f} (chance 0.200)";
+echo "centred value mae {$mae:.3f}";

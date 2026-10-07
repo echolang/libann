@@ -1,0 +1,136 @@
+/**
+ * `ann::Trainer` on the GPU. Same fields, same `History`, same observers.
+ * The difference is that the dataset is uploaded once and every batch is
+ * gathered on the device, so an epoch never copies samples. Weights are
+ * synced into the host model after every epoch, before `onEpoch` and the
+ * observer see the report.
+ *
+ *     $history = ann::metal::Trainer($epochs: 20, $batchSize: 256, $metric: .accuracy)
+ *         ->fit($net, Objective::crossEntropy(CrossEntropy()), Update::adam(Adam()), $data);
+ */
+
+namespace ann::metal;
+
+use ann::{Batches, Dataset, EpochReport, Evaluation, History, Metric, Observer, Plan, Random};
+
+public struct Trainer
+{
+    /**
+     * Passes over the whole training set.
+     */
+    public usize $epochs = 100;
+
+    /**
+     * Samples per gradient step, at most the network's `capacity`. Last
+     * batch of an epoch may be smaller.
+     */
+    public usize $batchSize = 32;
+
+    /**
+     * Reorder samples before every epoch.
+     */
+    public bool $shuffle = true;
+
+    /**
+     * Seed for shuffling, so a run reproduces.
+     */
+    public uint64 $seed = 1;
+
+    public Metric $metric = .none;
+
+    /**
+     * Cap on the global L2 of the gradients. 0 leaves them alone.
+     */
+    public float64 $clip = 0.0;
+
+    /**
+     * Evaluated after every epoch, never trained on.
+     */
+    public Dataset? $validation = null;
+
+    /**
+     * After every epoch. Logging, schedules and checkpoints live here. The
+     * host model already holds this epoch's weights.
+     */
+    public function<void(EpochReport)>? $onEpoch = null;
+
+    /**
+     * Hears the plan, every batch, every epoch and the end.
+     */
+    public Observer? $observer = null;
+
+    /**
+     * Train `$net` on `$data`. Fails only when the device has no room for
+     * the dataset.
+     */
+    public function fit(Network $net, const Objective& $objective, const Update& $update, const Dataset& $data) : result<History, GpuError>
+    {
+        usize $n = $data->count();
+
+        if ($n == 0) {
+            die('ann::metal::Trainer: the dataset is empty');
+        }
+
+        if ($this->batchSize == 0 || $this->batchSize > $net->capacity) {
+            die("ann::metal::Trainer: batch size {$this->batchSize}, but the network was mirrored for 1 to {$net->capacity} rows");
+        }
+
+        $resident = guard $net->upload($data) else ($e) {
+            return .error($e);
+        }
+
+        $batches = Batches($n, $this->batchSize);
+        $rng = Random($this->seed);
+        $history = History();
+        Observer? $observer = $this->observer;
+        $observer?->begin(Plan($this->epochs, $batches->count(), $n, $this->metric, $this->validation != null));
+
+        for (usize $epoch = 1; $epoch <= $this->epochs; $epoch++) {
+            if ($this->shuffle) {
+                $batches->shuffle($rng);
+            }
+
+            $total = 0.0;
+
+            foreach ($batches->all() as $b => $indices) {
+                $step = $net->learn(resident: $resident, $indices, $objective, $update, $this->clip);
+                $total = $total + $step * ($indices->count() as float64);
+                $observer?->batch($epoch, $b, $step);
+            }
+
+            $train = Evaluation($total / ($n as float64), 0.0);
+
+            if ($this->metric != Metric::none) {
+                $train->metric = $this->metric->score($objective->loss()->predict($net->predict($data->inputs)), $data->targets);
+            }
+
+            $report = EpochReport($epoch, $train, $this->validate($net, $objective));
+            $history->epochs[] = $report;
+            $net->sync();
+            $this->notify($report);
+            $observer?->epoch($report);
+        }
+
+        $observer?->end($history);
+
+        return .ok($history);
+    }
+
+    private const function validate(Network $net, const Objective& $objective) : Evaluation?
+    {
+        $held = guard $this->validation else {
+            return null;
+        }
+
+        return $net->evaluate($held, $objective, $this->metric);
+    }
+
+    private const function notify(const EpochReport& $report) : void
+    {
+        $hook = guard $this->onEpoch else {
+            return;
+        }
+
+        $hook($report);
+    }
+}

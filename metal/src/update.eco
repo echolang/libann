@@ -1,0 +1,70 @@
+/**
+ * A libann optimizer the GPU knows how to run. Holds the host optimizer and
+ * reads its settings on every step, so a schedule that sets `rate` in
+ * `onEpoch` works the same as on the CPU. The running state (Adam's
+ * moments, SGD's velocity) lives on the device, with the network.
+ *
+ *     $adam = Adam($rate: 0.001);
+ *     $u = Update::adam($adam);
+ */
+
+namespace ann::metal;
+
+use ann::{Adam, Sgd};
+
+public enum Update
+{
+    case adam(Adam $adam);
+    case sgd(Sgd $sgd);
+
+    /**
+     * Encode step `$t` (from 1) for one param. `$scale` holds the clip
+     * factor, 1 when nothing is clipped.
+     */
+    internal const function encode(Pass& $pass, Slot $slot, Matrix $scale, uint64 $t) : void
+    {
+        match ($this) {
+            .adam($adam) => {
+                Update::adamStep($pass, $slot, $scale, $t, $adam);
+            }
+            .sgd($sgd) => {
+                Update::sgdStep($pass, $slot, $scale, $sgd);
+            }
+        };
+    }
+
+    private static function adamStep(Pass& $pass, Slot $slot, Matrix $scale, uint64 $t, Adam $adam) : void
+    {
+        usize $n = $slot->size;
+        $steps = $t as float64;
+        $w = $slot->step;
+        $w->u(0, $n);
+        $w->f(1, $adam->beta1);
+        $w->f(2, $adam->beta2);
+        $w->f(3, $adam->rate);
+        $w->f(4, $adam->epsilon);
+        $w->f(5, $adam->weightDecay);
+        $w->f(6, 1.0 - std::math::pow($adam->beta1, $steps));
+        $w->f(7, 1.0 - std::math::pow($adam->beta2, $steps));
+        $buffers = [$slot->value->buffer, $slot->grad->buffer, $slot->first->buffer, $slot->second->buffer, $scale->buffer, $w->buffer];
+        $pass->run($pass->kernels->adam, $buffers, $n);
+    }
+
+    private static function sgdStep(Pass& $pass, Slot $slot, Matrix $scale, Sgd $sgd) : void
+    {
+        usize $n = $slot->size;
+        $w = $slot->step;
+        usize $nesterov = 0;
+
+        if ($sgd->nesterov) {
+            $nesterov = 1;
+        }
+
+        $w->u(0, $n);
+        $w->f(1, $sgd->rate);
+        $w->f(2, $sgd->momentum);
+        $w->u(3, $nesterov);
+        $buffers = [$slot->value->buffer, $slot->grad->buffer, $slot->first->buffer, $scale->buffer, $w->buffer];
+        $pass->run($pass->kernels->sgd, $buffers, $n);
+    }
+}

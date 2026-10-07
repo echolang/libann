@@ -1,0 +1,222 @@
+use ann::{Conv2D, Layer, MaxPool2D, Tensor};
+
+const CONV_TOLERANCE = 0.000001;
+
+internal function image(const array<float64>& $values) : Tensor
+{
+    array<usize> $s = [1, $values->count()];
+    return Tensor($s, $values);
+}
+
+// the textbook loop, one output value at a time, to hold the im2col path against
+internal function directConv(const Conv2D& $conv, const Tensor& $x) : Tensor
+{
+    usize $outH = $conv->outputHeight();
+    usize $outW = $conv->outputWidth();
+    usize $c = $conv->channels;
+    usize $f = $conv->filters;
+    usize $k = $conv->kernel;
+    Tensor $out = Tensor(shape($x->rows(), $conv->outputs()));
+
+    foreach (0 .. $x->rows() as $n) {
+        foreach (0 .. $outH as $oy) {
+            foreach (0 .. $outW as $ox) {
+                foreach (0 .. $f as $filter) {
+                    float64 $sum = $conv->bias->value->data[$filter];
+
+                    foreach (0 .. $k as $ky) {
+                        foreach (0 .. $k as $kx) {
+                            int64 $y = ($oy * $conv->stride + $ky) as int64 - ($conv->padding as int64);
+                            int64 $x0 = ($ox * $conv->stride + $kx) as int64 - ($conv->padding as int64);
+
+                            if ($y < 0 || $x0 < 0 || $y >= ($conv->height as int64) || $x0 >= ($conv->width as int64)) {
+                                continue;
+                            }
+
+                            foreach (0 .. $c as $ch) {
+                                usize $at = (($y as usize) * $conv->width + ($x0 as usize)) * $c + $ch;
+                                float64 $w = $conv->weight->value->data[(($ky * $k + $kx) * $c + $ch) * $f + $filter];
+                                $sum = $sum + $w * $x->at($n, $at);
+                            }
+                        }
+                    }
+
+                    $out->set($n, ($oy * $outW + $ox) * $f + $filter, $sum);
+                }
+            }
+        }
+    }
+
+    return $out;
+}
+
+#[group: "conv"]
+test conv_gradients_match_finite_differences
+{
+    // 3x3, stride 1, padding 1: same size out
+    Layer $same = initialized(Conv2D(2, 3, 4, 5));
+    assert(gradientError($same, noise(shape(2, 40), 51)) < CONV_TOLERANCE);
+
+    // stride 2 with padding, odd sides
+    Layer $strided = initialized(Conv2D(2, 2, 5, 5, $stride: 2));
+    assert(gradientError($strided, noise(shape(2, 50), 52)) < CONV_TOLERANCE);
+
+    // no padding, a 2x2 kernel, stride 2 on a non-square image
+    Layer $valid = initialized(Conv2D(3, 2, 4, 6, $kernel: 2, $stride: 2, $padding: 0));
+    assert(gradientError($valid, noise(shape(2, 72), 53)) < CONV_TOLERANCE);
+
+    // no padding, 3x3, stride 1
+    Layer $shrinking = initialized(Conv2D(1, 2, 5, 4, $padding: 0));
+    assert(gradientError($shrinking, noise(shape(3, 20), 54)) < CONV_TOLERANCE);
+}
+
+#[group: "conv"]
+test conv_shapes_follow_the_formula
+{
+    $same = Conv2D(4, 16, 32, 32);
+    assert($same->outputHeight() == 32 && $same->outputWidth() == 32);
+    assert($same->outputs() == 32 * 32 * 16);
+    assert($same->weight->value->rows() == 36 && $same->weight->value->cols() == 16);
+
+    // (32 + 2 - 3) / 2 + 1 = 16, (20 + 2 - 3) / 2 + 1 = 10
+    $strided = Conv2D(3, 8, 32, 20, $stride: 2);
+    assert($strided->outputHeight() == 16 && $strided->outputWidth() == 10);
+
+    $valid = Conv2D(1, 2, 7, 5, $kernel: 3, $padding: 0);
+    assert($valid->outputHeight() == 5 && $valid->outputWidth() == 3);
+
+    Layer $layer = initialized(Conv2D(3, 8, 32, 20, $stride: 2));
+    $out = $layer->forward(noise(shape(2, 32 * 20 * 3), 55), .infer);
+    assert($out->rows() == 2 && $out->cols() == 16 * 10 * 8);
+}
+
+#[group: "conv"]
+test conv_computes_a_known_kernel
+{
+    // a 3x3 image 1..9; filter 0 sums the 3x3 box, filter 1 reads the pixel above, plus 0.5
+    $conv = Conv2D(1, 2, 3, 3);
+    // row (ky * 3 + kx), column filter
+    for (usize $p = 0; $p < 9; $p++) {
+        $conv->weight->value->data[$p * 2] = 1.0;
+    }
+
+    $conv->weight->value->data[1 * 2 + 1] = 1.0;
+    $conv->bias->value->data[1] = 0.5;
+
+    array<float64> $pixels = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+    array<float64> $expected = [
+        12.0, 0.5, 21.0, 0.5, 16.0, 0.5,
+        27.0, 1.5, 45.0, 2.5, 33.0, 3.5,
+        24.0, 4.5, 39.0, 5.5, 28.0, 6.5,
+    ];
+    assert(identical($conv->forward(image($pixels), .infer), image($expected)));
+
+    // valid, stride 2 over a 4x4 of 1..16: only the top left 3x3 fits
+    $valid = Conv2D(1, 1, 4, 4, $stride: 2, $padding: 0);
+
+    for (usize $p = 0; $p < 9; $p++) {
+        $valid->weight->value->data[$p] = 1.0;
+    }
+
+    array<float64> $big = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0];
+    array<float64> $sums = [54.0];
+    assert(identical($valid->forward(image($big), .infer), image($sums)));
+}
+
+#[group: "conv"]
+test conv_matches_the_direct_loop
+{
+    $conv = Conv2D(3, 5, 6, 7, $stride: 2);
+    initialized($conv, 9);
+    $conv->bias->value = noise(shape(1, 5), 56);
+    $x = noise(shape(3, 6 * 7 * 3), 57);
+    assert(identical($conv->forward($x, .infer), directConv($conv, $x), 0.000000000001));
+
+    $valid = Conv2D(2, 4, 5, 5, $kernel: 2, $padding: 0);
+    initialized($valid, 10);
+    $y = noise(shape(2, 50), 58);
+    assert(identical($valid->forward($y, .infer), directConv($valid, $y), 0.000000000001));
+}
+
+#[group: "conv"]
+#[tests: expects death]
+test conv_refuses_the_wrong_image_size
+{
+    Layer $conv = Conv2D(1, 2, 4, 4);
+    $conv->forward(noise(shape(1, 15), 59), .infer);
+}
+
+#[group: "conv"]
+test maxpool_gradients_match_finite_differences
+{
+    Layer $even = MaxPool2D(3, 4, 4);
+    assert(gradientError($even, noise(shape(2, 48), 60)) < CONV_TOLERANCE);
+
+    Layer $odd = MaxPool2D(2, 5, 7);
+    assert(gradientError($odd, noise(shape(2, 70), 61)) < CONV_TOLERANCE);
+
+    Layer $wide = MaxPool2D(1, 6, 6, 3);
+    assert(gradientError($wide, noise(shape(2, 36), 62)) < CONV_TOLERANCE);
+}
+
+#[group: "conv"]
+test maxpool_shapes_round_down
+{
+    $pool = MaxPool2D(16, 32, 32);
+    assert($pool->outputHeight() == 16 && $pool->outputWidth() == 16);
+    assert($pool->outputs() == 16 * 16 * 16);
+
+    $odd = MaxPool2D(2, 5, 7);
+    assert($odd->outputHeight() == 2 && $odd->outputWidth() == 3 && $odd->outputs() == 12);
+    assert($odd->forward(noise(shape(3, 70), 63), .infer)->cols() == 12);
+}
+
+#[group: "conv"]
+test maxpool_takes_the_window_max_and_routes_to_it
+{
+    // 4x4, one channel: windows (1 5 2 0) (3 8 4 4) (6 7 9 2) (0 1 3 3)
+    Layer $pool = MaxPool2D(1, 4, 4);
+    array<float64> $x = [
+        1.0, 5.0, 3.0, 8.0,
+        2.0, 0.0, 4.0, 4.0,
+        6.0, 7.0, 0.0, 1.0,
+        9.0, 2.0, 3.0, 3.0,
+    ];
+    array<float64> $peaks = [5.0, 8.0, 9.0, 3.0];
+    assert(identical($pool->forward(image($x), .train), image($peaks)));
+
+    // the 3 3 tie in the last window goes to the first in row order
+    array<float64> $g = [10.0, 20.0, 30.0, 40.0];
+    array<float64> $routed = [
+        0.0, 10.0, 0.0, 20.0,
+        0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+        30.0, 0.0, 40.0, 0.0,
+    ];
+    assert(identical($pool->backward(image($g)), image($routed)));
+}
+
+#[group: "conv"]
+test maxpool_keeps_channels_apart
+{
+    // 2x2, two channels: channel 0 peaks at pixel 3, channel 1 at pixel 0
+    Layer $pool = MaxPool2D(2, 2, 2);
+    array<float64> $x = [1.0, 9.0, 2.0, 3.0, 0.0, 4.0, 7.0, 5.0];
+    array<float64> $peaks = [7.0, 9.0];
+    assert(identical($pool->forward(image($x), .train), image($peaks)));
+
+    array<float64> $g = [1.0, 2.0];
+    array<float64> $routed = [0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+    assert(identical($pool->backward(image($g)), image($routed)));
+
+    // a 5x5 drops its last row and column: they get no gradient
+    Layer $odd = MaxPool2D(1, 5, 5);
+    $odd->forward(noise(shape(1, 25), 64), .train);
+    $back = $odd->backward(Tensor(shape(1, 4), fill: 1.0));
+
+    for (usize $i = 0; $i < 5; $i++) {
+        assert($back->data[4 * 5 + $i] == 0.0 && $back->data[$i * 5 + 4] == 0.0);
+    }
+
+    assert(near($back->sum(), 4.0));
+}

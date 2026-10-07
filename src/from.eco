@@ -26,6 +26,15 @@ public function from(ann::Activation $a) : string
     };
 }
 
+public function from(ann::PoolMode $m) : string
+{
+    return match ($m) {
+        .mean => 'mean',
+        .max => 'max',
+        .meanMax => 'meanMax',
+    };
+}
+
 /**
  * Shape, then the matrix view row by row: `[2, 2] [[1, 2], [3, 4]]`.
  */

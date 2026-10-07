@@ -1,0 +1,218 @@
+/**
+ * Collapses equal-width slots into one: `[rows, slots * h]` becomes
+ * `[rows, h]`, the mean or the max of each feature over the slots, or
+ * `[rows, 2h]` for both. No params.
+ *
+ *     Pool(5, .meanMax)
+ *
+ * The rho side of Deep Sets: the result does not change when the slots
+ * are shuffled, so a set becomes one fixed-width summary.
+ */
+
+namespace ann;
+
+/**
+ * What `Pool` takes over the slots, per feature.
+ */
+public enum PoolMode : uint8
+{
+    /**
+     * Average over the slots. Gradient spreads evenly.
+     */
+    case mean = 0;
+
+    /**
+     * Largest over the slots. Gradient goes to that slot alone, the first
+     * one on a tie.
+     */
+    case max = 1;
+
+    /**
+     * Both, mean block first, then max block: `[rows, 2h]`.
+     */
+    case meanMax = 2;
+
+    /**
+     * Output blocks of `h` features each.
+     */
+    public const function blocks() : usize
+    {
+        if ($this == PoolMode::meanMax) {
+            return 2;
+        }
+
+        return 1;
+    }
+
+    /**
+     * Whether a mean block is part of the output.
+     */
+    public const function averages() : bool
+    {
+        return $this != PoolMode::max;
+    }
+
+    /**
+     * Whether a max block is part of the output.
+     */
+    public const function peaks() : bool
+    {
+        return $this != PoolMode::mean;
+    }
+}
+
+public class Pool : Layer
+{
+    /**
+     * Slots per row. The input width must be a multiple of it.
+     */
+    public const usize $slots;
+
+    public const PoolMode $mode;
+
+    // input shape and the winning slot of every (row, feature), from the last .train forward
+    private array<usize> $input = array<usize>();
+    private array<usize> $winners = array<usize>();
+
+    init
+    {
+        if ($this->slots == 0) {
+            die('ann::Pool: needs at least one slot');
+        }
+    }
+
+    public static function decode(Decoder $in, Registry $registry) : result<Layer, ModelError>
+    {
+        usize $slots = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        if ($slots == 0) {
+            return .error(.badValue(0));
+        }
+
+        uint8 $code = guard $in->u8() else ($e) {
+            return .error($e);
+        }
+
+        PoolMode $mode = guard PoolMode::from($code) else {
+            return .error(.badValue($code as uint64));
+        }
+
+        Layer $layer = Pool($slots, $mode);
+        return .ok($layer);
+    }
+
+    public function forward(const Tensor& $input, Mode $mode) : Tensor
+    {
+        usize $rows = $input->rows();
+        usize $width = $input->cols();
+
+        if ($width % $this->slots != 0) {
+            die("ann::Pool: {$width} values per sample do not split into {$this->slots} slots");
+        }
+
+        usize $h = $width / $this->slots;
+        usize $outWidth = $h * $this->mode->blocks();
+        // the max block sits after the mean block when there are both
+        usize $peakAt = $outWidth - $h;
+        array<usize> $shape = [$rows, $outWidth];
+        Tensor $out = Tensor($shape);
+        array<usize> $winners = arr::room<usize>($rows * $h);
+        float64 $share = 1.0 / ($this->slots as float64);
+
+        foreach (0 .. $rows as $r) {
+            usize $base = $r * $width;
+
+            foreach (0 .. $h as $k) {
+                float64 $sum = 0.0;
+                usize $best = 0;
+                float64 $peak = $input->data[$base + $k];
+
+                foreach (0 .. $this->slots as $s) {
+                    float64 $v = $input->data[$base + $s * $h + $k];
+                    $sum = $sum + $v;
+
+                    if ($v > $peak) {
+                        $peak = $v;
+                        $best = $s;
+                    }
+                }
+
+                if ($this->mode->averages()) {
+                    $out->data[$r * $outWidth + $k] = $sum * $share;
+                }
+
+                if ($this->mode->peaks()) {
+                    $out->data[$r * $outWidth + $peakAt + $k] = $peak;
+                }
+
+                $winners[] = $best;
+            }
+        }
+
+        if ($mode == Mode::train) {
+            $this->input = $input->shape;
+            $this->winners = $winners;
+        }
+
+        return $out;
+    }
+
+    public function backward(const Tensor& $gradient) : Tensor
+    {
+        Tensor $out = Tensor($this->input);
+        usize $rows = $out->rows();
+        usize $width = $out->cols();
+        usize $h = $width / $this->slots;
+        usize $outWidth = $gradient->cols();
+        usize $peakAt = $outWidth - $h;
+        float64 $share = 1.0 / ($this->slots as float64);
+
+        foreach (0 .. $rows as $r) {
+            usize $base = $r * $width;
+
+            foreach (0 .. $h as $k) {
+                if ($this->mode->averages()) {
+                    float64 $g = $gradient->data[$r * $outWidth + $k] * $share;
+
+                    foreach (0 .. $this->slots as $s) {
+                        $out->data[$base + $s * $h + $k] = $g;
+                    }
+                }
+
+                if ($this->mode->peaks()) {
+                    usize $at = $base + $this->winners[$r * $h + $k] * $h + $k;
+                    $out->data[$at] = $out->data[$at] + $gradient->data[$r * $outWidth + $peakAt + $k];
+                }
+            }
+        }
+
+        return $out;
+    }
+
+    public const function params() : array<Param>
+    {
+        return array<Param>();
+    }
+
+    public function initialize(Random& $rng) : void
+    {
+    }
+
+    public const function kind() : string
+    {
+        return 'pool';
+    }
+
+    public const function encode(Encoder $out) : void
+    {
+        $out->size($this->slots);
+        $out->u8($this->mode->value());
+    }
+
+    public const function summary() : string
+    {
+        return "pool {$this->mode} over {$this->slots} slots";
+    }
+}

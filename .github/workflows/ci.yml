@@ -29,3 +29,13 @@ jobs:
 
       - name: Build and test
         run: echoc test
+
+      # libann-metal: on macOS the host-side tests, the GPU step skips under
+      # the forking test runner. elsewhere only `available` is compiled
+      - name: Install metal packages
+        working-directory: metal
+        run: epm install
+
+      - name: Test metal
+        working-directory: metal
+        run: echoc test --package-dir vendor

@@ -1,0 +1,148 @@
+/**
+ * Hands a shared context to every slot. The input is the context first,
+ * then the slots: `[rows, context + slots * h]`. The output is one block
+ * per slot, the slot's own `h` values followed by a copy of the context:
+ * `[rows, slots * (h + context)]`. No params.
+ *
+ *     Broadcast(8, 5)
+ *
+ * After a `Parallel` that puts a pooled summary in front of the slots,
+ * this lets a `PerSlot` scorer judge each item against the whole set.
+ */
+
+namespace ann;
+
+public class Broadcast : Layer
+{
+    /**
+     * Leading columns that every slot receives.
+     */
+    public const usize $context;
+
+    /**
+     * Slots after the context. Their width must split evenly.
+     */
+    public const usize $slots;
+
+    // input shape of the last .train forward
+    private array<usize> $input = array<usize>();
+
+    init
+    {
+        if ($this->slots == 0) {
+            die('ann::Broadcast: needs at least one slot');
+        }
+    }
+
+    public static function decode(Decoder $in, Registry $registry) : result<Layer, ModelError>
+    {
+        usize $context = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        usize $slots = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        if ($slots == 0) {
+            return .error(.badValue(0));
+        }
+
+        Layer $layer = Broadcast($context, $slots);
+        return .ok($layer);
+    }
+
+    public function forward(const Tensor& $input, Mode $mode) : Tensor
+    {
+        usize $rows = $input->rows();
+        usize $width = $input->cols();
+
+        if ($width < $this->context || ($width - $this->context) % $this->slots != 0) {
+            die("ann::Broadcast: {$width} values per sample are not {$this->context} context values plus {$this->slots} equal slots");
+        }
+
+        usize $h = ($width - $this->context) / $this->slots;
+        usize $block = $h + $this->context;
+        usize $outWidth = $this->slots * $block;
+        array<usize> $shape = [$rows, $outWidth];
+        Tensor $out = Tensor($shape);
+
+        foreach (0 .. $rows as $r) {
+            usize $from = $r * $width;
+            usize $to = $r * $outWidth;
+
+            foreach (0 .. $this->slots as $s) {
+                usize $at = $to + $s * $block;
+
+                foreach (0 .. $h as $k) {
+                    $out->data[$at + $k] = $input->data[$from + $this->context + $s * $h + $k];
+                }
+
+                foreach (0 .. $this->context as $k) {
+                    $out->data[$at + $h + $k] = $input->data[$from + $k];
+                }
+            }
+        }
+
+        if ($mode == Mode::train) {
+            $this->input = $input->shape;
+        }
+
+        return $out;
+    }
+
+    public function backward(const Tensor& $gradient) : Tensor
+    {
+        Tensor $out = Tensor($this->input);
+        usize $rows = $out->rows();
+        usize $width = $out->cols();
+        usize $h = ($width - $this->context) / $this->slots;
+        usize $block = $h + $this->context;
+        usize $outWidth = $gradient->cols();
+
+        foreach (0 .. $rows as $r) {
+            usize $to = $r * $width;
+            usize $from = $r * $outWidth;
+
+            foreach (0 .. $this->slots as $s) {
+                usize $at = $from + $s * $block;
+
+                foreach (0 .. $h as $k) {
+                    $out->data[$to + $this->context + $s * $h + $k] = $gradient->data[$at + $k];
+                }
+
+                // every slot read the context, so its gradient is the sum over slots
+                foreach (0 .. $this->context as $k) {
+                    $out->data[$to + $k] = $out->data[$to + $k] + $gradient->data[$at + $h + $k];
+                }
+            }
+        }
+
+        return $out;
+    }
+
+    public const function params() : array<Param>
+    {
+        return array<Param>();
+    }
+
+    public function initialize(Random& $rng) : void
+    {
+    }
+
+    public const function kind() : string
+    {
+        return 'broadcast';
+    }
+
+    public const function encode(Encoder $out) : void
+    {
+        $out->size($this->context);
+        $out->size($this->slots);
+    }
+
+    public const function summary() : string
+    {
+        return "broadcast {$this->context} context values to {$this->slots} slots";
+    }
+}

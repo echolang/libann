@@ -7,18 +7,20 @@ Tensors, layers, losses, optimizers, a trainer. A binary format for the whole mo
 `ann::rl` sits on top: environments, replay and rollout buffers, and DQN, REINFORCE, actor-critic and PPO.
 
 ```bash
+epm install
 echoc test
 echoc run -m . examples/xor.eco
 ```
 
-The library has no program target. Those two commands are the whole checkout loop. `echoc build` without `-o` has nowhere to put a binary.
+The library has no program target. Those three commands are the whole checkout loop. `epm install` vendors [libcommand](https://github.com/echolang/libcommand), which draws the training output. `echoc build` without `-o` has nowhere to put a binary.
 
 ## A complete pass
 
 Let's train XOR so the pieces have somewhere to sit.
 
 ```echo
-use ann::{Act, BinaryCrossEntropy, Dataset, Dense, EpochReport, Model, Sequential, Sgd, Tensor, Trainer};
+use ann::{Act, BinaryCrossEntropy, Dataset, Dense, Log, Model, Sequential, Sgd, Tensor, Trainer};
+use ann::cli;
 
 array<array<float64>> $points = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]];
 array<float64> $labels = [0.0, 1.0, 1.0, 0.0];
@@ -31,7 +33,6 @@ $net = Sequential()
     ->add(Act(.sigmoid));
 
 $model = Model($net, $seed: 7);
-echo $model->summary();
 ```
 
 `Model($net, $seed: 7)` wraps the chain and fills every param from that seed. Building a `Dense` leaves the weights at zero until then. Same architecture and seed always start from the same weights.
@@ -39,15 +40,15 @@ echo $model->summary();
 The network ends in `Act(.sigmoid)` because this is a yes/no. `BinaryCrossEntropy` is the loss that goes with that.
 
 ```echo
+$log = Log()->to(cli::Console());
+$log->begin('xor');
+$log->model($model);
+
 $trainer = Trainer(
     $epochs: 2000,
     $batchSize: 4,
     $metric: .binaryAccuracy,
-    $onEpoch: function(EpochReport $r) : void {
-        if ($r->epoch % 500 == 0) {
-            echo "epoch {$r->epoch}: loss {$r->train->loss:.5f}, accuracy {$r->train->metric:.2f}";
-        }
-    },
+    $observer: $log->training(),
 );
 $trainer->fit($model, BinaryCrossEntropy(), Sgd(0.5, $momentum: 0.9), $data);
 ```
@@ -79,7 +80,7 @@ The whole file is `examples/xor.eco`.
 epm add --path ../libann
 ```
 
-That writes a `#[depends:]` line. Echo sees `namespace ann` as soon as the module loads. There is nothing to link.
+That writes a `#[depends:]` line. Echo sees `namespace ann` as soon as the module loads. There is nothing to link. libann's own `#[requires:]` (libcommand) comes along: run `epm install` in your program and it lands in your `vendor/`.
 
 ```echo
 use ann::{Act, Dense, Model, Sequential};
@@ -207,13 +208,11 @@ $trainer = Trainer(
     $batchSize: 16,
     $metric: .rmse,
     $validation: $split->holdout,
-    $onEpoch: function(EpochReport $r) : void {
-        Evaluation $v = $r->validation ?? $r->train;
-        echo "epoch {$r->epoch}: train rmse {$r->train->metric:.4f}, validation rmse {$v->metric:.4f}";
-    },
 );
 $history = $trainer->fit($model, MeanSquaredError(), Adam(0.01), $split->train);
 ```
+
+`fit` returns every epoch's `EpochReport` in a `History`. `$onEpoch` is a closure called after each one, and `$observer` hears every batch as well. Both are optional.
 
 Metrics are reported next to the loss. Training never optimises them. `.accuracy` is the share of samples whose largest output is the target class (one-hot rows or a `[n, 1]` column of class indices). `.binaryAccuracy` is the share of values on the same side of 0.5 as their target. `.rmse` and `.mae` are in the units of the target.
 
@@ -360,6 +359,12 @@ $rollout->clear();
 
 A game, a simulator or a business process plugs in by implementing four methods on `Environment`. Randomness belongs to the environment: seed it on construction so runs reproduce.
 
+## On the GPU
+
+A wide MLP outgrows the CPU fast: three 1024-wide layers at batch 256 take 160 ms a step here. `metal/` is a separate module, `libann-metal`, that mirrors a `Model` onto the GPU through Metal, trains it there in float32, and syncs the weights back into the same model. Same trainer fields, same `History`, same files. Apple platforms only, Dense and Act layers only for now, and under about 128 wide the CPU is still faster.
+
+It's a module of its own so this one stays pure Echo with nothing to link. [metal/README.md](metal/README.md) has the numbers and the rest.
+
 ## Catalog
 
 ### Layers
@@ -392,6 +397,38 @@ Row-wise probabilities. Skip it when training with `CrossEntropy`.
 
 A chain of layers, itself a `Layer`.
 
+#### `Conv2D`
+
+2D convolution over HWC images stored flat, one image per row. `Conv2D($channels, $filters, $height, $width)`, 3x3 stride 1 padding 1 by default. Im2col plus one matmul.
+
+#### `MaxPool2D`
+
+Max over non-overlapping windows. `MaxPool2D($channels, $height, $width)`, window 2.
+
+#### `SelfAttention`
+
+Multi-head self-attention over the slots of a row. `SelfAttention($slots, $width, $heads: n)`. No residual or norm inside.
+
+#### `Parallel`
+
+Branches over column ranges of the same input, outputs side by side. `pass($from, $count)` copies a range unchanged.
+
+#### `PerSlot`
+
+One shared layer over equal-width slots packed in a row. The phi of Deep Sets.
+
+#### `Pool`
+
+Collapses slots into a mean, a max, or both. `Pool($slots, .meanMax)`. No params.
+
+#### `Broadcast`
+
+Hands a shared context to every slot. After a pooled summary sitting in front of the slots.
+
+#### `Permute`
+
+Reorders columns. `Permute(slots: n, width: w)` regroups slot-major into field-major.
+
 ### Activations
 
 `.linear`, `.relu`, `.leakyRelu` (0.01x on the negative side, so no unit is stuck at zero gradient), `.sigmoid`, `.tanh`, `.gelu`, `.softplus`, `.elu`, `.swish`.
@@ -417,6 +454,14 @@ Probabilities in (0, 1). Pair with a final `Act(.sigmoid)`.
 #### `CrossEntropy`
 
 Softmax cross-entropy over logits. Targets are one-hot rows, or soft distributions. `smoothing` in `[0, 1)`.
+
+#### `SigmoidCrossEntropy`
+
+Independent logistic losses over logits. Pair with a plain `Dense` when yes/no heads share a linear layer.
+
+#### `Heads`
+
+Several losses over slices of one output. `add($width, $loss)` in column order; `gate:` scores only rows whose extra target column holds 1.
 
 ### Optimizers
 
@@ -446,6 +491,9 @@ echoc run -m . examples/custom_layer.eco
 echoc run -m . examples/cartpole_dqn.eco
 echoc run -m . examples/cartpole_a2c.eco
 echoc run -m . examples/cartpole_ppo.eco
+echoc run -m . examples/multihead.eco
+echoc run -m . examples/sets.eco
+echoc run -m . examples/shapes.eco
 ```
 
 `examples/bench.eco` is the hot paths. Release builds only; the JIT's debug checks would measure themselves:

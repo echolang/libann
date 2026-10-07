@@ -1,0 +1,11 @@
+/**
+ * Non-Apple hosts. The rest of `ann::metal` is not compiled here; check
+ * `available` before naming it, and gate that code on the platform.
+ */
+
+namespace ann::metal;
+
+public function available() : bool
+{
+    return false;
+}

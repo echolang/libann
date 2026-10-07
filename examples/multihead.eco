@@ -1,0 +1,103 @@
+// one network, three answers: which quadrant a point sits in (class),
+// whether it is inside the unit circle (flag), and its distance from the
+// origin, which only counts for points right of the y axis (gated value)
+//
+//   echoc run -m . examples/multihead.eco
+
+use ann::{Act, Adam, Dataset, Dense, Heads, MeanSquaredError, Model, Random, Sequential, SigmoidCrossEntropy, CrossEntropy, Tensor, Trainer};
+
+const SAMPLES = 600;
+
+// target columns: 4 one-hot, 1 flag, 1 distance, then the gate
+internal function points(uint64 $seed) : Dataset
+{
+    $rng = Random($seed);
+    array<array<float64>> $inputs = array<array<float64>>();
+    array<array<float64>> $targets = array<array<float64>>();
+
+    foreach (0 .. SAMPLES as $i) {
+        float64 $x = $rng->uniform(-1.5, 1.5);
+        float64 $y = $rng->uniform(-1.5, 1.5);
+        float64 $r = std::math::sqrt($x * $x + $y * $y);
+        array<float64> $row = [0.0, 0.0, 0.0, 0.0, 0.0, $r, 0.0];
+        usize $quadrant = 0;
+
+        if ($x < 0.0) {
+            $quadrant = $quadrant + 1;
+        }
+
+        if ($y < 0.0) {
+            $quadrant = $quadrant + 2;
+        }
+
+        $row[$quadrant] = 1.0;
+
+        if ($r < 1.0) {
+            $row[4] = 1.0;
+        }
+
+        if ($x > 0.0) {
+            $row[6] = 1.0;
+        }
+
+        array<float64> $point = [$x, $y];
+        $inputs[] = $point;
+        $targets[] = $row;
+    }
+
+    return Dataset(Tensor(rows: $inputs), Tensor(rows: $targets));
+}
+
+$heads = Heads()
+    ->add(4, CrossEntropy())
+    ->add(1, SigmoidCrossEntropy())
+    ->add(1, MeanSquaredError(), gate: 6);
+
+$net = Sequential()
+    ->add(Dense(2, 32, .he))
+    ->add(Act(.relu))
+    ->add(Dense(32, 32, .he))
+    ->add(Act(.relu))
+    ->add(Dense(32, $heads->outputs()));
+
+$split = points(5)->split(0.2, $seed: 3);
+$model = Model($net, $seed: 1);
+$history = Trainer($epochs: 200, $batchSize: 32)->fit($model, $heads, Adam(0.01), $split->train);
+
+$holdout = $split->holdout;
+$p = $heads->predict($model->predict($holdout->inputs));
+usize $quadrants = 0;
+usize $flags = 0;
+float64 $error = 0.0;
+float64 $gated = 0.0;
+
+foreach (0 .. $holdout->count() as $r) {
+    usize $best = 0;
+
+    foreach (1 .. 4 as $c) {
+        if ($p->at($r, $c) > $p->at($r, $best)) {
+            $best = $c;
+        }
+    }
+
+    if ($holdout->targets->at($r, $best) == 1.0) {
+        $quadrants = $quadrants + 1;
+    }
+
+    if (($p->at($r, 4) > 0.5) == ($holdout->targets->at($r, 4) == 1.0)) {
+        $flags = $flags + 1;
+    }
+
+    if ($holdout->targets->at($r, 6) == 1.0) {
+        $error = $error + std::math::abs($p->at($r, 5) - $holdout->targets->at($r, 5));
+        $gated = $gated + 1.0;
+    }
+}
+
+float64 $n = $holdout->count() as float64;
+float64 $quadrantAccuracy = ($quadrants as float64) / $n;
+float64 $flagAccuracy = ($flags as float64) / $n;
+float64 $distanceError = $error / $gated;
+echo "quadrant accuracy {$quadrantAccuracy:.3f}";
+echo "inside-circle accuracy {$flagAccuracy:.3f}";
+echo "distance mae (right half) {$distanceError:.3f}";

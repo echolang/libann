@@ -40,6 +40,30 @@ public class Registry
         $this->add('residual', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
             return Residual::decode($in, $r);
         });
+        $this->add('parallel', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
+            return Parallel::decode($in, $r);
+        });
+        $this->add('perslot', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
+            return PerSlot::decode($in, $r);
+        });
+        $this->add('pool', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
+            return Pool::decode($in, $r);
+        });
+        $this->add('broadcast', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
+            return Broadcast::decode($in, $r);
+        });
+        $this->add('permute', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
+            return Permute::decode($in, $r);
+        });
+        $this->add('conv2d', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
+            return Conv2D::decode($in, $r);
+        });
+        $this->add('maxpool2d', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
+            return MaxPool2D::decode($in, $r);
+        });
+        $this->add('attention', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
+            return SelfAttention::decode($in, $r);
+        });
     }
 
     /**

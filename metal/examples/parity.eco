@@ -1,0 +1,202 @@
+/*
+ * The GPU and the CPU train the same network from the same seed, and
+ * must agree: every step's loss, then every weight after `sync`. One run
+ * per loss, per optimizer, with and without clipping. Stops on the first
+ * disagreement.
+ *
+ *   echoc run --target parity
+ *
+ * `echoc run`, not a test: the test runner forks, and the Metal shader
+ * compiler (XPC) does not survive a fork.
+ */
+
+use ann::{Act, Activation, Adam, BinaryCrossEntropy, CrossEntropy, Dataset, Huber, Loss, MeanAbsoluteError, MeanSquaredError, Model, Optimizer, Random, Sequential, Sgd, Tensor, Dense};
+use ann::metal::{Gpu, Objective, Update};
+
+internal function noise(Random& $rng, usize $rows, usize $cols, float64 $low, float64 $high) : Tensor
+{
+    array<usize> $shape = [$rows, $cols];
+    $t = Tensor($shape);
+
+    foreach (0 .. $t->data->count() as $i) {
+        $t->data[$i] = $rng->uniform($low, $high);
+    }
+
+    return $t;
+}
+
+internal function onehot(Random& $rng, usize $rows, usize $cols) : Tensor
+{
+    array<usize> $shape = [$rows, $cols];
+    $t = Tensor($shape);
+
+    for (usize $r = 0; $r < $rows; $r++) {
+        $t->data[$r * $cols + $rng->below($cols)] = 1.0;
+    }
+
+    return $t;
+}
+
+internal function net(Activation $hidden, Activation $last, usize $inputs, usize $width, usize $outputs) : Sequential
+{
+    return Sequential()
+        ->add(Dense($inputs, $width, .he))
+        ->add(Act($hidden))
+        ->add(Sequential()->add(Dense($width, $width))->add(Act(.tanh)))
+        ->add(Dense($width, $outputs))
+        ->add(Act($last));
+}
+
+internal function close(float64 $a, float64 $b, float64 $tolerance) : bool
+{
+    $scale = std::math::max(std::math::max(std::math::abs($a), std::math::abs($b)), 1.0);
+    return std::math::abs($a - $b) <= $tolerance * $scale;
+}
+
+internal function check(Gpu $gpu, const string& $name, Activation $hidden, Activation $last, Loss $hostLoss, const Objective& $objective, Optimizer $cpuOpt, const Update& $gpuUpdate, float64 $clip, const Dataset& $data, usize $batch) : void
+{
+    usize $inputs = $data->inputs->cols();
+    usize $outputs = $data->targets->cols();
+    $cpu = Model(net($hidden, $last, $inputs, 48, $outputs), $seed: 5);
+    $host = Model(net($hidden, $last, $inputs, 48, $outputs), $seed: 5);
+    $start = Model(net($hidden, $last, $inputs, 48, $outputs), $seed: 5);
+
+    $gnet = guard $gpu->mirror($host, $batch) else ($e) {
+        die("{$name}: {$e}");
+    }
+
+    $worst = 0.0;
+    $moved = 0.0;
+    $lossGap = 0.0;
+
+    for (int32 $step = 0; $step < 20; $step++) {
+        usize $first = (($step as usize) * $batch) % ($data->count() - $batch + 1);
+        array<usize> $rows = arr::room<usize>($batch);
+
+        for (usize $i = 0; $i < $batch; $i++) {
+            $rows[] = $first + $i;
+        }
+
+        $b = $data->batch($rows);
+        $want = $cpu->learn($b, $hostLoss, $cpuOpt, $clip);
+        $got = $gnet->learn($b, $objective, $gpuUpdate, $clip);
+
+        if (!close($want, $got, 0.001)) {
+            die("{$name}: step {$step} loss cpu {$want} gpu {$got}");
+        }
+
+        $lossGap = std::math::max($lossGap, std::math::abs($want - $got));
+    }
+
+    $gnet->sync();
+    $a = $cpu->params();
+    $b = $host->params();
+    $c = $start->params();
+
+    foreach (0 .. $a->count() as $p) {
+        foreach (0 .. $a[$p]->value->data->count() as $i) {
+            $x = $a[$p]->value->data[$i];
+            $y = $b[$p]->value->data[$i];
+            $worst = std::math::max($worst, std::math::abs($x - $y));
+            $moved = std::math::max($moved, std::math::abs($y - $c[$p]->value->data[$i]));
+
+            if (!close($x, $y, 0.002)) {
+                die("{$name}: param {$p} value {$i} cpu {$x} gpu {$y}");
+            }
+        }
+    }
+
+    // a gap is only small next to how far training went. not much smaller:
+    // where a gradient is near zero, float32 and float64 can disagree on
+    // its sign, and Adam turns either into a whole step
+    if ($moved < 20.0 * $worst) {
+        die("{$name}: weights moved {$moved}, barely more than the gap {$worst}");
+    }
+
+    $pc = $cpu->predict($data->inputs);
+    $pg = $gnet->predict($data->inputs);
+
+    foreach (0 .. $pc->data->count() as $i) {
+        if (!close($pc->data[$i], $pg->data[$i], 0.002)) {
+            die("{$name}: predict {$i} cpu {$pc->data[$i]} gpu {$pg->data[$i]}");
+        }
+    }
+
+    echo "ok  {$name}  (loss gap {$lossGap}, weights moved {$moved}, weight gap {$worst})";
+}
+
+// whole fits: shuffling, device gathers, the last short batch, validation
+internal function fits(Gpu $gpu, const Dataset& $data, const Dataset& $held) : void
+{
+    $cpu = Model(net(.relu, .linear, 13, 48, 5), $seed: 8);
+    $host = Model(net(.relu, .linear, 13, 48, 5), $seed: 8);
+
+    $gnet = guard $gpu->mirror($host, $batch: 64) else ($e) {
+        die("fit: {$e}");
+    }
+
+    $want = ann::Trainer($epochs: 4, $batchSize: 48, $seed: 3, $metric: .accuracy, $validation: $held)
+        ->fit($cpu, CrossEntropy(), Adam(), $data);
+
+    $got = guard ann::metal::Trainer($epochs: 4, $batchSize: 48, $seed: 3, $metric: .accuracy, $validation: $held)
+        ->fit($gnet, Objective::crossEntropy(CrossEntropy()), Update::adam(Adam()), $data) else ($e) {
+        die("fit: {$e}");
+    }
+
+    foreach (0 .. $want->epochs->count() as $e) {
+        $a = $want->epochs[$e];
+        $b = $got->epochs[$e];
+        $va = guard $a->validation;
+        $vb = guard $b->validation;
+
+        if (!close($a->train->loss, $b->train->loss, 0.001) || !close($va->loss, $vb->loss, 0.001)) {
+            die("fit: epoch {$e} loss cpu {$a->train->loss}/{$va->loss} gpu {$b->train->loss}/{$vb->loss}");
+        }
+
+        if (!close($a->train->metric, $b->train->metric, 0.01)) {
+            die("fit: epoch {$e} accuracy cpu {$a->train->metric} gpu {$b->train->metric}");
+        }
+    }
+
+    // fit synced the host model on its way out
+    $pc = $cpu->predict($held->inputs);
+    $ph = $host->predict($held->inputs);
+
+    foreach (0 .. $pc->data->count() as $i) {
+        if (!close($pc->data[$i], $ph->data[$i], 0.002)) {
+            die("fit: synced predict {$i} cpu {$pc->data[$i]} gpu {$ph->data[$i]}");
+        }
+    }
+
+    echo 'ok  trainer fit with validation';
+}
+
+$gpu = guard Gpu::open() else ($e) {
+    die("{$e}");
+}
+
+echo "device: {$gpu->name()}";
+
+$rng = Random(11);
+usize $n = 300;
+$x = noise($rng, $n, 13, -1.0, 1.0);
+$regression = Dataset($x, noise($rng, $n, 3, -1.0, 1.0), weights: noise($rng, $n, 1, 0.5, 1.5));
+$binary = Dataset($x, noise($rng, $n, 3, 0.0, 1.0));
+$classes = Dataset($x, onehot($rng, $n, 5));
+// big enough that the fast tanh would return NaN inside a GELU
+$loud = Dataset(noise($rng, $n, 13, -30.0, 30.0), noise($rng, $n, 3, -1.0, 1.0));
+
+check($gpu, 'mse adam', .relu, .linear, MeanSquaredError(), Objective::mse(MeanSquaredError())), Adam(), Update::adam(Adam()), 0.0, $regression, 64);
+check($gpu, 'mse adamw clip', .gelu, .linear, MeanSquaredError(), Objective::mse(MeanSquaredError())), Adam($rate: 0.003, $weightDecay: 0.01), Update::adam(Adam($rate: 0.003, $weightDecay: 0.01)), 0.5, $regression, 64);
+check($gpu, 'mae sgd', .leakyRelu, .linear, MeanAbsoluteError(), Objective::mae(MeanAbsoluteError()), Sgd($rate: 0.05), Update::sgd(Sgd($rate: 0.05)), 0.0, $regression, 50);
+check($gpu, 'huber nesterov', .elu, .linear, Huber($delta: 0.3), Objective::huber(Huber($delta: 0.3)), Sgd($rate: 0.02, $momentum: 0.9, $nesterov: true), Update::sgd(Sgd($rate: 0.02, $momentum: 0.9, $nesterov: true)), 1.0, $regression, 37);
+check($gpu, 'bce adam', .swish, .sigmoid, BinaryCrossEntropy(), Objective::bce(BinaryCrossEntropy()), Adam(), Update::adam(Adam()), 0.0, $binary, 64);
+check($gpu, 'cross-entropy adam', .softplus, .linear, CrossEntropy($smoothing: 0.1), Objective::crossEntropy(CrossEntropy($smoothing: 0.1)), Adam(), Update::adam(Adam()), 0.0, $classes, 100);
+check($gpu, 'cross-entropy one row', .relu, .linear, CrossEntropy(), Objective::crossEntropy(CrossEntropy()), Adam(), Update::adam(Adam()), 0.0, $classes, 1);
+check($gpu, 'large inputs gelu', .gelu, .linear, MeanSquaredError(), Objective::mse(MeanSquaredError())), Adam(), Update::adam(Adam()), 0.0, $loud, 64);
+check($gpu, 'large inputs softplus', .softplus, .tanh, MeanSquaredError(), Objective::mse(MeanSquaredError())), Adam(), Update::adam(Adam()), 0.0, $loud, 64);
+check($gpu, 'sigmoid-hidden mse', .sigmoid, .tanh, MeanSquaredError(), Objective::mse(MeanSquaredError())), Adam(), Update::adam(Adam()), 0.0, $regression, 128);
+
+fits($gpu, $classes, Dataset(noise($rng, 40, 13, -1.0, 1.0), onehot($rng, 40, 5)));
+
+echo 'all agree';

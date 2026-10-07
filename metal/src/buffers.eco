@@ -1,0 +1,195 @@
+/**
+ * Shared-storage buffers the CPU writes straight into, and the pass that
+ * encodes kernels against them. On Apple silicon shared is unified memory:
+ * no copies, only the float64 to float32 conversion.
+ */
+
+namespace ann::metal;
+
+use ann::Tensor;
+
+/**
+ * Words the kernels read as `constant uint*`: sizes as they are, floats as
+ * their bits. Also the index list a gather reads.
+ */
+internal class Words
+{
+    internal mtl::Buffer $buffer;
+
+    internal constructor(mtl::Buffer $buffer)
+    {
+        $this->buffer = $buffer;
+    }
+
+    internal function u(usize $slot, usize $value) : void
+    {
+        $raw = $this->buffer->contents();
+        $words = $raw:$ as ptr<uint32>;
+        $words:$[$slot] = $value as uint32;
+    }
+
+    internal function f(usize $slot, float64 $value) : void
+    {
+        $raw = $this->buffer->contents();
+        $words = $raw:$ as ptr<float32>;
+        $words:$[$slot] = $value as float32;
+    }
+
+    /**
+     * `$indices[$first ..< $first + $count]` into the first `$count` words.
+     */
+    internal function indices(const array<usize>& $indices, usize $first, usize $count) : void
+    {
+        $raw = $this->buffer->contents();
+        $words = $raw:$ as ptr<uint32>;
+
+        for (usize $i = 0; $i < $count; $i++) {
+            $words:$[$i] = $indices[$first + $i] as uint32;
+        }
+    }
+}
+
+/**
+ * A float32 row-major matrix. `rows` is a capacity: a smaller batch uses
+ * the top rows and leaves the rest alone.
+ */
+internal class Matrix
+{
+    internal mtl::Buffer $buffer;
+    internal usize $rows;
+    internal usize $cols;
+
+    internal constructor(mtl::Buffer $buffer, usize $rows, usize $cols)
+    {
+        $this->buffer = $buffer;
+        $this->rows = $rows;
+        $this->cols = $cols;
+    }
+
+    /**
+     * Rows `$first ..< $first + $count` of `$t` into the top `$count` rows.
+     */
+    internal function load(const Tensor& $t, usize $first, usize $count) : void
+    {
+        $raw = $this->buffer->contents();
+        $data = $raw:$ as ptr<float32>;
+        usize $start = $first * $this->cols;
+        usize $n = $count * $this->cols;
+
+        for (usize $i = 0; $i < $n; $i++) {
+            $data:$[$i] = $t->data[$start + $i] as float32;
+        }
+    }
+
+    /**
+     * The top `$count` rows into rows `$first ..< $first + $count` of `$t`.
+     */
+    internal function read(Tensor& $t, usize $first, usize $count) : void
+    {
+        $raw = $this->buffer->contents();
+        $data = $raw:$ as ptr<float32>;
+        usize $start = $first * $this->cols;
+        usize $n = $count * $this->cols;
+
+        for (usize $i = 0; $i < $n; $i++) {
+            $t->data[$start + $i] = $data:$[$i] as float64;
+        }
+    }
+
+    /**
+     * Sum of the first `$n` values, in float64.
+     */
+    internal function total(usize $n) : float64
+    {
+        $raw = $this->buffer->contents();
+        $data = $raw:$ as ptr<float32>;
+        $sum = 0.0;
+
+        for (usize $i = 0; $i < $n; $i++) {
+            $sum = $sum + ($data:$[$i] as float64);
+        }
+
+        return $sum;
+    }
+
+    internal function fill(float64 $value) : void
+    {
+        $raw = $this->buffer->contents();
+        $data = $raw:$ as ptr<float32>;
+        usize $n = $this->rows * $this->cols;
+        $v = $value as float32;
+
+        for (usize $i = 0; $i < $n; $i++) {
+            $data:$[$i] = $v;
+        }
+    }
+}
+
+/**
+ * One command buffer with one compute encoder. Serial dispatch: every
+ * kernel sees what the one before it wrote. `finish` blocks until the GPU
+ * is done.
+ */
+internal struct Pass
+{
+    internal Kernels $kernels;
+    internal mtl::CommandBuffer $command;
+    internal mtl::ComputeCommandEncoder $encoder;
+
+    /**
+     * One thread per element of a `$width` x `$height` grid.
+     */
+    internal function run(mtl::ComputePipelineState $kernel, const array<mtl::Buffer>& $buffers, usize $width, usize $height = 1) : void
+    {
+        usize $wide = 256;
+        usize $square = 16;
+        usize $one = 1;
+        usize $across = std::math::min($width, $wide);
+        usize $down = $one;
+
+        if ($height > 1) {
+            $across = std::math::min($width, $square);
+            $down = std::math::min($height, $square);
+        }
+
+        $this->bind($kernel, $buffers);
+        $this->encoder->dispatchThreads(mtl::Size($width, $height), mtl::Size($across, $down));
+    }
+
+    /**
+     * `$groups` whole threadgroups of `$threads` along x.
+     */
+    internal function groups(mtl::ComputePipelineState $kernel, const array<mtl::Buffer>& $buffers, usize $groups, usize $threads) : void
+    {
+        $this->bind($kernel, $buffers);
+        $this->encoder->dispatchThreads(mtl::Size($groups * $threads, 1), mtl::Size($threads, 1));
+    }
+
+    /**
+     * `C = A . B` over an `$m` x `$n` result, in 64 x 64 tiles. Buffers in
+     * the order the matmul kernel binds them.
+     */
+    internal function matmul(const array<mtl::Buffer>& $buffers, usize $m, usize $n) : void
+    {
+        usize $across = ($n + 63) / 64;
+        usize $down = ($m + 63) / 64;
+        $this->bind($this->kernels->matmul, $buffers);
+        $this->encoder->dispatchThreads(mtl::Size($across * 16, $down * 16), mtl::Size(16, 16));
+    }
+
+    internal function finish() : void
+    {
+        $this->encoder->endEncoding();
+        $this->command->commit();
+        $this->command->waitUntilCompleted();
+    }
+
+    private function bind(mtl::ComputePipelineState $kernel, const array<mtl::Buffer>& $buffers) : void
+    {
+        $this->encoder->setComputePipelineState($kernel);
+
+        foreach ($buffers as $i => $buffer) {
+            $this->encoder->setBuffer($buffer, index: $i as uint32);
+        }
+    }
+}

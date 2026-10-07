@@ -1,0 +1,264 @@
+/**
+ * Branches over column ranges of the same input, outputs side by side in
+ * `add` order. Ranges may overlap or leave columns out.
+ *
+ *     $net = Parallel()
+ *         ->pass(0, 80)                                // the slots as they are
+ *         ->add(0, 80, Pool(5, .meanMax));             // plus a summary of all of them
+ *
+ * How a set model keeps its per-slot features and a pooled context in one
+ * row.
+ */
+
+namespace ann;
+
+/**
+ * One `Parallel` branch: the input columns it reads and the layer it runs
+ * them through.
+ */
+public struct Branch
+{
+    /**
+     * First input column.
+     */
+    public usize $from;
+
+    /**
+     * Input columns from `$from` on.
+     */
+    public usize $count;
+
+    /**
+     * Null when the columns go through unchanged, no layer and no params.
+     */
+    public Layer? $layer = null;
+}
+
+public class Parallel : Layer
+{
+    /**
+     * In output order. Append with `add` or `pass`.
+     */
+    public array<Branch> $branches = array<Branch>();
+
+    // output width of every branch and the input shape, from the last .train forward
+    private array<usize> $widths = array<usize>();
+    private array<usize> $input = array<usize>();
+
+    public static function decode(Decoder $in, Registry $registry) : result<Layer, ModelError>
+    {
+        usize $count = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        $parallel = Parallel();
+
+        for (usize $i = 0; $i < $count; $i++) {
+            usize $from = guard $in->size() else ($e) {
+                return .error($e);
+            }
+
+            usize $columns = guard $in->size() else ($e) {
+                return .error($e);
+            }
+
+            bool $pass = guard $in->flag() else ($e) {
+                return .error($e);
+            }
+
+            if ($pass) {
+                $parallel->pass($from, $columns);
+                continue;
+            }
+
+            Layer $child = guard $registry->decode($in) else ($e) {
+                return .error($e);
+            }
+
+            $parallel->add($from, $columns, $child);
+        }
+
+        Layer $layer = $parallel;
+        return .ok($layer);
+    }
+
+    /**
+     * Append a branch that runs input columns `$from` up to `$from + $count`
+     * through `$layer`. Returns `$this` so calls chain.
+     */
+    public function add(usize $from, usize $count, Layer $layer) : Parallel
+    {
+        $this->branches[] = Branch($from, $count, $layer);
+        return $this;
+    }
+
+    /**
+     * Append a branch that copies input columns `$from` up to
+     * `$from + $count` to the output unchanged.
+     */
+    public function pass(usize $from, usize $count) : Parallel
+    {
+        $this->branches[] = Branch($from, $count);
+        return $this;
+    }
+
+    public function forward(const Tensor& $input, Mode $mode) : Tensor
+    {
+        usize $rows = $input->rows();
+        usize $width = $input->cols();
+        array<Tensor> $parts = arr::room<Tensor>($this->branches->count());
+        array<usize> $widths = arr::room<usize>($this->branches->count());
+        usize $total = 0;
+
+        foreach ($this->branches as $i => $branch) {
+            if ($branch->from + $branch->count > $width) {
+                usize $to = $branch->from + $branch->count;
+                die("ann::Parallel: branch {$i} reads columns {$branch->from}..{$to}, the input has {$width}");
+            }
+
+            Tensor $slice = $input->columns($branch->from, $branch->count);
+            Layer $child = guard $branch->layer else {
+                $widths[] = $slice->cols();
+                $total = $total + $slice->cols();
+                $parts[] = $slice;
+                continue;
+            };
+
+            $slice = $child->forward($slice, $mode);
+
+            if ($slice->rows() != $rows) {
+                die("ann::Parallel: branch {$i} turned {$rows} rows into {$slice->rows()}");
+            }
+
+            $widths[] = $slice->cols();
+            $total = $total + $slice->cols();
+            $parts[] = $slice;
+        }
+
+        array<usize> $shape = [$rows, $total];
+        Tensor $out = Tensor($shape);
+        usize $at = 0;
+
+        foreach ($parts as $part) {
+            $out->put(columns: $at, $part);
+            $at = $at + $part->cols();
+        }
+
+        if ($mode == Mode::train) {
+            $this->widths = $widths;
+            $this->input = $input->shape;
+        }
+
+        return $out;
+    }
+
+    public function backward(const Tensor& $gradient) : Tensor
+    {
+        Tensor $out = Tensor($this->input);
+        usize $at = 0;
+
+        foreach ($this->branches as $i => $branch) {
+            usize $width = $this->widths[$i];
+            Tensor $part = $gradient->columns($at, $width);
+
+            Layer $child = guard $branch->layer else {
+                Parallel::scatter($out, $branch->from, $part);
+                $at = $at + $width;
+                continue;
+            };
+
+            $part = $child->backward($part);
+
+            Parallel::scatter($out, $branch->from, $part);
+            $at = $at + $width;
+        }
+
+        return $out;
+    }
+
+    public const function params() : array<Param>
+    {
+        array<Param> $all = array<Param>();
+
+        foreach ($this->branches as $branch) {
+            Layer $child = guard $branch->layer else {
+                continue;
+            };
+
+            $all->extend($child->params());
+        }
+
+        return $all;
+    }
+
+    public function initialize(Random& $rng) : void
+    {
+        foreach ($this->branches as $branch) {
+            Layer $child = guard $branch->layer else {
+                continue;
+            };
+
+            $child->initialize($rng);
+        }
+    }
+
+    public const function kind() : string
+    {
+        return 'parallel';
+    }
+
+    public const function encode(Encoder $out) : void
+    {
+        $out->size($this->branches->count());
+
+        foreach ($this->branches as $branch) {
+            $out->size($branch->from);
+            $out->size($branch->count);
+            Layer $child = guard $branch->layer else {
+                $out->flag(true);
+                continue;
+            };
+
+            $out->flag(false);
+            $out->layer($child);
+        }
+    }
+
+    public const function summary() : string
+    {
+        string $out = 'parallel';
+
+        foreach ($this->branches as $branch) {
+            usize $to = $branch->from + $branch->count;
+            $out->append("\n  [{$branch->from}..{$to}] ");
+
+            Layer $child = guard $branch->layer else {
+                $out->append('pass');
+                continue;
+            };
+
+            // the child's first line sits on the range, the rest one level deeper
+            string $text = indent($child->summary());
+            $out->append($text->sub(2, $text->size() - 2));
+        }
+
+        return $out;
+    }
+
+    /**
+     * Add `$part` into the columns of `$into` that start at `$from`.
+     */
+    private static function scatter(Tensor& $into, usize $from, const Tensor& $part) : void
+    {
+        usize $rows = $into->rows();
+        usize $width = $into->cols();
+        usize $count = $part->cols();
+
+        foreach (0 .. $rows as $r) {
+            foreach (0 .. $count as $c) {
+                usize $at = $r * $width + $from + $c;
+                $into->data[$at] = $into->data[$at] + $part->data[$r * $count + $c];
+            }
+        }
+    }
+}

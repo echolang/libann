@@ -1,0 +1,232 @@
+/**
+ * The matrix-multiply kernels `Tensor::matmul` and
+ * `Tensor::accumulate(outer:)` run. Kept off `tensor.eco` so that file
+ * stays the shape and the elementwise ops.
+ */
+
+namespace ann;
+
+/**
+ * Add `A · B` into `$into` `[n, m]`. `B` is `$right`'s `[depth, m]` view;
+ * `A` is `[n, depth]`, read through `$left` with the given strides, so
+ * one kernel serves a plain and a transposed left side.
+ */
+internal function gemmProduct(Tensor& $into, ptr<const float64> $left, usize $rowStride, usize $depthStride, const Tensor& $right, usize $n, usize $depth, usize $m) : void
+{
+    usize $rows = $n - $n % 4;
+    usize $cols = $m - $m % 4;
+
+    for (usize $i = 0; $i < $rows; $i = $i + 4) {
+        for (usize $j = 0; $j < $cols; $j = $j + 4) {
+            gemmTile($into, $left:$, $rowStride, $depthStride, $right, $i, $j, $depth, $m);
+        }
+    }
+
+    // what the 4 x 4 tiles leave over: right edge, then bottom rows
+    gemmSpan($into, $left:$, $rowStride, $depthStride, $right, 0, $rows, $cols, $m, $depth, $m);
+    gemmSpan($into, $left:$, $rowStride, $depthStride, $right, $rows, $n, 0, $m, $depth, $m);
+}
+
+/**
+ * Add the 4 x 4 block of `A · B` at row `$i`, column `$j`. The block
+ * lives in eight two-lane registers for the whole walk along `depth`,
+ * so each value of `B` is loaded once per block, not once per output
+ * row.
+ */
+private function gemmTile(Tensor& $into, ptr<const float64> $left, usize $rowStride, usize $depthStride, const Tensor& $right, usize $i, usize $j, usize $depth, usize $m) : void
+{
+    ptr<const float64> $b = $right->data->data();
+    ptr<float64> $out = $into->data->data();
+    usize $r0 = $i * $rowStride;
+    usize $r1 = $r0 + $rowStride;
+    usize $r2 = $r1 + $rowStride;
+    usize $r3 = $r2 + $rowStride;
+    simd<float64, 2> $c00 = simd::splat<float64, 2>(0.0);
+    simd<float64, 2> $c01 = $c00;
+    simd<float64, 2> $c10 = $c00;
+    simd<float64, 2> $c11 = $c00;
+    simd<float64, 2> $c20 = $c00;
+    simd<float64, 2> $c21 = $c00;
+    simd<float64, 2> $c30 = $c00;
+    simd<float64, 2> $c31 = $c00;
+
+    for (usize $p = 0; $p < $depth; $p++) {
+        ptr<const float64> $src = $b:$ + ($p * $m + $j);
+        simd<float64, 2> $b0 = simd::load<float64, 2>($src:$);
+        simd<float64, 2> $b1 = simd::load<float64, 2>($src:$ + 2);
+        usize $at = $p * $depthStride;
+        simd<float64, 2> $a0 = simd::splat<float64, 2>($left:$[$r0 + $at]);
+        simd<float64, 2> $a1 = simd::splat<float64, 2>($left:$[$r1 + $at]);
+        simd<float64, 2> $a2 = simd::splat<float64, 2>($left:$[$r2 + $at]);
+        simd<float64, 2> $a3 = simd::splat<float64, 2>($left:$[$r3 + $at]);
+        $c00 = $c00 + $a0 * $b0;
+        $c01 = $c01 + $a0 * $b1;
+        $c10 = $c10 + $a1 * $b0;
+        $c11 = $c11 + $a1 * $b1;
+        $c20 = $c20 + $a2 * $b0;
+        $c21 = $c21 + $a2 * $b1;
+        $c30 = $c30 + $a3 * $b0;
+        $c31 = $c31 + $a3 * $b1;
+    }
+
+    ptr<float64> $d0 = $out:$ + ($i * $m + $j);
+    ptr<float64> $d1 = $d0:$ + $m;
+    ptr<float64> $d2 = $d1:$ + $m;
+    ptr<float64> $d3 = $d2:$ + $m;
+    gemmDeposit($d0:$, $c00);
+    gemmDeposit($d0:$ + 2, $c01);
+    gemmDeposit($d1:$, $c10);
+    gemmDeposit($d1:$ + 2, $c11);
+    gemmDeposit($d2:$, $c20);
+    gemmDeposit($d2:$ + 2, $c21);
+    gemmDeposit($d3:$, $c30);
+    gemmDeposit($d3:$ + 2, $c31);
+}
+
+/**
+ * Add rows `$fromRow`..`$toRow`, columns `$fromCol`..`$toCol` of
+ * `A · B` one value at a time: tile leftovers, and products too small
+ * to tile. Zero values of `A` (common after ReLU) are skipped.
+ */
+private function gemmSpan(Tensor& $into, ptr<const float64> $left, usize $rowStride, usize $depthStride, const Tensor& $right, usize $fromRow, usize $toRow, usize $fromCol, usize $toCol, usize $depth, usize $m) : void
+{
+    // i-k-j walks both right-hand rows and the output contiguously
+    for (usize $i = $fromRow; $i < $toRow; $i++) {
+        usize $outRow = $i * $m;
+
+        for (usize $p = 0; $p < $depth; $p++) {
+            float64 $a = $left:$[$i * $rowStride + $p * $depthStride];
+
+            if ($a == 0.0) {
+                continue;
+            }
+
+            usize $rightRow = $p * $m;
+
+            for (usize $j = $fromCol; $j < $toCol; $j++) {
+                $into->data[$outRow + $j] = $into->data[$outRow + $j] + $a * $right->data[$rightRow + $j];
+            }
+        }
+    }
+}
+
+/**
+ * Fill `$into` `[n, m]` with row-dots of `$left` `[n, k]` against `$right`
+ * `[m, k]`, four left rows against two right rows at a time.
+ */
+internal function gemmDots(Tensor& $into, const Tensor& $left, const Tensor& $right, usize $n, usize $k, usize $m) : void
+{
+    ptr<const float64> $a = $left->data->data();
+    ptr<const float64> $b = $right->data->data();
+    usize $rows = $n - $n % 4;
+    usize $cols = $m - $m % 2;
+    usize $even = $k - $k % 2;
+
+    for (usize $i = 0; $i < $rows; $i = $i + 4) {
+        ptr<const float64> $x0 = $a:$ + $i * $k;
+        ptr<const float64> $x1 = $x0:$ + $k;
+        ptr<const float64> $x2 = $x1:$ + $k;
+        ptr<const float64> $x3 = $x2:$ + $k;
+
+        for (usize $j = 0; $j < $cols; $j = $j + 2) {
+            ptr<const float64> $y0 = $b:$ + $j * $k;
+            ptr<const float64> $y1 = $y0:$ + $k;
+            simd<float64, 2> $s00 = simd::splat<float64, 2>(0.0);
+            simd<float64, 2> $s01 = $s00;
+            simd<float64, 2> $s10 = $s00;
+            simd<float64, 2> $s11 = $s00;
+            simd<float64, 2> $s20 = $s00;
+            simd<float64, 2> $s21 = $s00;
+            simd<float64, 2> $s30 = $s00;
+            simd<float64, 2> $s31 = $s00;
+
+            for (usize $p = 0; $p < $even; $p = $p + 2) {
+                simd<float64, 2> $u0 = simd::load<float64, 2>($x0:$ + $p);
+                simd<float64, 2> $u1 = simd::load<float64, 2>($x1:$ + $p);
+                simd<float64, 2> $u2 = simd::load<float64, 2>($x2:$ + $p);
+                simd<float64, 2> $u3 = simd::load<float64, 2>($x3:$ + $p);
+                simd<float64, 2> $v0 = simd::load<float64, 2>($y0:$ + $p);
+                simd<float64, 2> $v1 = simd::load<float64, 2>($y1:$ + $p);
+                $s00 = $s00 + $u0 * $v0;
+                $s01 = $s01 + $u0 * $v1;
+                $s10 = $s10 + $u1 * $v0;
+                $s11 = $s11 + $u1 * $v1;
+                $s20 = $s20 + $u2 * $v0;
+                $s21 = $s21 + $u2 * $v1;
+                $s30 = $s30 + $u3 * $v0;
+                $s31 = $s31 + $u3 * $v1;
+            }
+
+            usize $at = $i * $m + $j;
+            $into->data[$at] = gemmClose($s00, $x0:$, $y0:$, $even, $k);
+            $into->data[$at + 1] = gemmClose($s01, $x0:$, $y1:$, $even, $k);
+            $into->data[$at + $m] = gemmClose($s10, $x1:$, $y0:$, $even, $k);
+            $into->data[$at + $m + 1] = gemmClose($s11, $x1:$, $y1:$, $even, $k);
+            $into->data[$at + 2 * $m] = gemmClose($s20, $x2:$, $y0:$, $even, $k);
+            $into->data[$at + 2 * $m + 1] = gemmClose($s21, $x2:$, $y1:$, $even, $k);
+            $into->data[$at + 3 * $m] = gemmClose($s30, $x3:$, $y0:$, $even, $k);
+            $into->data[$at + 3 * $m + 1] = gemmClose($s31, $x3:$, $y1:$, $even, $k);
+        }
+    }
+
+    // odd right row of each block, then the rows below the blocks
+    for (usize $i = 0; $i < $n; $i++) {
+        usize $from = $cols;
+
+        if ($i >= $rows) {
+            $from = 0;
+        }
+
+        for (usize $j = $from; $j < $m; $j++) {
+            $into->data[$i * $m + $j] = gemmInner($a:$ + $i * $k, $b:$ + $j * $k, $k);
+        }
+    }
+}
+
+/**
+ * Dot of `$count` values at `$x` and `$y`, summed in four independent
+ * pairs of lanes so the adds do not wait on each other.
+ */
+internal function gemmInner(ptr<const float64> $x, ptr<const float64> $y, usize $count) : float64
+{
+    simd<float64, 2> $s0 = simd::splat<float64, 2>(0.0);
+    simd<float64, 2> $s1 = $s0;
+    simd<float64, 2> $s2 = $s0;
+    simd<float64, 2> $s3 = $s0;
+    usize $p = 0;
+
+    while ($p + 8 <= $count) {
+        $s0 = $s0 + simd::load<float64, 2>($x:$ + $p) * simd::load<float64, 2>($y:$ + $p);
+        $s1 = $s1 + simd::load<float64, 2>($x:$ + ($p + 2)) * simd::load<float64, 2>($y:$ + ($p + 2));
+        $s2 = $s2 + simd::load<float64, 2>($x:$ + ($p + 4)) * simd::load<float64, 2>($y:$ + ($p + 4));
+        $s3 = $s3 + simd::load<float64, 2>($x:$ + ($p + 6)) * simd::load<float64, 2>($y:$ + ($p + 6));
+        $p = $p + 8;
+    }
+
+    return gemmClose(($s0 + $s1) + ($s2 + $s3), $x:$, $y:$, $p, $count);
+}
+
+/**
+ * Both lanes of `$sum`, plus the products `$from`..`$to` at `$x` and
+ * `$y` that no vector covered.
+ */
+private function gemmClose(simd<float64, 2> $sum, ptr<const float64> $x, ptr<const float64> $y, usize $from, usize $to) : float64
+{
+    float64[2] $lanes = simd::to_array<float64, 2>($sum);
+    float64 $total = $lanes[0] + $lanes[1];
+
+    for (usize $p = $from; $p < $to; $p++) {
+        $total = $total + $x:$[$p] * $y:$[$p];
+    }
+
+    return $total;
+}
+
+/**
+ * Add both lanes of `$v` into the two values at `$at`.
+ */
+private function gemmDeposit(ptr<float64> $at, simd<float64, 2> $v) : void
+{
+    simd<float64, 2> $was = simd::load<float64, 2>($at:$ as ptr<const float64>);
+    simd::store<float64, 2>($at:$, $was + $v);
+}

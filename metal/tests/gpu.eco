@@ -1,0 +1,58 @@
+#[if: os == darwin || os == ios]
+use ann::{Act, Adam, Dataset, Dense, MeanSquaredError, Model, Random, Sequential, Tensor};
+use ann::metal::{Gpu, Objective, Update};
+
+// echoc test forks, and the Metal shader compiler (XPC) does not survive a
+// fork. null is that case: nothing else to check. examples/parity is the
+// real GPU test
+internal function gpu() : Gpu?
+{
+    if (!ann::metal::available()) {
+        return null;
+    }
+
+    $opened = Gpu::open();
+
+    if ($opened->failed()) {
+        $message = $opened->failure()->message();
+        assert($message->contains('XPC') || $message->contains('Compiler') || $message->contains('compiler'));
+        echo 'skipped: no shader compiler in a forked test';
+        return null;
+    }
+
+    return $opened->unwrap();
+}
+
+test gpu_step_matches_the_cpu
+{
+    $device = guard gpu() else {
+        return;
+    }
+
+    $rng = Random(2);
+    array<usize> $inShape = [16, 5];
+    array<usize> $outShape = [16, 2];
+    $x = Tensor($inShape);
+    $y = Tensor($outShape);
+
+    foreach (0 .. $x->data->count() as $i) {
+        $x->data[$i] = $rng->uniform(-1.0, 1.0);
+    }
+
+    foreach (0 .. $y->data->count() as $i) {
+        $y->data[$i] = $rng->uniform(-1.0, 1.0);
+    }
+
+    $data = Dataset($x, $y);
+    $cpu = Model(Sequential()->add(Dense(5, 7))->add(Act(.tanh))->add(Dense(7, 2)), $seed: 3);
+    $host = Model(Sequential()->add(Dense(5, 7))->add(Act(.tanh))->add(Dense(7, 2)), $seed: 3);
+
+    $net = guard $device->mirror($host, $batch: 16) else ($e) {
+        die("{$e}");
+    }
+
+    $want = $cpu->learn($data, MeanSquaredError(), Adam());
+    $got = $net->learn($data, Objective::mse(MeanSquaredError()), Update::adam(Adam()));
+    assert(std::math::abs($want - $got) < 0.0001);
+}
+#[end]

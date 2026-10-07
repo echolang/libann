@@ -1,16 +1,16 @@
 /**
- * Sample indices, reshuffled and cut into minibatches. `Trainer` and
- * `ann::rl::Ppo` walk their data this way.
+ * Sample indices, reshuffled and cut into minibatches. `Trainer`,
+ * `ann::metal::Trainer` and `ann::rl::Ppo` walk their data this way.
  */
 
 namespace ann;
 
-internal struct Batches
+public struct Batches
 {
     /**
      * Every index once, in the current order.
      */
-    internal array<usize> $order;
+    public array<usize> $order;
 
     private usize $size;
 
@@ -18,7 +18,7 @@ internal struct Batches
      * Indices `0 .. $n`, cut `$size` at a time. Size 0 is the whole set as
      * one batch.
      */
-    internal constructor(usize $n, usize $size = 0)
+    public constructor(usize $n, usize $size = 0)
     {
         array<usize> $order = arr::room<usize>($n);
 
@@ -38,7 +38,7 @@ internal struct Batches
     /**
      * Shuffle in place. Starts from the last order, not the identity.
      */
-    internal function shuffle(Random& $rng) : void
+    public function shuffle(Random& $rng) : void
     {
         $rng->shuffle($this->order);
     }
@@ -46,7 +46,7 @@ internal struct Batches
     /**
      * Batches per pass: `all()->count()` without cutting them.
      */
-    internal const function count() : usize
+    public const function count() : usize
     {
         usize $n = $this->order->count();
 
@@ -60,7 +60,7 @@ internal struct Batches
     /**
      * Current order as consecutive batches of `size`. Last one may be smaller.
      */
-    internal const function all() : array<array<usize>>
+    public const function all() : array<array<usize>>
     {
         usize $n = $this->order->count();
         array<array<usize>> $out = array<array<usize>>();

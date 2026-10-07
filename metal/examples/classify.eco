@@ -1,0 +1,121 @@
+/*
+ * A 64 -> 512 -> 512 -> 10 classifier, trained on the GPU and served from
+ * the CPU. The labels come from a fixed random "teacher" network, so there
+ * is something real to learn. After `fit` the host model holds the trained
+ * weights: it is saved, loaded back into a fresh model, and scored on the
+ * CPU, which must agree with what the GPU measured.
+ *
+ *   echoc run --package-dir ../vendor --target classify
+ */
+
+use ann::{Act, Adam, CrossEntropy, Dataset, Dense, EpochReport, Evaluation, Log, Model, Random, Sequential, Tensor};
+use ann::cli;
+use ann::metal::{Gpu, Objective, Trainer, Update};
+
+internal const usize INPUTS = 64;
+internal const usize CLASSES = 10;
+internal const usize SAMPLES = 50000;
+
+internal function gaussian(Random& $rng, usize $rows, usize $cols, float64 $deviation) : Tensor
+{
+    array<usize> $shape = [$rows, $cols];
+    $t = Tensor($shape);
+
+    foreach (0 .. $t->data->count() as $i) {
+        $t->data[$i] = $rng->normal(0.0, $deviation);
+    }
+
+    return $t;
+}
+
+// label = argmax of tanh(x . a) . b, a fixed network nobody trains
+internal function teacher(uint64 $seed) : Dataset
+{
+    $rng = Random($seed);
+    $x = gaussian($rng, SAMPLES, INPUTS, 1.0);
+    $a = gaussian($rng, INPUTS, 32, 0.1);
+    $b = gaussian($rng, 32, CLASSES, 1.0);
+    $scores = $x->matmul($a)->map(function(float64 $v) : float64 { return std::math::tanh($v); })->matmul($b);
+    array<usize> $labels = arr::room<usize>(SAMPLES);
+
+    for (usize $r = 0; $r < SAMPLES; $r++) {
+        usize $best = 0;
+
+        for (usize $c = 1; $c < CLASSES; $c++) {
+            if ($scores->data[$r * CLASSES + $c] > $scores->data[$r * CLASSES + $best]) {
+                $best = $c;
+            }
+        }
+
+        $labels[] = $best;
+    }
+
+    return Dataset($x, Tensor(oneHot: $labels, classes: CLASSES));
+}
+
+internal function network() : Sequential
+{
+    return Sequential()
+        ->add(Dense(INPUTS, 512, .he))
+        ->add(Act(.gelu))
+        ->add(Dense(512, 512, .he))
+        ->add(Act(.gelu))
+        ->add(Dense(512, CLASSES));
+}
+
+$gpu = guard Gpu::open() else ($e) {
+    die("{$e}");
+}
+
+$split = teacher(42)->split(0.1, $seed: 7);
+$model = Model(network(), $seed: 1);
+$log = Log()->to(cli::Console($every: 1));
+$log->begin("classify on {$gpu->name()}");
+$log->model($model);
+
+$net = guard $gpu->mirror($model, $batch: 256) else ($e) {
+    die("{$e}");
+}
+
+$adam = Adam(0.001);
+$trainer = Trainer(
+    $epochs: 10,
+    $batchSize: 256,
+    $metric: .accuracy,
+    $validation: $split->holdout,
+    $observer: $log->training(),
+    $onEpoch: function(EpochReport $r) : void {
+        if ($r->epoch == 7) {
+            $adam->rate = $adam->rate * 0.3;
+        }
+    },
+);
+
+guard $trainer->fit($net, Objective::crossEntropy(CrossEntropy()), Update::adam($adam), $split->train) else ($e) {
+    die("{$e}");
+}
+
+$onGpu = $net->evaluate($split->holdout, Objective::crossEntropy(CrossEntropy()), .accuracy);
+$path = 'classify.ann';
+
+guard $model->save($path) else ($e) {
+    die("save failed: {$e}");
+}
+
+$loaded = guard Model::load($path) else ($e) {
+    die("load failed: {$e}");
+}
+
+std::io::remove($path);
+$onCpu = $loaded->evaluate($split->holdout, CrossEntropy(), .accuracy);
+
+$table = $log->table(['', 'validation loss', 'validation accuracy']);
+$table->row(['gpu, before saving', "{$onGpu->loss:.4f}", "{$onGpu->metric:.4f}"]);
+$table->row(['cpu, after loading', "{$onCpu->loss:.4f}", "{$onCpu->metric:.4f}"]);
+$log->note($path, $table);
+
+if (std::math::abs($onGpu->metric - $onCpu->metric) > 0.005) {
+    die('the cpu and the gpu disagree on the trained model');
+}
+
+$log->end('done');

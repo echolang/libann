@@ -1,0 +1,221 @@
+use ann::{Act, Broadcast, Dense, Layer, Model, Parallel, Permute, PerSlot, Pool, Sequential, Tensor};
+
+const SETS_TOLERANCE = 0.000001;
+
+internal function row(const array<float64>& $values) : Tensor
+{
+    array<usize> $s = [1, $values->count()];
+    return Tensor($s, $values);
+}
+
+// 4 slots of 3 features: encode, pool into a context, hand it back, score, regroup
+internal function setNet() : Sequential
+{
+    $encoder = Sequential()
+        ->add(Dense(3, 5))
+        ->add(Act(.tanh));
+
+    $context = Sequential()
+        ->add(Pool(4, .meanMax))
+        ->add(Dense(10, 3))
+        ->add(Act(.tanh));
+
+    return Sequential()
+        ->add(PerSlot(4, $encoder))
+        ->add(Parallel()->add(0, 20, $context)->pass(0, 20))
+        ->add(Broadcast(3, 4))
+        ->add(PerSlot(4, Dense(8, 2)))
+        ->add(Permute(slots: 4, width: 2));
+}
+
+#[group: "sets"]
+test parallel_gradients_match_finite_differences
+{
+    // column 2 is read twice, column 6 not at all
+    Layer $layer = initialized(Parallel()->pass(0, 3)->add(2, 4, Dense(4, 3)));
+    $x = noise(shape(4, 7), 31);
+    assert(gradientError($layer, $x) < SETS_TOLERANCE);
+    assert($layer->params()->count() == 2);
+
+    $out = $layer->forward($x, .train);
+    assert($out->rows() == 4 && $out->cols() == 6);
+}
+
+#[group: "sets"]
+test parallel_adds_overlapping_gradients
+{
+    Layer $layer = Parallel()->pass(0, 2)->pass(1, 2);
+    array<float64> $x = [1.0, 2.0, 3.0, 4.0];
+    $out = $layer->forward(row($x), .train);
+    array<float64> $copied = [1.0, 2.0, 2.0, 3.0];
+    assert(identical($out, row($copied)));
+
+    array<float64> $ones = [1.0, 1.0, 1.0, 1.0];
+    $back = $layer->backward(row($ones));
+    array<float64> $summed = [1.0, 2.0, 1.0, 0.0];
+    assert(identical($back, row($summed)));
+}
+
+#[group: "sets"]
+#[tests: expects death]
+test parallel_refuses_a_range_past_the_input
+{
+    Layer $layer = Parallel()->pass(2, 4);
+    $layer->forward(noise(shape(2, 5), 32), .infer);
+}
+
+#[group: "sets"]
+test perslot_gradients_match_finite_differences
+{
+    Layer $dense = initialized(PerSlot(3, Dense(4, 2)));
+    assert(gradientError($dense, noise(shape(4, 12), 33)) < SETS_TOLERANCE);
+
+    $inner = Sequential()
+        ->add(Dense(4, 3))
+        ->add(Act(.tanh));
+    Layer $chain = initialized(PerSlot(3, $inner));
+    assert(gradientError($chain, noise(shape(2, 12), 34)) < SETS_TOLERANCE);
+}
+
+#[group: "sets"]
+test perslot_shares_one_layer_across_slots
+{
+    $dense = Dense(2, 3);
+    Layer $layer = initialized(PerSlot(4, $dense));
+    $x = noise(shape(5, 8), 35);
+    $out = $layer->forward($x, .infer);
+    assert($out->rows() == 5 && $out->cols() == 12);
+
+    // slot 2 of row 3 is the inner layer on that slot alone
+    Tensor $alone = $dense->forward($x->row(3)->columns(4, 2), .infer);
+    assert(identical($out->row(3)->columns(6, 3), $alone));
+}
+
+#[group: "sets"]
+test pool_gradients_match_finite_differences
+{
+    Layer $mean = Pool(4, .mean);
+    Layer $max = Pool(4, .max);
+    Layer $both = Pool(4, .meanMax);
+    $x = noise(shape(3, 20), 36);
+    assert(gradientError($mean, $x) < SETS_TOLERANCE);
+    assert(gradientError($max, $x) < SETS_TOLERANCE);
+    assert(gradientError($both, $x) < SETS_TOLERANCE);
+
+    assert($mean->forward($x, .infer)->cols() == 5);
+    assert($both->forward($x, .infer)->cols() == 10);
+}
+
+#[group: "sets"]
+test pool_takes_mean_then_max
+{
+    // slots (1, 5) (9, 2) (3, 7)
+    Layer $layer = Pool(3, .meanMax);
+    array<float64> $x = [1.0, 5.0, 9.0, 2.0, 3.0, 7.0];
+    array<float64> $pooled = [13.0 / 3.0, 14.0 / 3.0, 9.0, 7.0];
+    assert(identical($layer->forward(row($x), .infer), row($pooled), 0.000000000001));
+}
+
+#[group: "sets"]
+test pool_max_routes_to_the_winning_slot
+{
+    Layer $layer = Pool(3, .max);
+    array<float64> $x = [1.0, 5.0, 9.0, 2.0, 3.0, 7.0];
+    $layer->forward(row($x), .train);
+    array<float64> $g = [10.0, 20.0];
+    array<float64> $routed = [0.0, 0.0, 10.0, 0.0, 0.0, 20.0];
+    assert(identical($layer->backward(row($g)), row($routed)));
+
+    // on a tie the first slot wins
+    array<float64> $tied = [4.0, 4.0, 4.0, 1.0];
+    Layer $pair = Pool(2, .max);
+    $pair->forward(row($tied), .train);
+    array<float64> $first = [10.0, 20.0, 0.0, 0.0];
+    assert(identical($pair->backward(row($g)), row($first)));
+}
+
+#[group: "sets"]
+test broadcast_gradients_match_finite_differences
+{
+    Layer $layer = Broadcast(2, 3);
+    $x = noise(shape(3, 14), 37);
+    assert(gradientError($layer, $x) < SETS_TOLERANCE);
+    assert($layer->forward($x, .infer)->cols() == 18);
+}
+
+#[group: "sets"]
+test broadcast_copies_the_context_and_sums_its_gradient
+{
+    // context (c0, c1), then slots (a0, a1) (b0, b1) (d0, d1)
+    Layer $layer = Broadcast(2, 3);
+    array<float64> $x = [100.0, 200.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    $out = $layer->forward(row($x), .train);
+    array<float64> $laid = [1.0, 2.0, 100.0, 200.0, 3.0, 4.0, 100.0, 200.0, 5.0, 6.0, 100.0, 200.0];
+    assert(identical($out, row($laid)));
+
+    array<float64> $g = [1.0, 2.0, 10.0, 20.0, 3.0, 4.0, 30.0, 40.0, 5.0, 6.0, 50.0, 60.0];
+    array<float64> $back = [90.0, 120.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    assert(identical($layer->backward(row($g)), row($back)));
+}
+
+#[group: "sets"]
+test permute_gradients_match_finite_differences
+{
+    // column 0 twice, columns 1 and 3 dropped
+    array<usize> $order = [4, 0, 0, 2];
+    Layer $picked = Permute($order);
+    assert(gradientError($picked, noise(shape(3, 5), 38)) < SETS_TOLERANCE);
+
+    Layer $regrouped = Permute(slots: 3, width: 2);
+    assert(gradientError($regrouped, noise(shape(3, 6), 39)) < SETS_TOLERANCE);
+}
+
+#[group: "sets"]
+test permute_regroups_slots_into_fields
+{
+    $layer = Permute(slots: 3, width: 2);
+    array<usize> $order = [0, 2, 4, 1, 3, 5];
+    assert($layer->order->count() == $order->count());
+
+    foreach ($order as $j => $column) {
+        assert($layer->order[$j] == $column);
+    }
+
+    // (a0, b0) (a1, b1) (a2, b2) becomes a0 a1 a2 b0 b1 b2
+    array<float64> $x = [1.0, 10.0, 2.0, 20.0, 3.0, 30.0];
+    array<float64> $fields = [1.0, 2.0, 3.0, 10.0, 20.0, 30.0];
+    assert(identical($layer->forward(row($x), .infer), row($fields)));
+}
+
+#[group: "sets"]
+test set_network_gradients_match_finite_differences
+{
+    Layer $net = initialized(setNet());
+    assert(gradientError($net, noise(shape(3, 12), 40)) < SETS_TOLERANCE);
+    assert($net->params()->count() == 6);
+}
+
+#[group: "sets"]
+test set_network_round_trips_through_a_file
+{
+    $dir = std::env::tmp();
+    $path = "{$dir}/libann-test-sets.ann";
+    $model = Model(setNet(), $seed: 4);
+
+    guard $model->save($path) else ($e) {
+        assert(false, 'save failed');
+        return;
+    }
+
+    Model $loaded = guard Model::load($path) else ($e) {
+        std::io::remove($path);
+        assert(false, 'load failed');
+        return;
+    }
+
+    std::io::remove($path);
+    $x = noise(shape(5, 12), 41);
+    assert(identical($model->predict($x), $loaded->predict($x)));
+    assert($loaded->summary() == $model->summary());
+    assert($loaded->encode() == $model->encode());
+}

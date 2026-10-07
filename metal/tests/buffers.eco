@@ -1,0 +1,67 @@
+#[if: os == darwin || os == ios]
+use ann::Tensor;
+use ann::metal::Matrix;
+
+// a shared buffer needs a device but not the shader compiler, so this
+// runs under the forking test runner
+internal function matrix(usize $rows, usize $cols) : Matrix?
+{
+    $device = guard mtl::Device::systemDefault() else {
+        return null;
+    }
+
+    $buffer = guard $device->newBuffer($rows * $cols * 4) else {
+        return null;
+    }
+
+    return Matrix($buffer, $rows, $cols);
+}
+
+test matrix_round_trips_through_float32
+{
+    $m = guard matrix(4, 3) else {
+        return;
+    }
+
+    array<usize> $shape = [3, 3];
+    $data = [1.0, -2.5, 0.125, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    $t = Tensor($shape, $data);
+
+    // rows 1 and 2 of the tensor into the top two rows
+    $m->load($t, 1, 2);
+    $back = Tensor($shape);
+    $m->read($back, 1, 2);
+
+    assert($back->data[0] == 0.0);
+    assert($back->data[3] == 3.0);
+    assert($back->data[8] == 8.0);
+    assert($m->total(6) == 33.0);
+}
+
+test matrix_rounds_to_float32
+{
+    $m = guard matrix(1, 1) else {
+        return;
+    }
+
+    array<usize> $shape = [1, 1];
+    $data = [0.1];
+    $t = Tensor($shape, $data);
+    $m->load($t, 0, 1);
+    $back = Tensor($shape);
+    $m->read($back, 0, 1);
+
+    assert($back->data[0] != 0.1);
+    assert(std::math::abs($back->data[0] - 0.1) < 0.00000001);
+}
+
+test matrix_fill_covers_the_capacity
+{
+    $m = guard matrix(5, 2) else {
+        return;
+    }
+
+    $m->fill(0.5);
+    assert($m->total(10) == 5.0);
+}
+#[end]

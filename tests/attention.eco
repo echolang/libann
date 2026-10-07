@@ -1,0 +1,126 @@
+use ann::{Act, Conv2D, Dense, Layer, MaxPool2D, Model, Pool, Residual, SelfAttention, Sequential, Tensor};
+
+const ATTENTION_TOLERANCE = 0.000001;
+
+// slot s of the result is slot order[s] of $x, for every row
+internal function shuffled(const Tensor& $x, const array<usize>& $order, usize $width) : Tensor
+{
+    Tensor $out = $x;
+    usize $cols = $x->cols();
+
+    foreach (0 .. $x->rows() as $r) {
+        foreach ($order as $s => $from) {
+            foreach (0 .. $width as $k) {
+                $out->data[$r * $cols + $s * $width + $k] = $x->data[$r * $cols + $from * $width + $k];
+            }
+        }
+    }
+
+    return $out;
+}
+
+// a 6x6 picture: conv, pool to 3x3, the 9 pixels attend to each other, mean, classify
+internal function visionNet() : Sequential
+{
+    return Sequential()
+        ->add(Conv2D(1, 4, 6, 6))
+        ->add(Act(.tanh))
+        ->add(MaxPool2D(4, 6, 6))
+        ->add(Residual(SelfAttention(9, 4, $heads: 2)))
+        ->add(Pool(9, .mean))
+        ->add(Dense(4, 2));
+}
+
+#[group: "attention"]
+test attention_gradients_match_finite_differences
+{
+    Layer $single = initialized(SelfAttention(3, 4));
+    assert(gradientError($single, noise(shape(2, 12), 71)) < ATTENTION_TOLERANCE);
+
+    Layer $multi = initialized(SelfAttention(4, 6, $heads: 3));
+    assert(gradientError($multi, noise(shape(2, 24), 72)) < ATTENTION_TOLERANCE);
+
+    // every value of a slot its own head
+    Layer $narrow = initialized(SelfAttention(3, 2, $heads: 2));
+    assert(gradientError($narrow, noise(shape(3, 6), 73)) < ATTENTION_TOLERANCE);
+}
+
+#[group: "attention"]
+test attention_keeps_the_shape
+{
+    $layer = SelfAttention(5, 8, $heads: 2);
+    assert($layer->outputs() == 40);
+    assert($layer->params()->count() == 8);
+
+    initialized($layer);
+    $out = $layer->forward(noise(shape(3, 40), 74), .infer);
+    assert($out->rows() == 3 && $out->cols() == 40);
+}
+
+#[group: "attention"]
+test attention_with_equal_scores_takes_the_mean
+{
+    // no query projection: every score is zero, so every slot gets the mean value
+    $layer = SelfAttention(3, 2);
+
+    for (usize $d = 0; $d < 2; $d++) {
+        $layer->value->value->data[$d * 2 + $d] = 1.0;
+        $layer->output->value->data[$d * 2 + $d] = 1.0;
+        $layer->key->value->data[$d * 2 + $d] = 3.0;
+    }
+
+    array<float64> $x = [1.0, 10.0, 2.0, 20.0, 6.0, 60.0];
+    array<float64> $mean = [3.0, 30.0, 3.0, 30.0, 3.0, 30.0];
+    array<usize> $s = [1, 6];
+    assert(identical($layer->forward(Tensor($s, $x), .infer), Tensor($s, $mean), 0.000000000001));
+}
+
+#[group: "attention"]
+test attention_permuting_slots_permutes_the_output
+{
+    Layer $layer = initialized(SelfAttention(4, 6, $heads: 2));
+    $x = noise(shape(3, 24), 75);
+    array<usize> $order = [2, 0, 3, 1];
+    $out = $layer->forward($x, .infer);
+    $moved = $layer->forward(shuffled($x, $order, 6), .infer);
+    assert(identical($moved, shuffled($out, $order, 6), 0.000000000001));
+}
+
+#[group: "attention"]
+#[tests: expects death]
+test attention_refuses_heads_that_do_not_split_the_width
+{
+    SelfAttention(3, 6, $heads: 4);
+}
+
+#[group: "attention"]
+test vision_network_gradients_match_finite_differences
+{
+    Layer $net = initialized(visionNet());
+    assert(gradientError($net, noise(shape(2, 36), 76)) < ATTENTION_TOLERANCE);
+}
+
+#[group: "attention"]
+test vision_network_round_trips_through_a_file
+{
+    $dir = std::env::tmp();
+    $path = "{$dir}/libann-test-vision.ann";
+    $model = Model(visionNet(), $seed: 6);
+
+    guard $model->save($path) else ($e) {
+        assert(false, 'save failed');
+        return;
+    }
+
+    Model $loaded = guard Model::load($path) else ($e) {
+        std::io::remove($path);
+        assert(false, 'load failed');
+        return;
+    }
+
+    std::io::remove($path);
+    $x = noise(shape(4, 36), 77);
+    assert(identical($model->predict($x), $loaded->predict($x)));
+    assert($loaded->summary() == $model->summary());
+    assert($loaded->encode() == $model->encode());
+}
