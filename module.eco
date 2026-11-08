@@ -11,6 +11,7 @@
 
 #[module: "libann"]
 #[version: "0.2.1"] // x-release-please-version
+#[epm::echoc: ">=0.14.0"]
 #[epm::license: "MIT"]
 #[epm::description: "A small artificial neural network trainer & runner library for echo."]
 

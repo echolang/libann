@@ -357,7 +357,7 @@ public class Model
 
     private static function write(const string& $path, const string& $bytes) : status<ModelError>
     {
-        guard std::io::writefile($path, $bytes) else ($e) {
+        guard std::fs::writefile($path, $bytes) else ($e) {
             return .error(.io($e));
         }
 
@@ -366,7 +366,7 @@ public class Model
 
     private static function read(const string& $path) : result<string, ModelError>
     {
-        string $bytes = guard std::io::readfile($path) else ($e) {
+        string $bytes = guard std::fs::readfile($path) else ($e) {
             return .error(.io($e));
         }
 

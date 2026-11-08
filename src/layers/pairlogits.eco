@@ -1,0 +1,210 @@
+/**
+ * Scores pairs of slots, a policy over moves that take something from one
+ * slot to another. The input is `[rows, pairs + slots * 2 * width]`: first
+ * `pairs` codes, each `from * slots + to` or negative for an unused place,
+ * then every slot as a source half and a target half of `width` values.
+ * The output is `[rows, pairs]`: the source half of `from` against the
+ * target half of `to`, scaled by `1 / sqrt(width)`, and `EMPTY_PAIR` for
+ * an unused place so a softmax gives it nothing.
+ *
+ *     // 128 move codes, then 121 cells of 64 values
+ *     Sequential()
+ *         ->add(Parallel()->pass(0, 128)->add(128, 121 * 64, PerSlot(121, Dense(64, 32))))
+ *         ->add(PairLogits(121, 16, 128));
+ *
+ * No params. The codes get no gradient.
+ */
+
+namespace ann;
+
+/**
+ * What an unused place scores: far enough down that a softmax over the
+ * row gives it nothing, near enough that float32 stays finite.
+ */
+public const float64 EMPTY_PAIR = -1000000000.0;
+
+public class PairLogits : Layer
+{
+    /**
+     * Slots a pair may name.
+     */
+    public const usize $slots;
+
+    /**
+     * Values per half: every slot carries `2 * width`.
+     */
+    public const usize $width;
+
+    /**
+     * Places for pairs per row, the output width.
+     */
+    public const usize $pairs;
+
+    private Tensor $input;
+
+    init
+    {
+        if ($this->slots == 0 || $this->width == 0 || $this->pairs == 0) {
+            die('ann::PairLogits: needs slots, values and places for pairs');
+        }
+
+        array<usize> $empty = [0, $this->inputs()];
+        $this->input = Tensor($empty);
+    }
+
+    public static function decode(Decoder $in, Registry $registry) : result<Layer, ModelError>
+    {
+        usize $slots = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        usize $width = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        usize $pairs = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        if ($slots == 0 || $width == 0 || $pairs == 0) {
+            return .error(.badValue($pairs as uint64));
+        }
+
+        Layer $layer = PairLogits($slots, $width, $pairs);
+        return .ok($layer);
+    }
+
+    /**
+     * Values per input sample: the codes, then both halves of every slot.
+     */
+    public const function inputs() : usize
+    {
+        return $this->pairs + $this->slots * 2 * $this->width;
+    }
+
+    public function forward(const Tensor& $input, Mode $mode) : Tensor
+    {
+        if ($input->cols() != $this->inputs()) {
+            usize $each = 2 * $this->width;
+            die("ann::PairLogits: expected {$this->pairs} codes and {$this->slots} slots of {$each} = {$this->inputs()} values per sample, got {$input->cols()}");
+        }
+
+        usize $rows = $input->rows();
+        usize $cols = $this->inputs();
+        float64 $scale = 1.0 / std::math::sqrt($this->width as float64);
+        array<usize> $shape = [$rows, $this->pairs];
+        Tensor $out = Tensor($shape);
+
+        for (usize $r = 0; $r < $rows; $r++) {
+            for (usize $p = 0; $p < $this->pairs; $p++) {
+                usize? $named = $this->pair($input, $r, $p);
+
+                if ($named == null) {
+                    $out->data[$r * $this->pairs + $p] = EMPTY_PAIR;
+                    continue;
+                }
+
+                usize $code = $named ?? 0;
+                usize $source = $r * $cols + $this->half($code / $this->slots, 0);
+                usize $target = $r * $cols + $this->half($code % $this->slots, 1);
+                float64 $sum = 0.0;
+
+                for (usize $k = 0; $k < $this->width; $k++) {
+                    $sum = $sum + $input->data[$source + $k] * $input->data[$target + $k];
+                }
+
+                $out->data[$r * $this->pairs + $p] = $sum * $scale;
+            }
+        }
+
+        if ($mode == Mode::train) {
+            $this->input = $input;
+        }
+
+        return $out;
+    }
+
+    public function backward(const Tensor& $gradient) : Tensor
+    {
+        usize $rows = $this->input->rows();
+        usize $cols = $this->inputs();
+        float64 $scale = 1.0 / std::math::sqrt($this->width as float64);
+        Tensor $out = Tensor($this->input->shape);
+
+        for (usize $r = 0; $r < $rows; $r++) {
+            for (usize $p = 0; $p < $this->pairs; $p++) {
+                usize? $named = $this->pair($this->input, $r, $p);
+
+                if ($named == null) {
+                    continue;
+                }
+
+                usize $code = $named ?? 0;
+                usize $source = $r * $cols + $this->half($code / $this->slots, 0);
+                usize $target = $r * $cols + $this->half($code % $this->slots, 1);
+                float64 $g = $gradient->data[$r * $this->pairs + $p] * $scale;
+
+                for (usize $k = 0; $k < $this->width; $k++) {
+                    $out->data[$source + $k] = $out->data[$source + $k] + $g * $this->input->data[$target + $k];
+                    $out->data[$target + $k] = $out->data[$target + $k] + $g * $this->input->data[$source + $k];
+                }
+            }
+        }
+
+        return $out;
+    }
+
+    public const function params() : array<Param>
+    {
+        return array<Param>();
+    }
+
+    public function initialize(Random& $rng) : void
+    {
+    }
+
+    public const function kind() : string
+    {
+        return 'pairlogits';
+    }
+
+    public const function encode(Encoder $out) : void
+    {
+        $out->size($this->slots);
+        $out->size($this->width);
+        $out->size($this->pairs);
+    }
+
+    public const function summary() : string
+    {
+        return "pairlogits {$this->pairs} pairs of {$this->slots} slots, halves of {$this->width}";
+    }
+
+    /**
+     * The pair code at place `$p` of row `$r`, or null for an unused place.
+     */
+    private const function pair(const Tensor& $input, usize $r, usize $p) : usize?
+    {
+        float64 $raw = $input->data[$r * $this->inputs() + $p];
+
+        if ($raw < 0.0) {
+            return null;
+        }
+
+        usize $code = $raw as usize;
+
+        if ($code >= $this->slots * $this->slots) {
+            die("ann::PairLogits: pair code {$code} names a slot past {$this->slots}");
+        }
+
+        return $code;
+    }
+
+    /**
+     * Column of half `$which` (0 source, 1 target) of slot `$s`.
+     */
+    private const function half(usize $s, usize $which) : usize
+    {
+        return $this->pairs + ($s * 2 + $which) * $this->width;
+    }
+}

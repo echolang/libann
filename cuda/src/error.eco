@@ -1,0 +1,73 @@
+/**
+ * What can go wrong putting a model on the GPU. Shape bugs in a call (a
+ * batch wider than the network) still `die`, the way libann does.
+ */
+
+namespace ann::cuda;
+
+public enum GpuError
+{
+    /**
+     * No driver, no NVRTC or no device. The text says which.
+     */
+    case unavailable(string $why);
+
+    /**
+     * The kernels did not compile. The text is NVRTC's log.
+     */
+    case compile(string $message);
+
+    /**
+     * The device refused memory, or a copy failed.
+     */
+    case device(string $message);
+
+    /**
+     * A layer kind the GPU does not run, by its path in the network.
+     */
+    case unsupported(string $where, string $kind);
+
+    /**
+     * A layer takes a different width than the one before it gives, or
+     * the network's input width cannot be told from its layers.
+     */
+    case shape(string $why);
+
+    public const function message() : string
+    {
+        return match ($this) {
+            .unavailable($why) => $why,
+            .compile($message) => GpuError::compiled($message),
+            .device($message) => $message,
+            .unsupported($where, $kind) => GpuError::foreign($where, $kind),
+            .shape($why) => $why,
+        };
+    }
+
+    private static function compiled(const string& $message) : string
+    {
+        string $out = 'kernels did not compile: ';
+        $out->append($message);
+        return $out;
+    }
+
+    private static function foreign(const string& $where, const string& $kind) : string
+    {
+        return "layer {$where} is a {$kind}, which the GPU does not run";
+    }
+}
+
+/**
+ * Whether this machine can run `ann::cuda`: a driver, NVRTC and a device.
+ */
+public function available() : bool
+{
+    return cuda::available();
+}
+
+namespace str;
+
+public function from(const ann::cuda::GpuError& $e) : string
+{
+    return $e->message();
+}

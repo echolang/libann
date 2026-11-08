@@ -64,6 +64,15 @@ public class Registry
         $this->add('attention', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
             return SelfAttention::decode($in, $r);
         });
+        $this->add('embedding', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
+            return Embedding::decode($in, $r);
+        });
+        $this->add('pairlogits', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
+            return PairLogits::decode($in, $r);
+        });
+        $this->add('relattention', function(Decoder $in, Registry $r) : result<Layer, ModelError> {
+            return SelfAttention::relative($in, $r);
+        });
     }
 
     /**

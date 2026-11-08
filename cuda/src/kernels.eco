@@ -1,0 +1,1206 @@
+/**
+ * The CUDA kernels, compiled once per `Gpu` by NVRTC. Arguments come by
+ * value in the order each kernel declares them; see `cuda::Args`. All
+ * float32, row-major.
+ *
+ * The source is a single-quoted string, so it holds no backslashes and no
+ * single quotes: echoc would read them as escapes or the string's end.
+ *
+ * No fast math: expf, logf, tanhf and sqrtf stay the precise ones, so the
+ * GPU tracks the CPU path.
+ */
+
+namespace ann::cuda;
+
+internal const KERNELS = '
+#define TILE 64
+#define DEPTH 16
+#define GROUP 256
+#define MAX_SLOTS 64
+#define MAX_CODES 64
+
+// C[m, n] = sum over k of A[m, k] B[k, n], strides given, so one kernel is
+// A.B, A.Bt and At.B. 16 x 16 threads, each owns a 4 x 4 block of a 64 x 64
+// tile. flags: 1 adds bias[n], 2 adds into C instead of overwriting it, 4
+// splits k over blockIdx.z, every split adding its part into C atomically
+// (C zeroed first unless it accumulates), for a small C over a long k.
+extern "C" __global__ void matmul(
+    const float* A, const float* B, float* C, const float* bias,
+    unsigned int M, unsigned int N, unsigned int K,
+    unsigned int sam, unsigned int sak, unsigned int sbk, unsigned int sbn,
+    unsigned int flags, unsigned int chunk)
+{
+    __shared__ float as[DEPTH][TILE];
+    __shared__ float bs[DEPTH][TILE];
+
+    const unsigned int tx = threadIdx.x;
+    const unsigned int ty = threadIdx.y;
+    const unsigned int index = ty * 16 + tx;
+    const unsigned int row0 = blockIdx.y * TILE;
+    const unsigned int col0 = blockIdx.x * TILE;
+    float acc[4][4];
+
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            acc[i][j] = 0.0f;
+        }
+    }
+
+    const bool split = (flags & 4) != 0;
+    const unsigned int kFirst = split ? blockIdx.z * chunk : 0;
+    const unsigned int kEnd = split ? min(K, kFirst + chunk) : K;
+
+    for (unsigned int k0 = kFirst; k0 < kEnd; k0 += DEPTH) {
+        // walk memory in whichever direction is contiguous
+        for (unsigned int e = index; e < TILE * DEPTH; e += GROUP) {
+            unsigned int m;
+            unsigned int k;
+
+            if (sak == 1) {
+                m = e / DEPTH;
+                k = e % DEPTH;
+            } else {
+                k = e / TILE;
+                m = e % TILE;
+            }
+
+            unsigned int gm = row0 + m;
+            unsigned int gk = k0 + k;
+            as[k][m] = (gm < M && gk < kEnd) ? A[(size_t)gm * sam + (size_t)gk * sak] : 0.0f;
+        }
+
+        for (unsigned int e = index; e < TILE * DEPTH; e += GROUP) {
+            unsigned int n;
+            unsigned int k;
+
+            if (sbn == 1) {
+                k = e / TILE;
+                n = e % TILE;
+            } else {
+                n = e / DEPTH;
+                k = e % DEPTH;
+            }
+
+            unsigned int gn = col0 + n;
+            unsigned int gk = k0 + k;
+            bs[k][n] = (gn < N && gk < kEnd) ? B[(size_t)gk * sbk + (size_t)gn * sbn] : 0.0f;
+        }
+
+        __syncthreads();
+
+        for (unsigned int k = 0; k < DEPTH; k++) {
+            float x[4];
+            float y[4];
+
+            for (int i = 0; i < 4; i++) {
+                x[i] = as[k][ty * 4 + i];
+                y[i] = bs[k][tx * 4 + i];
+            }
+
+            for (int i = 0; i < 4; i++) {
+                for (int j = 0; j < 4; j++) {
+                    acc[i][j] += x[i] * y[j];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    for (unsigned int i = 0; i < 4; i++) {
+        unsigned int gm = row0 + ty * 4 + i;
+
+        if (gm >= M) {
+            continue;
+        }
+
+        for (unsigned int j = 0; j < 4; j++) {
+            unsigned int gn = col0 + tx * 4 + j;
+
+            if (gn < N) {
+                float v = acc[i][j];
+
+                if ((flags & 1) && (!split || blockIdx.z == 0)) {
+                    v += bias[gn];
+                }
+
+                size_t at = (size_t)gm * N + gn;
+
+                if (split) {
+                    atomicAdd(&C[at], v);
+                } else if (flags & 2) {
+                    C[at] += v;
+                } else {
+                    C[at] = v;
+                }
+            }
+        }
+    }
+}
+
+__device__ float logistic(float x)
+{
+    if (x >= 0.0f) {
+        return 1.0f / (1.0f + expf(-x));
+    }
+
+    float e = expf(x);
+    return e / (1.0f + e);
+}
+
+__device__ float geluInner(float x)
+{
+    return 0.7978845608028654f * (x + 0.044715f * x * x * x);
+}
+
+// codes are ann::Activation values
+__device__ float activate(unsigned int kind, float x)
+{
+    switch (kind) {
+        case 1: return fmaxf(x, 0.0f);
+        case 2: return x > 0.0f ? x : 0.01f * x;
+        case 3: return logistic(x);
+        case 4: return tanhf(x);
+        case 5: return 0.5f * x * (1.0f + tanhf(geluInner(x)));
+        case 6: return fmaxf(x, 0.0f) + logf(1.0f + expf(-fabsf(x)));
+        case 7: return x > 0.0f ? x : expf(x) - 1.0f;
+        case 8: return x * logistic(x);
+        default: return x;
+    }
+}
+
+__device__ float derive(unsigned int kind, float x, float y)
+{
+    switch (kind) {
+        case 1: return x > 0.0f ? 1.0f : 0.0f;
+        case 2: return x > 0.0f ? 1.0f : 0.01f;
+        case 3: return y * (1.0f - y);
+        case 4: return 1.0f - y * y;
+        case 5: {
+            float t = tanhf(geluInner(x));
+            float inner = 0.7978845608028654f * (1.0f + 3.0f * 0.044715f * x * x);
+            return 0.5f * (1.0f + t) + 0.5f * x * (1.0f - t * t) * inner;
+        }
+        case 6: return logistic(x);
+        case 7: return x > 0.0f ? 1.0f : y + 1.0f;
+        case 8: {
+            float s = logistic(x);
+            return s + x * s * (1.0f - s);
+        }
+        default: return 1.0f;
+    }
+}
+
+extern "C" __global__ void act(const float* x, float* y, unsigned int n, unsigned int kind)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < n) {
+        y[i] = activate(kind, x[i]);
+    }
+}
+
+extern "C" __global__ void slope(const float* x, const float* y, const float* g, float* out, unsigned int n, unsigned int kind)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < n) {
+        out[i] = g[i] * derive(kind, x[i], y[i]);
+    }
+}
+
+// out = a + b, out may be a
+extern "C" __global__ void add(const float* a, const float* b, float* out, unsigned int n)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < n) {
+        out[i] = a[i] + b[i];
+    }
+}
+
+// sums of the rows of g, and with x the sums of g * x, per column, added
+// into sums and products, which start zeroed. 32 x 8 threads, 32 columns a
+// block; blockIdx.y takes a run of `chunk` rows, the 8 lanes walk it and
+// are reduced at the end. x may be null; then only the sums are written.
+extern "C" __global__ void columns(const float* g, const float* x, float* sums, float* products, unsigned int rows, unsigned int cols, unsigned int chunk)
+{
+    __shared__ float a[8][33];
+    __shared__ float b[8][33];
+    const unsigned int c = blockIdx.x * 32 + threadIdx.x;
+    const unsigned int first = blockIdx.y * chunk;
+    const unsigned int end = min(rows, first + chunk);
+    float s = 0.0f;
+    float p = 0.0f;
+
+    if (c < cols) {
+        for (unsigned int r = first + threadIdx.y; r < end; r += 8) {
+            float v = g[(size_t)r * cols + c];
+            s += v;
+
+            if (x != 0) {
+                p += v * x[(size_t)r * cols + c];
+            }
+        }
+    }
+
+    a[threadIdx.y][threadIdx.x] = s;
+    b[threadIdx.y][threadIdx.x] = p;
+    __syncthreads();
+
+    if (threadIdx.y == 0 && c < cols) {
+        float total = 0.0f;
+        float product = 0.0f;
+
+        for (int k = 0; k < 8; k++) {
+            total += a[k][threadIdx.x];
+            product += b[k][threadIdx.x];
+        }
+
+        atomicAdd(&sums[c], total);
+
+        if (x != 0) {
+            atomicAdd(&products[c], product);
+        }
+    }
+}
+
+// dst row r = src row idx[r]
+extern "C" __global__ void gather(const float* src, const unsigned int* idx, float* dst, unsigned int rows, unsigned int cols)
+{
+    unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (y < rows && x < cols) {
+        dst[(size_t)y * cols + x] = src[(size_t)idx[y] * cols + x];
+    }
+}
+
+// one thread per row: weighted row loss, and the row of d(loss)/d(output)
+// already weighted and divided by the batch. codes: 0 mse, 1 mae, 2 huber,
+// 3 binary cross-entropy, 4 softmax cross-entropy, 5 sigmoid cross-entropy
+extern "C" __global__ void loss(
+    const float* out, const float* target, const float* weight, float* losses, float* grad,
+    unsigned int rows, unsigned int cols, unsigned int kind, float p, float invRows)
+{
+    unsigned int r = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (r >= rows) {
+        return;
+    }
+
+    const float scale = weight[r] * invRows;
+    const float n = (float)cols;
+    const size_t base = (size_t)r * cols;
+    float total = 0.0f;
+
+    if (kind == 4) {
+        float top = out[base];
+
+        for (unsigned int c = 1; c < cols; c++) {
+            top = fmaxf(top, out[base + c]);
+        }
+
+        float sum = 0.0f;
+
+        for (unsigned int c = 0; c < cols; c++) {
+            sum += expf(out[base + c] - top);
+        }
+
+        const float lse = top + logf(sum);
+
+        for (unsigned int c = 0; c < cols; c++) {
+            float t = target[base + c] * (1.0f - p) + p / n;
+            float o = out[base + c];
+
+            if (t != 0.0f) {
+                total -= t * (o - lse);
+            }
+
+            grad[base + c] = scale * (expf(o - lse) - t);
+        }
+
+        losses[r] = weight[r] * total;
+        return;
+    }
+
+    for (unsigned int c = 0; c < cols; c++) {
+        float o = out[base + c];
+        float t = target[base + c];
+        float d = o - t;
+        float l;
+        float g;
+
+        if (kind == 1) {
+            l = fabsf(d);
+            g = d > 0.0f ? 1.0f : (d < 0.0f ? -1.0f : 0.0f);
+        } else if (kind == 2) {
+            float ad = fabsf(d);
+            l = ad <= p ? 0.5f * d * d : p * (ad - 0.5f * p);
+            g = fminf(fmaxf(d, -p), p);
+        } else if (kind == 3) {
+            float q = fminf(fmaxf(o, 1e-7f), 1.0f - 1e-7f);
+            l = -(t * logf(q) + (1.0f - t) * logf(1.0f - q));
+            g = (q - t) / (q * (1.0f - q));
+        } else if (kind == 5) {
+            l = fmaxf(o, 0.0f) - o * t + logf(1.0f + expf(-fabsf(o)));
+            g = logistic(o) - t;
+        } else {
+            l = d * d;
+            g = 2.0f * d;
+        }
+
+        total += l / n;
+        grad[base + c] = scale * g / n;
+    }
+
+    losses[r] = weight[r] * total;
+}
+
+// partial sums of squares, one per block, into partials[offset + block]
+extern "C" __global__ void squares(const float* g, float* partials, unsigned int n, unsigned int offset)
+{
+    __shared__ float shared[GROUP];
+    const unsigned int index = threadIdx.x;
+    float s = 0.0f;
+
+    for (unsigned int i = blockIdx.x * GROUP + index; i < n; i += gridDim.x * GROUP) {
+        s += g[i] * g[i];
+    }
+
+    shared[index] = s;
+    __syncthreads();
+
+    for (unsigned int stride = GROUP / 2; stride > 0; stride /= 2) {
+        if (index < stride) {
+            shared[index] += shared[index + stride];
+        }
+
+        __syncthreads();
+    }
+
+    if (index == 0) {
+        partials[offset + blockIdx.x] = shared[0];
+    }
+}
+
+// global L2 from the partials, then the factor that brings it under the limit
+extern "C" __global__ void clip(const float* partials, float* scale, unsigned int count, float limit)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+
+    float sum = 0.0f;
+
+    for (unsigned int k = 0; k < count; k++) {
+        sum += partials[k];
+    }
+
+    const float norm = sqrtf(sum);
+    scale[0] = norm > limit ? limit / norm : 1.0f;
+}
+
+extern "C" __global__ void adam(
+    float* w, const float* g, float* m, float* v, const float* scale,
+    unsigned int n, float beta1, float beta2, float rate, float epsilon, float decay, float correct1, float correct2)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i >= n) {
+        return;
+    }
+
+    const float gi = g[i] * scale[0];
+    const float mi = beta1 * m[i] + (1.0f - beta1) * gi;
+    const float vi = beta2 * v[i] + (1.0f - beta2) * gi * gi;
+    m[i] = mi;
+    v[i] = vi;
+
+    const float wi = w[i];
+    const float update = (mi / correct1) / (sqrtf(vi / correct2) + epsilon);
+    w[i] = wi - rate * (update + decay * wi);
+}
+
+extern "C" __global__ void sgd(float* w, const float* g, float* velocity, const float* scale, unsigned int n, float rate, float momentum, unsigned int nesterov)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i >= n) {
+        return;
+    }
+
+    const float gi = g[i] * scale[0];
+    float update = gi;
+
+    if (momentum != 0.0f) {
+        float v = momentum * velocity[i] + gi;
+        velocity[i] = v;
+        update = nesterov != 0 ? gi + momentum * v : v;
+    }
+
+    w[i] = w[i] - rate * update;
+}
+
+__device__ float warpSum(float v)
+{
+    for (int offset = 16; offset > 0; offset /= 2) {
+        v += __shfl_xor_sync(0xffffffffu, v, offset);
+    }
+
+    return v;
+}
+
+__device__ float warpMax(float v)
+{
+    for (int offset = 16; offset > 0; offset /= 2) {
+        v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, offset));
+    }
+
+    return v;
+}
+
+// one warp per row: normalize, keep the normalized row and 1 / deviation
+extern "C" __global__ void normForward(
+    const float* x, float* y, float* xhat, float* inv, const float* gamma, const float* beta,
+    unsigned int rows, unsigned int cols, float epsilon)
+{
+    const unsigned int r = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    const unsigned int lane = threadIdx.x % 32;
+
+    if (r >= rows) {
+        return;
+    }
+
+    const size_t base = (size_t)r * cols;
+    const float n = (float)cols;
+    float mean = 0.0f;
+
+    for (unsigned int c = lane; c < cols; c += 32) {
+        mean += x[base + c];
+    }
+
+    mean = warpSum(mean) / n;
+    float variance = 0.0f;
+
+    for (unsigned int c = lane; c < cols; c += 32) {
+        float d = x[base + c] - mean;
+        variance += d * d;
+    }
+
+    variance = warpSum(variance);
+    const float iv = 1.0f / sqrtf(variance / n + epsilon);
+
+    if (lane == 0) {
+        inv[r] = iv;
+    }
+
+    for (unsigned int c = lane; c < cols; c += 32) {
+        float h = (x[base + c] - mean) * iv;
+        xhat[base + c] = h;
+        y[base + c] = h * gamma[c] + beta[c];
+    }
+}
+
+// one warp per row: the gradient of the input
+extern "C" __global__ void normBackward(
+    const float* g, const float* xhat, const float* inv, const float* gamma, float* out,
+    unsigned int rows, unsigned int cols)
+{
+    const unsigned int r = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    const unsigned int lane = threadIdx.x % 32;
+
+    if (r >= rows) {
+        return;
+    }
+
+    const size_t base = (size_t)r * cols;
+    const float n = (float)cols;
+    float meanSlope = 0.0f;
+    float meanSlopeX = 0.0f;
+
+    for (unsigned int c = lane; c < cols; c += 32) {
+        float slope = g[base + c] * gamma[c];
+        meanSlope += slope;
+        meanSlopeX += slope * xhat[base + c];
+    }
+
+    meanSlope = warpSum(meanSlope) / n;
+    meanSlopeX = warpSum(meanSlopeX) / n;
+    const float iv = inv[r];
+
+    for (unsigned int c = lane; c < cols; c += 32) {
+        float slope = g[base + c] * gamma[c];
+        out[base + c] = iv * (slope - meanSlope - xhat[base + c] * meanSlopeX);
+    }
+}
+
+// one thread per row and column of the slot width: mean and or max over
+// the slots. mode: 0 mean, 1 max, 2 mean then max
+extern "C" __global__ void poolForward(const float* x, float* y, unsigned int* winners, unsigned int rows, unsigned int slots, unsigned int h, unsigned int mode)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i >= rows * h) {
+        return;
+    }
+
+    const unsigned int r = i / h;
+    const unsigned int k = i % h;
+    const size_t base = (size_t)r * slots * h;
+    const unsigned int blocks = mode == 2 ? 2 : 1;
+    const unsigned int width = h * blocks;
+    const unsigned int peakAt = width - h;
+    float sum = 0.0f;
+    unsigned int best = 0;
+    float peak = x[base + k];
+
+    for (unsigned int s = 0; s < slots; s++) {
+        float v = x[base + s * h + k];
+        sum += v;
+
+        if (v > peak) {
+            peak = v;
+            best = s;
+        }
+    }
+
+    if (mode != 1) {
+        y[(size_t)r * width + k] = sum / (float)slots;
+    }
+
+    if (mode != 0) {
+        y[(size_t)r * width + peakAt + k] = peak;
+    }
+
+    winners[i] = best;
+}
+
+extern "C" __global__ void poolBackward(const float* g, const unsigned int* winners, float* out, unsigned int rows, unsigned int slots, unsigned int h, unsigned int mode)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i >= rows * h) {
+        return;
+    }
+
+    const unsigned int r = i / h;
+    const unsigned int k = i % h;
+    const size_t base = (size_t)r * slots * h;
+    const unsigned int blocks = mode == 2 ? 2 : 1;
+    const unsigned int width = h * blocks;
+    const unsigned int peakAt = width - h;
+    float share = 0.0f;
+
+    if (mode != 1) {
+        share = g[(size_t)r * width + k] / (float)slots;
+    }
+
+    for (unsigned int s = 0; s < slots; s++) {
+        out[base + s * h + k] = share;
+    }
+
+    if (mode != 0) {
+        out[base + winners[i] * h + k] += g[(size_t)r * width + peakAt + k];
+    }
+}
+
+// one thread per row, head and query slot: softmax weights over the key
+// slots into P, and the weighted values into that head of M
+extern "C" __global__ void attend(
+    const float* Q, const float* K, const float* V, float* P, float* M,
+    unsigned int rows, unsigned int slots, unsigned int width, unsigned int heads, float scale)
+{
+    unsigned int t = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (t >= rows * heads * slots) {
+        return;
+    }
+
+    const unsigned int i = t % slots;
+    const unsigned int h = (t / slots) % heads;
+    const unsigned int r = t / (slots * heads);
+    const unsigned int d = width / heads;
+    const size_t first = (size_t)r * slots;
+    const size_t qi = (first + i) * width + h * d;
+    const size_t row = (((size_t)r * heads + h) * slots + i) * slots;
+    float score[MAX_SLOTS];
+    float peak = 0.0f;
+
+    for (unsigned int j = 0; j < slots; j++) {
+        const size_t kj = (first + j) * width + h * d;
+        float s = 0.0f;
+
+        for (unsigned int u = 0; u < d; u++) {
+            s += Q[qi + u] * K[kj + u];
+        }
+
+        s = s * scale;
+
+        if (j == 0 || s > peak) {
+            peak = s;
+        }
+
+        score[j] = s;
+    }
+
+    float total = 0.0f;
+
+    for (unsigned int j = 0; j < slots; j++) {
+        score[j] = expf(score[j] - peak);
+        total += score[j];
+    }
+
+    for (unsigned int u = 0; u < d; u++) {
+        M[qi + u] = 0.0f;
+    }
+
+    for (unsigned int j = 0; j < slots; j++) {
+        const float a = score[j] / total;
+        P[row + j] = a;
+        const size_t vj = (first + j) * width + h * d;
+
+        for (unsigned int u = 0; u < d; u++) {
+            M[qi + u] += a * V[vj + u];
+        }
+    }
+}
+
+// backward, one thread per row, head and query slot: the score gradients
+// into dS and the query gradient of that slot
+extern "C" __global__ void unattendQuery(
+    const float* dM, const float* K, const float* V, const float* P, float* dS, float* dQ,
+    unsigned int rows, unsigned int slots, unsigned int width, unsigned int heads, float scale)
+{
+    unsigned int t = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (t >= rows * heads * slots) {
+        return;
+    }
+
+    const unsigned int i = t % slots;
+    const unsigned int h = (t / slots) % heads;
+    const unsigned int r = t / (slots * heads);
+    const unsigned int d = width / heads;
+    const size_t first = (size_t)r * slots;
+    const size_t qi = (first + i) * width + h * d;
+    const size_t row = (((size_t)r * heads + h) * slots + i) * slots;
+    float da[MAX_SLOTS];
+    float expected = 0.0f;
+
+    for (unsigned int j = 0; j < slots; j++) {
+        const size_t vj = (first + j) * width + h * d;
+        float s = 0.0f;
+
+        for (unsigned int u = 0; u < d; u++) {
+            s += dM[qi + u] * V[vj + u];
+        }
+
+        da[j] = s;
+        expected += P[row + j] * s;
+    }
+
+    for (unsigned int u = 0; u < d; u++) {
+        dQ[qi + u] = 0.0f;
+    }
+
+    for (unsigned int j = 0; j < slots; j++) {
+        const float ds = P[row + j] * (da[j] - expected) * scale;
+        dS[row + j] = ds;
+        const size_t kj = (first + j) * width + h * d;
+
+        for (unsigned int u = 0; u < d; u++) {
+            dQ[qi + u] += ds * K[kj + u];
+        }
+    }
+}
+
+// backward, one thread per row, head and key slot: the key and value
+// gradients of that slot, summed over the query slots
+extern "C" __global__ void unattendKeys(
+    const float* dM, const float* Q, const float* P, const float* dS, float* dK, float* dV,
+    unsigned int rows, unsigned int slots, unsigned int width, unsigned int heads)
+{
+    unsigned int t = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (t >= rows * heads * slots) {
+        return;
+    }
+
+    const unsigned int j = t % slots;
+    const unsigned int h = (t / slots) % heads;
+    const unsigned int r = t / (slots * heads);
+    const unsigned int d = width / heads;
+    const size_t first = (size_t)r * slots;
+    const size_t kj = (first + j) * width + h * d;
+    const size_t head = ((size_t)r * heads + h) * slots;
+
+    for (unsigned int u = 0; u < d; u++) {
+        float k = 0.0f;
+        float v = 0.0f;
+
+        for (unsigned int i = 0; i < slots; i++) {
+            const size_t qi = (first + i) * width + h * d;
+            const size_t at = (head + i) * slots + j;
+            k += dS[at] * Q[qi + u];
+            v += P[at] * dM[qi + u];
+        }
+
+        dK[kj + u] = k;
+        dV[kj + u] = v;
+    }
+}
+// C = bias in every row, or C += bias with add
+extern "C" __global__ void setBias(const float* bias, float* C, unsigned int rows, unsigned int cols, unsigned int add)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i >= rows * cols) {
+        return;
+    }
+
+    const float b = bias[i % cols];
+    C[i] = add != 0 ? C[i] + b : b;
+}
+
+// count columns of every row from src at srcAt into dst at dstAt, or added
+extern "C" __global__ void copyColumns(
+    const float* src, unsigned int srcStride, unsigned int srcAt,
+    float* dst, unsigned int dstStride, unsigned int dstAt,
+    unsigned int rows, unsigned int count, unsigned int add)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i >= rows * count) {
+        return;
+    }
+
+    const unsigned int r = i / count;
+    const unsigned int c = i % count;
+    const float v = src[(size_t)r * srcStride + srcAt + c];
+    const size_t to = (size_t)r * dstStride + dstAt + c;
+    dst[to] = add != 0 ? dst[to] + v : v;
+}
+
+// one warp per score row (row, head, query slot): add the relation bias,
+// then a stable softmax over the key slots, in place
+extern "C" __global__ void softmaxRows(
+    float* P, const float* bias, const unsigned int* pos,
+    unsigned int total, unsigned int slots, unsigned int heads, unsigned int relations)
+{
+    const unsigned int t = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    const unsigned int lane = threadIdx.x % 32;
+
+    if (t >= total) {
+        return;
+    }
+
+    const unsigned int i = t % slots;
+    const unsigned int h = (t / slots) % heads;
+    float* row = P + (size_t)t * slots;
+    float peak = -3.0e38f;
+
+    for (unsigned int j = lane; j < slots; j += 32) {
+        float s = row[j];
+
+        if (relations > 0) {
+            s += bias[h * relations + pos[i * slots + j]];
+            row[j] = s;
+        }
+
+        peak = fmaxf(peak, s);
+    }
+
+    peak = warpMax(peak);
+    float sum = 0.0f;
+
+    for (unsigned int j = lane; j < slots; j += 32) {
+        float e = expf(row[j] - peak);
+        row[j] = e;
+        sum += e;
+    }
+
+    const float inv = 1.0f / warpSum(sum);
+
+    for (unsigned int j = lane; j < slots; j += 32) {
+        row[j] = row[j] * inv;
+    }
+}
+
+// one warp per score row: dS holds d(loss)/d(weights) and becomes the
+// gradient of the scores before the softmax
+extern "C" __global__ void softmaxBack(const float* P, float* dS, unsigned int total, unsigned int slots)
+{
+    const unsigned int t = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    const unsigned int lane = threadIdx.x % 32;
+
+    if (t >= total) {
+        return;
+    }
+
+    const size_t base = (size_t)t * slots;
+    float expected = 0.0f;
+
+    for (unsigned int j = lane; j < slots; j += 32) {
+        expected += P[base + j] * dS[base + j];
+    }
+
+    expected = warpSum(expected);
+
+    for (unsigned int j = lane; j < slots; j += 32) {
+        dS[base + j] = P[base + j] * (dS[base + j] - expected);
+    }
+}
+
+// one thread per head, query and key slot: the score gradient summed over
+// the rows, added to the bias of that pair relation
+extern "C" __global__ void biasGrad(
+    const float* dS, const unsigned int* pos, float* dBias,
+    unsigned int rows, unsigned int slots, unsigned int heads, unsigned int relations)
+{
+    unsigned int t = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int square = slots * slots;
+
+    if (t >= heads * square) {
+        return;
+    }
+
+    const unsigned int h = t / square;
+    const unsigned int ij = t % square;
+    float sum = 0.0f;
+
+    for (unsigned int r = 0; r < rows; r++) {
+        sum += dS[((size_t)r * heads + h) * square + ij];
+    }
+
+    atomicAdd(&dBias[h * relations + pos[ij]], sum);
+}
+
+// one thread per row, slot and value: the code row plus the slot row
+extern "C" __global__ void embed(
+    const float* codes, const float* table, const float* position, float* out,
+    unsigned int rows, unsigned int slots, unsigned int width)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i >= rows * slots * width) {
+        return;
+    }
+
+    const unsigned int k = i % width;
+    const unsigned int rs = i / width;
+    const unsigned int s = rs % slots;
+    const unsigned int code = (unsigned int)codes[rs];
+    out[i] = table[(size_t)code * width + k] + position[(size_t)s * width + k];
+}
+
+// the code table gradient: blockIdx.y takes a run of chunk tokens, each
+// thread one value of every code; sums go into tableGrad, zeroed first
+extern "C" __global__ void embedGrad(
+    const float* codes, const float* g, float* tableGrad,
+    unsigned int tokens, unsigned int width, unsigned int vocabulary, unsigned int chunk)
+{
+    const unsigned int k = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (k >= width) {
+        return;
+    }
+
+    float sums[MAX_CODES];
+
+    for (unsigned int c = 0; c < vocabulary; c++) {
+        sums[c] = 0.0f;
+    }
+
+    const unsigned int first = blockIdx.y * chunk;
+    const unsigned int end = min(tokens, first + chunk);
+
+    for (unsigned int t = first; t < end; t++) {
+        sums[(unsigned int)codes[t]] += g[(size_t)t * width + k];
+    }
+
+    for (unsigned int c = 0; c < vocabulary; c++) {
+        if (sums[c] != 0.0f) {
+            atomicAdd(&tableGrad[(size_t)c * width + k], sums[c]);
+        }
+    }
+}
+
+// the slot rows gradient: one thread per slot and value, over the rows
+extern "C" __global__ void positionGrad(const float* g, float* positionGrad, unsigned int rows, unsigned int slots, unsigned int width)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i >= slots * width) {
+        return;
+    }
+
+    const size_t stride = (size_t)slots * width;
+    float sum = 0.0f;
+
+    for (unsigned int r = 0; r < rows; r++) {
+        sum += g[(size_t)r * stride + i];
+    }
+
+    positionGrad[i] = sum;
+}
+
+// one thread per row and pair place: the source half of from against the
+// target half of to, or empty for an unused place
+extern "C" __global__ void pairForward(
+    const float* in, float* out, unsigned int rows, unsigned int cols, unsigned int pairs,
+    unsigned int slots, unsigned int width, float scale, float empty)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i >= rows * pairs) {
+        return;
+    }
+
+    const unsigned int r = i / pairs;
+    const unsigned int p = i % pairs;
+    const float raw = in[(size_t)r * cols + p];
+
+    if (raw < 0.0f) {
+        out[i] = empty;
+        return;
+    }
+
+    const unsigned int code = (unsigned int)raw;
+    const size_t source = (size_t)r * cols + pairs + (size_t)((code / slots) * 2) * width;
+    const size_t target = (size_t)r * cols + pairs + (size_t)((code % slots) * 2 + 1) * width;
+    float sum = 0.0f;
+
+    for (unsigned int k = 0; k < width; k++) {
+        sum += in[source + k] * in[target + k];
+    }
+
+    out[i] = sum * scale;
+}
+
+// one thread per row and pair place: its gradient into both halves it
+// read, added into gradIn, zeroed first
+extern "C" __global__ void pairBackward(
+    const float* in, const float* g, float* gradIn, unsigned int rows, unsigned int cols,
+    unsigned int pairs, unsigned int slots, unsigned int width, float scale)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i >= rows * pairs) {
+        return;
+    }
+
+    const unsigned int r = i / pairs;
+    const unsigned int p = i % pairs;
+    const float raw = in[(size_t)r * cols + p];
+
+    if (raw < 0.0f) {
+        return;
+    }
+
+    const unsigned int code = (unsigned int)raw;
+    const size_t source = (size_t)r * cols + pairs + (size_t)((code / slots) * 2) * width;
+    const size_t target = (size_t)r * cols + pairs + (size_t)((code % slots) * 2 + 1) * width;
+    const float d = g[i] * scale;
+
+    for (unsigned int k = 0; k < width; k++) {
+        atomicAdd(&gradIn[source + k], d * in[target + k]);
+        atomicAdd(&gradIn[target + k], d * in[source + k]);
+    }
+}
+// one thread per row: one part of the output scored, its rows of the loss
+// written (or added with more) and its gradient columns written, already
+// weighted and divided by the batch. kind 0 softmax with targets for the
+// first `targets` columns, 1 gauss bins over [a, b] of width c bins around
+// one target, 2 sigmoid cross-entropy, 3 squared error
+extern "C" __global__ void parts(
+    const float* out, const float* target, const float* weight, float* losses, float* grad,
+    unsigned int rows, unsigned int outStride, unsigned int outAt, unsigned int cols,
+    unsigned int targetStride, unsigned int targetAt, unsigned int targets,
+    unsigned int kind, float a, float b, float c, float partWeight, float invRows, unsigned int more)
+{
+    unsigned int r = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (r >= rows) {
+        return;
+    }
+
+    const float w = weight[r] * partWeight;
+    const float scale = w * invRows;
+    const float* o = out + (size_t)r * outStride + outAt;
+    const float* t = target + (size_t)r * targetStride + targetAt;
+    float* g = grad + (size_t)r * outStride + outAt;
+    float total = 0.0f;
+
+    if (kind == 0 || kind == 1) {
+        float top = o[0];
+
+        for (unsigned int k = 1; k < cols; k++) {
+            top = fmaxf(top, o[k]);
+        }
+
+        float sum = 0.0f;
+
+        for (unsigned int k = 0; k < cols; k++) {
+            sum += expf(o[k] - top);
+        }
+
+        const float lse = top + logf(sum);
+        const float y = t[0];
+        const float width = (b - a) / (float)cols;
+        const float spread = c * width * 1.4142135623730951f;
+        float mass = 1.0f;
+
+        if (kind == 1) {
+            mass = 0.5f * (erff((b - y) / spread) - erff((a - y) / spread));
+            mass = fmaxf(mass, 1e-12f);
+        }
+
+        for (unsigned int k = 0; k < cols; k++) {
+            float p;
+
+            if (kind == 0) {
+                p = k < targets ? t[k] : 0.0f;
+            } else {
+                float left = a + (float)k * width;
+                p = 0.5f * (erff((left + width - y) / spread) - erff((left - y) / spread)) / mass;
+            }
+
+            if (p != 0.0f) {
+                total -= p * (o[k] - lse);
+            }
+
+            g[k] = scale * (expf(o[k] - lse) - p);
+        }
+    } else if (kind == 4) {
+        const float z = o[0];
+        const float y = t[0];
+        total = fmaxf(z, 0.0f) - z * y + logf(1.0f + expf(-fabsf(z)));
+        float slope = logistic(z) - y;
+        const int back = (int)t[1];
+        const int size = (int)t[2];
+
+        if (size > 1) {
+            const float* first = out + (size_t)(r - back) * outStride + outAt;
+            const float* firstTarget = target + (size_t)(r - back) * targetStride + targetAt;
+            float topNet = -1e30f;
+            float topTeacher = -1e30f;
+
+            for (int j = 0; j < size; j++) {
+                float yj = fminf(fmaxf(firstTarget[(size_t)j * targetStride], 1e-6f), 1.0f - 1e-6f);
+                topNet = fmaxf(topNet, first[(size_t)j * outStride] / a);
+                topTeacher = fmaxf(topTeacher, logf(yj / (1.0f - yj)) / a);
+            }
+
+            float sumNet = 0.0f;
+            float sumTeacher = 0.0f;
+
+            for (int j = 0; j < size; j++) {
+                float yj = fminf(fmaxf(firstTarget[(size_t)j * targetStride], 1e-6f), 1.0f - 1e-6f);
+                sumNet += expf(first[(size_t)j * outStride] / a - topNet);
+                sumTeacher += expf(logf(yj / (1.0f - yj)) / a - topTeacher);
+            }
+
+            float yc = fminf(fmaxf(y, 1e-6f), 1.0f - 1e-6f);
+            float logP = z / a - topNet - logf(sumNet);
+            float q = expf(logf(yc / (1.0f - yc)) / a - topTeacher) / sumTeacher;
+            total += b * (-q * logP);
+            slope += b * (expf(logP) - q) / a;
+        }
+
+        g[0] = scale * slope;
+    } else {
+        const float n = (float)cols;
+
+        for (unsigned int k = 0; k < cols; k++) {
+            float d = o[k] - t[k];
+            float l;
+            float slope;
+
+            if (kind == 2) {
+                l = fmaxf(o[k], 0.0f) - o[k] * t[k] + logf(1.0f + expf(-fabsf(o[k])));
+                slope = logistic(o[k]) - t[k];
+            } else {
+                l = d * d;
+                slope = 2.0f * d;
+            }
+
+            total += l / n;
+            g[k] = scale * slope / n;
+        }
+    }
+
+    losses[r] = more != 0 ? losses[r] + w * total : w * total;
+}
+';
+
+/**
+ * One handle per kernel in `KERNELS`.
+ */
+internal struct Kernels
+{
+    internal cuda::Kernel $matmul;
+    internal cuda::Kernel $act;
+    internal cuda::Kernel $slope;
+    internal cuda::Kernel $add;
+    internal cuda::Kernel $columns;
+    internal cuda::Kernel $gather;
+    internal cuda::Kernel $loss;
+    internal cuda::Kernel $squares;
+    internal cuda::Kernel $clip;
+    internal cuda::Kernel $adam;
+    internal cuda::Kernel $sgd;
+    internal cuda::Kernel $normForward;
+    internal cuda::Kernel $normBackward;
+    internal cuda::Kernel $poolForward;
+    internal cuda::Kernel $poolBackward;
+    internal cuda::Kernel $attend;
+    internal cuda::Kernel $unattendQuery;
+    internal cuda::Kernel $unattendKeys;
+    internal cuda::Kernel $setBias;
+    internal cuda::Kernel $copyColumns;
+    internal cuda::Kernel $softmaxRows;
+    internal cuda::Kernel $softmaxBack;
+    internal cuda::Kernel $biasGrad;
+    internal cuda::Kernel $embed;
+    internal cuda::Kernel $embedGrad;
+    internal cuda::Kernel $positionGrad;
+    internal cuda::Kernel $pairForward;
+    internal cuda::Kernel $pairBackward;
+    internal cuda::Kernel $parts;
+}
+
+/**
+ * Most slots `SelfAttention` may have: the kernels keep a row of scores in
+ * registers.
+ */
+internal const usize MAX_SLOTS = 64;
+
+/**
+ * Most codes an `Embedding` may have on the GPU: the gradient kernel sums
+ * every code in registers.
+ */
+internal const usize MAX_CODES = 64;
+
+/**
+ * Compile `KERNELS` and look every kernel up.
+ */
+internal function compile(cuda::Device $device) : result<Kernels, GpuError>
+{
+    cuda::Module $module = guard $device->compile(KERNELS) else ($e) {
+        return .error(.compile($e->message()));
+    }
+
+    array<string> $names = ['matmul', 'act', 'slope', 'add', 'columns', 'gather', 'loss', 'squares', 'clip', 'adam', 'sgd', 'normForward', 'normBackward', 'poolForward', 'poolBackward', 'attend', 'unattendQuery', 'unattendKeys', 'setBias', 'copyColumns', 'softmaxRows', 'softmaxBack', 'biasGrad', 'embed', 'embedGrad', 'positionGrad', 'pairForward', 'pairBackward', 'parts'];
+    array<cuda::Kernel> $found = array<cuda::Kernel>();
+
+    foreach ($names as $name) {
+        cuda::Kernel $k = guard $module->kernel($name) else ($e) {
+            return .error(.compile($e->message()));
+        }
+
+        $found[] = $k;
+    }
+
+    return .ok(Kernels($found[0], $found[1], $found[2], $found[3], $found[4], $found[5], $found[6], $found[7], $found[8], $found[9], $found[10], $found[11], $found[12], $found[13], $found[14], $found[15], $found[16], $found[17], $found[18], $found[19], $found[20], $found[21], $found[22], $found[23], $found[24], $found[25], $found[26], $found[27], $found[28]));
+}

@@ -66,7 +66,7 @@ public class FileLog : Sink
      */
     public constructor(string $path, Format $format = .jsonl)
     {
-        std::io::file $out = guard std::io::create($path) else ($e) {
+        std::io::file $out = guard std::fs::create($path) else ($e) {
             die("ann::FileLog: cannot open {$path}: {$e}");
         }
 

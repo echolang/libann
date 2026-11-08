@@ -1,0 +1,1033 @@
+/**
+ * The device side of each layer. A stage reads the matrix before it and
+ * writes the one after; backward reads the gradient after it and writes
+ * the one before, plus its params' gradients. Every gradient is written,
+ * not accumulated: one backward per step, and every param belongs to one
+ * layer.
+ *
+ * Stages nest the way the layers do: a sequence runs its children, a
+ * residual adds its input to its branch, a per-slot stage runs its inner
+ * stage on the slots stacked as rows.
+ */
+
+namespace ann::cuda;
+
+use ann::Param;
+
+/**
+ * Most squares partials one param writes.
+ */
+internal const usize MAX_GROUPS = 64;
+
+/**
+ * A host `Param` mirrored on the device, with its gradient and the
+ * optimizer's running state.
+ */
+internal class Slot
+{
+    internal Param $param;
+    internal usize $size;
+    internal Matrix $value;
+    internal Matrix $grad;
+
+    /**
+     * Adam's first moment, or SGD's velocity.
+     */
+    internal Matrix $first;
+
+    /**
+     * Adam's second moment.
+     */
+    internal Matrix $second;
+
+    /**
+     * Squares blocks, and where their partials start.
+     */
+    internal usize $groups;
+    internal usize $offset;
+
+    internal constructor(Param $param, Matrix $value, Matrix $grad, Matrix $first, Matrix $second, usize $offset)
+    {
+        $this->param = $param;
+        $this->size = $param->size();
+        $this->value = $value;
+        $this->grad = $grad;
+        $this->first = $first;
+        $this->second = $second;
+        usize $one = 1;
+        $this->groups = std::math::max(std::math::min(($this->size + 255) / 256, MAX_GROUPS), $one);
+        $this->offset = $offset;
+        $this->reload();
+    }
+
+    internal static function make(Gpu $gpu, Param $param, usize $offset) : result<Slot, GpuError>
+    {
+        usize $n = $param->size();
+
+        Matrix $value = guard $gpu->matrix(1, $n) else ($e) {
+            return .error($e);
+        }
+
+        Matrix $grad = guard $gpu->matrix(1, $n) else ($e) {
+            return .error($e);
+        }
+
+        Matrix $first = guard $gpu->matrix(1, $n) else ($e) {
+            return .error($e);
+        }
+
+        Matrix $second = guard $gpu->matrix(1, $n) else ($e) {
+            return .error($e);
+        }
+
+        return .ok(Slot($param, $value, $grad, $first, $second, $offset));
+    }
+
+    /**
+     * Device weights into the host param.
+     */
+    internal function sync() : void
+    {
+        $this->value->read($this->param->value, 0, 1);
+    }
+
+    /**
+     * Host param onto the device. Optimizer state stays.
+     */
+    internal function reload() : void
+    {
+        $this->value->load($this->param->value, 0, 1);
+    }
+
+    internal function squares(const Gpu& $gpu, const Matrix& $partials) : void
+    {
+        cuda::Args $a = cuda::Args();
+        $a->buffer($this->grad->buffer);
+        $a->buffer($partials->buffer);
+        $a->u($this->size);
+        $a->u($this->offset);
+        $gpu->blocks($gpu->kernels->squares, $a, $this->groups, 256);
+    }
+}
+
+internal interface Stage
+{
+    function forward(usize $rows) : void;
+
+    /**
+     * `$input` is false where nothing upstream needs the gradient of the
+     * stage's input, the network's first layer.
+     */
+    function backward(usize $rows, bool $input) : void;
+}
+
+/**
+ * Column sums of `$g` into `$sums`, and with `$x` the column sums of
+ * `g * x` into `$products`.
+ */
+internal function columns(const Gpu& $gpu, const Matrix& $g, const Matrix? $x, const Matrix& $sums, const Matrix? $products, usize $rows, usize $cols) : void
+{
+    cuda::Args $a = cuda::Args();
+    $a->buffer($g->buffer);
+
+    guard $sums->buffer->fill(0, $cols) else ($e) {
+        die("ann::cuda: {$e}");
+    }
+
+    if ($x != null && $products != null) {
+        Matrix $xs = guard $x else {
+            return;
+        }
+        Matrix $ps = guard $products else {
+            return;
+        }
+        guard $ps->buffer->fill(0, $cols) else ($e) {
+            die("ann::cuda: {$e}");
+        }
+        $a->buffer($xs->buffer);
+        $a->buffer($sums->buffer);
+        $a->buffer($ps->buffer);
+    } else {
+        $a->u(0);
+        $a->buffer($sums->buffer);
+        $a->u(0);
+    }
+
+    // runs of 256 rows a block, so a long batch fills the device
+    usize $chunk = 256;
+    usize $runs = ($rows + $chunk - 1) / $chunk;
+    usize $one = 1;
+    $runs = std::math::max($runs, $one);
+    $a->u($rows);
+    $a->u($cols);
+    $a->u($chunk);
+    usize $blocks = ($cols + 31) / 32;
+    guard $gpu->kernels->columns->launch(cuda::Dim($blocks as uint32, $runs as uint32), cuda::Dim(32, 8), $a) else ($e) {
+        die("ann::cuda: launching columns: {$e}");
+    }
+}
+
+/**
+ * `out = in . weight + bias`, and back: `dW = in' . g`, `db` the column
+ * sums of `g`, `d(in) = g . weight'`.
+ */
+internal class DenseStage : Stage
+{
+    private Gpu $gpu;
+    private usize $inputs;
+    private usize $outputs;
+    private Slot $weight;
+    private Slot $bias;
+    private Matrix $in;
+    private Matrix $out;
+    private Matrix $gradIn;
+    private Matrix $gradOut;
+
+    internal constructor(Gpu $gpu, usize $inputs, usize $outputs, Slot $weight, Slot $bias, Matrix $in, Matrix $out, Matrix $gradIn, Matrix $gradOut)
+    {
+        $this->gpu = $gpu;
+        $this->inputs = $inputs;
+        $this->outputs = $outputs;
+        $this->weight = $weight;
+        $this->bias = $bias;
+        $this->in = $in;
+        $this->out = $out;
+        $this->gradIn = $gradIn;
+        $this->gradOut = $gradOut;
+    }
+
+    public function forward(usize $rows) : void
+    {
+        $this->gpu->matmul($this->in, $this->weight->value, $this->out, $this->bias->value, $rows, $this->outputs, $this->inputs, $this->inputs, 1, $this->outputs, 1, false);
+    }
+
+    public function backward(usize $rows, bool $input) : void
+    {
+        // in' [inputs, rows] . g [rows, outputs]
+        $this->gpu->matmul($this->in, $this->gradOut, $this->weight->grad, null, $this->inputs, $this->outputs, $rows, 1, $this->inputs, $this->outputs, 1, false);
+        columns($this->gpu, $this->gradOut, null, $this->bias->grad, null, $rows, $this->outputs);
+
+        if (!$input) {
+            return;
+        }
+
+        // g [rows, outputs] . weight' [outputs, inputs]
+        $this->gpu->matmul($this->gradOut, $this->weight->value, $this->gradIn, null, $rows, $this->inputs, $this->outputs, $this->outputs, 1, 1, $this->outputs, false);
+    }
+}
+
+/**
+ * An `ann::Activation` on every value, and its slope on the way back.
+ */
+internal class ActStage : Stage
+{
+    private Gpu $gpu;
+    private usize $code;
+    private usize $width;
+    private Matrix $in;
+    private Matrix $out;
+    private Matrix $gradIn;
+    private Matrix $gradOut;
+
+    internal constructor(Gpu $gpu, usize $code, usize $width, Matrix $in, Matrix $out, Matrix $gradIn, Matrix $gradOut)
+    {
+        $this->gpu = $gpu;
+        $this->code = $code;
+        $this->width = $width;
+        $this->in = $in;
+        $this->out = $out;
+        $this->gradIn = $gradIn;
+        $this->gradOut = $gradOut;
+    }
+
+    public function forward(usize $rows) : void
+    {
+        usize $n = $rows * $this->width;
+        cuda::Args $a = cuda::Args();
+        $a->buffer($this->in->buffer);
+        $a->buffer($this->out->buffer);
+        $a->u($n);
+        $a->u($this->code);
+        $this->gpu->run($this->gpu->kernels->act, $a, $n);
+    }
+
+    public function backward(usize $rows, bool $input) : void
+    {
+        if (!$input) {
+            return;
+        }
+
+        usize $n = $rows * $this->width;
+        cuda::Args $a = cuda::Args();
+        $a->buffer($this->in->buffer);
+        $a->buffer($this->out->buffer);
+        $a->buffer($this->gradOut->buffer);
+        $a->buffer($this->gradIn->buffer);
+        $a->u($n);
+        $a->u($this->code);
+        $this->gpu->run($this->gpu->kernels->slope, $a, $n);
+    }
+}
+
+/**
+ * Children in order, and back in reverse.
+ */
+internal class SequenceStage : Stage
+{
+    private array<Stage> $children;
+
+    internal constructor(array<Stage> $children)
+    {
+        $this->children = $children;
+    }
+
+    public function forward(usize $rows) : void
+    {
+        foreach ($this->children as $child) {
+            $child->forward($rows);
+        }
+    }
+
+    public function backward(usize $rows, bool $input) : void
+    {
+        usize $k = $this->children->count();
+
+        while ($k > 0) {
+            $k = $k - 1;
+            $this->children[$k]->backward($rows, $k > 0 || $input);
+        }
+    }
+}
+
+/**
+ * `out = in + inner(in)`. The branch and the sum share the gradient that
+ * comes back; the input's gradient is that plus the branch's.
+ */
+internal class ResidualStage : Stage
+{
+    private Gpu $gpu;
+    private Stage $inner;
+    private usize $width;
+    private Matrix $in;
+    private Matrix $branch;
+    private Matrix $out;
+    private Matrix $gradOut;
+    private Matrix $branchGradIn;
+    private Matrix $gradIn;
+
+    internal constructor(Gpu $gpu, Stage $inner, usize $width, Matrix $in, Matrix $branch, Matrix $out, Matrix $gradOut, Matrix $branchGradIn, Matrix $gradIn)
+    {
+        $this->gpu = $gpu;
+        $this->inner = $inner;
+        $this->width = $width;
+        $this->in = $in;
+        $this->branch = $branch;
+        $this->out = $out;
+        $this->gradOut = $gradOut;
+        $this->branchGradIn = $branchGradIn;
+        $this->gradIn = $gradIn;
+    }
+
+    public function forward(usize $rows) : void
+    {
+        $this->inner->forward($rows);
+        $this->sum($this->in, $this->branch, $this->out, $rows * $this->width);
+    }
+
+    public function backward(usize $rows, bool $input) : void
+    {
+        $this->inner->backward($rows, $input);
+
+        if ($input) {
+            $this->sum($this->gradOut, $this->branchGradIn, $this->gradIn, $rows * $this->width);
+        }
+    }
+
+    private const function sum(const Matrix& $a, const Matrix& $b, const Matrix& $into, usize $n) : void
+    {
+        cuda::Args $args = cuda::Args();
+        $args->buffer($a->buffer);
+        $args->buffer($b->buffer);
+        $args->buffer($into->buffer);
+        $args->u($n);
+        $this->gpu->run($this->gpu->kernels->add, $args, $n);
+    }
+}
+
+/**
+ * The inner stage on every slot, the slots of a row stacked as rows.
+ * Row-major memory already lays them out that way, so only the row count
+ * changes.
+ */
+internal class PerSlotStage : Stage
+{
+    private Stage $inner;
+    private usize $slots;
+
+    internal constructor(Stage $inner, usize $slots)
+    {
+        $this->inner = $inner;
+        $this->slots = $slots;
+    }
+
+    public function forward(usize $rows) : void
+    {
+        $this->inner->forward($rows * $this->slots);
+    }
+
+    public function backward(usize $rows, bool $input) : void
+    {
+        $this->inner->backward($rows * $this->slots, $input);
+    }
+}
+
+/**
+ * Every row normalized to mean 0 and deviation 1 over its columns, then
+ * scaled by gamma and shifted by beta.
+ */
+internal class NormStage : Stage
+{
+    private Gpu $gpu;
+    private usize $features;
+    private float64 $epsilon;
+    private Slot $gamma;
+    private Slot $beta;
+    private Matrix $in;
+    private Matrix $out;
+    private Matrix $gradIn;
+    private Matrix $gradOut;
+    private Matrix $normalized;
+    private Matrix $inverse;
+
+    internal constructor(Gpu $gpu, usize $features, float64 $epsilon, Slot $gamma, Slot $beta, Matrix $in, Matrix $out, Matrix $gradIn, Matrix $gradOut, Matrix $normalized, Matrix $inverse)
+    {
+        $this->gpu = $gpu;
+        $this->features = $features;
+        $this->epsilon = $epsilon;
+        $this->gamma = $gamma;
+        $this->beta = $beta;
+        $this->in = $in;
+        $this->out = $out;
+        $this->gradIn = $gradIn;
+        $this->gradOut = $gradOut;
+        $this->normalized = $normalized;
+        $this->inverse = $inverse;
+    }
+
+    public function forward(usize $rows) : void
+    {
+        cuda::Args $a = cuda::Args();
+        $a->buffer($this->in->buffer);
+        $a->buffer($this->out->buffer);
+        $a->buffer($this->normalized->buffer);
+        $a->buffer($this->inverse->buffer);
+        $a->buffer($this->gamma->value->buffer);
+        $a->buffer($this->beta->value->buffer);
+        $a->u($rows);
+        $a->u($this->features);
+        $a->f($this->epsilon);
+        $this->gpu->run($this->gpu->kernels->normForward, $a, $rows * 32);
+    }
+
+    public function backward(usize $rows, bool $input) : void
+    {
+        columns($this->gpu, $this->gradOut, $this->normalized, $this->beta->grad, $this->gamma->grad, $rows, $this->features);
+
+        if (!$input) {
+            return;
+        }
+
+        cuda::Args $a = cuda::Args();
+        $a->buffer($this->gradOut->buffer);
+        $a->buffer($this->normalized->buffer);
+        $a->buffer($this->inverse->buffer);
+        $a->buffer($this->gamma->value->buffer);
+        $a->buffer($this->gradIn->buffer);
+        $a->u($rows);
+        $a->u($this->features);
+        $this->gpu->run($this->gpu->kernels->normBackward, $a, $rows * 32);
+    }
+}
+
+/**
+ * Mean and or max over the slots of every row.
+ */
+internal class PoolStage : Stage
+{
+    private Gpu $gpu;
+    private usize $slots;
+    private usize $width;
+    private usize $mode;
+    private Matrix $in;
+    private Matrix $out;
+    private Matrix $gradIn;
+    private Matrix $gradOut;
+    private Matrix $winners;
+
+    internal constructor(Gpu $gpu, usize $slots, usize $width, usize $mode, Matrix $in, Matrix $out, Matrix $gradIn, Matrix $gradOut, Matrix $winners)
+    {
+        $this->gpu = $gpu;
+        $this->slots = $slots;
+        $this->width = $width;
+        $this->mode = $mode;
+        $this->in = $in;
+        $this->out = $out;
+        $this->gradIn = $gradIn;
+        $this->gradOut = $gradOut;
+        $this->winners = $winners;
+    }
+
+    public function forward(usize $rows) : void
+    {
+        cuda::Args $a = cuda::Args();
+        $a->buffer($this->in->buffer);
+        $a->buffer($this->out->buffer);
+        $a->buffer($this->winners->buffer);
+        $a->u($rows);
+        $a->u($this->slots);
+        $a->u($this->width);
+        $a->u($this->mode);
+        $this->gpu->run($this->gpu->kernels->poolForward, $a, $rows * $this->width);
+    }
+
+    public function backward(usize $rows, bool $input) : void
+    {
+        if (!$input) {
+            return;
+        }
+
+        cuda::Args $a = cuda::Args();
+        $a->buffer($this->gradOut->buffer);
+        $a->buffer($this->winners->buffer);
+        $a->buffer($this->gradIn->buffer);
+        $a->u($rows);
+        $a->u($this->slots);
+        $a->u($this->width);
+        $a->u($this->mode);
+        $this->gpu->run($this->gpu->kernels->poolBackward, $a, $rows * $this->width);
+    }
+}
+
+/**
+ * The buffers an attention stage works in, `slots` rows per sample row.
+ */
+internal struct Workspace
+{
+    internal Matrix $queries;
+    internal Matrix $keys;
+    internal Matrix $values;
+    internal Matrix $mixed;
+    internal Matrix $dMixed;
+    internal Matrix $dQueries;
+    internal Matrix $dKeys;
+    internal Matrix $dValues;
+
+    /**
+     * Softmax weights and their score gradients, `slots` per query slot.
+     */
+    internal Matrix $weights;
+    internal Matrix $dScores;
+}
+
+/**
+ * Multi-head self-attention over the slots of every row: projections as
+ * matmuls over the slots stacked as rows. With cuBLAS the scores and the
+ * weighted sums are batched products per head and the softmax its own
+ * kernel, which also adds a learned bias per slot relation; without it,
+ * the attention kernels do all three for up to `MAX_SLOTS` slots.
+ */
+internal class AttentionStage : Stage
+{
+    private Gpu $gpu;
+    private usize $slots;
+    private usize $width;
+    private usize $heads;
+    private usize $relations;
+    private float64 $scale;
+    private array<Slot> $params;
+    private Matrix $positions;
+    private Matrix $in;
+    private Matrix $out;
+    private Matrix $gradIn;
+    private Matrix $gradOut;
+    private Workspace $w;
+
+    internal constructor(Gpu $gpu, usize $slots, usize $width, usize $heads, usize $relations, array<Slot> $params, Matrix $positions, Matrix $in, Matrix $out, Matrix $gradIn, Matrix $gradOut, Workspace $w)
+    {
+        $this->gpu = $gpu;
+        $this->slots = $slots;
+        $this->width = $width;
+        $this->heads = $heads;
+        $this->relations = $relations;
+        $this->scale = 1.0 / std::math::sqrt(($width / $heads) as float64);
+        $this->params = $params;
+        $this->positions = $positions;
+        $this->in = $in;
+        $this->out = $out;
+        $this->gradIn = $gradIn;
+        $this->gradOut = $gradOut;
+        $this->w = $w;
+    }
+
+    public function forward(usize $rows) : void
+    {
+        usize $stacked = $rows * $this->slots;
+        $this->project($this->in, 0, $this->w->queries, $stacked);
+        $this->project($this->in, 2, $this->w->keys, $stacked);
+        $this->project($this->in, 4, $this->w->values, $stacked);
+
+        if ($this->gpu->accelerated()) {
+            $this->products($rows);
+        } else {
+            cuda::Args $a = cuda::Args();
+            $a->buffer($this->w->queries->buffer);
+            $a->buffer($this->w->keys->buffer);
+            $a->buffer($this->w->values->buffer);
+            $a->buffer($this->w->weights->buffer);
+            $a->buffer($this->w->mixed->buffer);
+            $this->shape($a, $rows);
+            $a->f($this->scale);
+            $this->gpu->run($this->gpu->kernels->attend, $a, $rows * $this->heads * $this->slots);
+        }
+
+        $this->project($this->w->mixed, 6, $this->out, $stacked);
+    }
+
+    public function backward(usize $rows, bool $input) : void
+    {
+        usize $stacked = $rows * $this->slots;
+        usize $w = $this->width;
+        Slot $output = $this->params[6];
+
+        // the output projection, and the gradient of the mixed heads
+        $this->gpu->matmul($this->w->mixed, $this->gradOut, $output->grad, null, $w, $w, $stacked, 1, $w, $w, 1, false);
+        columns($this->gpu, $this->gradOut, null, $this->params[7]->grad, null, $stacked, $w);
+        $this->gpu->matmul($this->gradOut, $output->value, $this->w->dMixed, null, $stacked, $w, $w, $w, 1, 1, $w, false);
+
+        if ($this->gpu->accelerated()) {
+            $this->unproducts($rows);
+        } else {
+            cuda::Args $q = cuda::Args();
+            $q->buffer($this->w->dMixed->buffer);
+            $q->buffer($this->w->keys->buffer);
+            $q->buffer($this->w->values->buffer);
+            $q->buffer($this->w->weights->buffer);
+            $q->buffer($this->w->dScores->buffer);
+            $q->buffer($this->w->dQueries->buffer);
+            $this->shape($q, $rows);
+            $q->f($this->scale);
+            $this->gpu->run($this->gpu->kernels->unattendQuery, $q, $rows * $this->heads * $this->slots);
+
+            cuda::Args $k = cuda::Args();
+            $k->buffer($this->w->dMixed->buffer);
+            $k->buffer($this->w->queries->buffer);
+            $k->buffer($this->w->weights->buffer);
+            $k->buffer($this->w->dScores->buffer);
+            $k->buffer($this->w->dKeys->buffer);
+            $k->buffer($this->w->dValues->buffer);
+            $this->shape($k, $rows);
+            $this->gpu->run($this->gpu->kernels->unattendKeys, $k, $rows * $this->heads * $this->slots);
+        }
+
+        $this->learn($this->w->dQueries, 0, $stacked);
+        $this->learn($this->w->dKeys, 2, $stacked);
+        $this->learn($this->w->dValues, 4, $stacked);
+
+        if (!$input) {
+            return;
+        }
+
+        $this->gpu->matmul($this->w->dQueries, $this->params[0]->value, $this->gradIn, null, $stacked, $w, $w, $w, 1, 1, $w, false);
+        $this->gpu->matmul($this->w->dKeys, $this->params[2]->value, $this->gradIn, null, $stacked, $w, $w, $w, 1, 1, $w, true);
+        $this->gpu->matmul($this->w->dValues, $this->params[4]->value, $this->gradIn, null, $stacked, $w, $w, $w, 1, 1, $w, true);
+    }
+
+    /**
+     * Scores, softmax and weighted values as batched products, one batch
+     * of `$rows` per head.
+     */
+    private const function products(usize $rows) : void
+    {
+        usize $s = $this->slots;
+        usize $w = $this->width;
+        usize $d = $w / $this->heads;
+        usize $square = $s * $s;
+        usize $block = $this->heads * $square;
+
+        for (usize $h = 0; $h < $this->heads; $h++) {
+            cuda::Operand $q = cuda::Operand(Gpu::at($this->w->queries, $h * $d), $w, false, $s * $w);
+            cuda::Operand $k = cuda::Operand(Gpu::at($this->w->keys, $h * $d), $w, true, $s * $w);
+            cuda::Operand $p = cuda::Operand(Gpu::at($this->w->weights, $h * $square), $s, false, $block);
+            $this->gpu->multiply($s, $s, $d, $q, $k, $p, $this->scale, 0.0, $rows);
+        }
+
+        cuda::Args $a = cuda::Args();
+        $a->buffer($this->w->weights->buffer);
+        $this->bias($a);
+        $a->u($rows * $this->heads * $s);
+        $a->u($s);
+        $a->u($this->heads);
+        $a->u($this->relations);
+        $this->gpu->run($this->gpu->kernels->softmaxRows, $a, $rows * $this->heads * $s * 32);
+
+        for (usize $h = 0; $h < $this->heads; $h++) {
+            cuda::Operand $p = cuda::Operand(Gpu::at($this->w->weights, $h * $square), $s, false, $block);
+            cuda::Operand $v = cuda::Operand(Gpu::at($this->w->values, $h * $d), $w, false, $s * $w);
+            cuda::Operand $m = cuda::Operand(Gpu::at($this->w->mixed, $h * $d), $w, false, $s * $w);
+            $this->gpu->multiply($s, $d, $s, $p, $v, $m, 1.0, 0.0, $rows);
+        }
+    }
+
+    /**
+     * The reverse of `products`: from the mixed heads' gradient, the
+     * gradients of the queries, keys and values, and of the bias.
+     */
+    private const function unproducts(usize $rows) : void
+    {
+        usize $s = $this->slots;
+        usize $w = $this->width;
+        usize $d = $w / $this->heads;
+        usize $square = $s * $s;
+        usize $block = $this->heads * $square;
+
+        // d(loss)/d(weights) = dM . V'
+        for (usize $h = 0; $h < $this->heads; $h++) {
+            cuda::Operand $dm = cuda::Operand(Gpu::at($this->w->dMixed, $h * $d), $w, false, $s * $w);
+            cuda::Operand $v = cuda::Operand(Gpu::at($this->w->values, $h * $d), $w, true, $s * $w);
+            cuda::Operand $ds = cuda::Operand(Gpu::at($this->w->dScores, $h * $square), $s, false, $block);
+            $this->gpu->multiply($s, $s, $d, $dm, $v, $ds, 1.0, 0.0, $rows);
+        }
+
+        cuda::Args $back = cuda::Args();
+        $back->buffer($this->w->weights->buffer);
+        $back->buffer($this->w->dScores->buffer);
+        $back->u($rows * $this->heads * $s);
+        $back->u($s);
+        $this->gpu->run($this->gpu->kernels->softmaxBack, $back, $rows * $this->heads * $s * 32);
+
+        if ($this->relations > 0) {
+            Slot $bias = $this->params[8];
+            $bias->grad->fill(0.0);
+            cuda::Args $b = cuda::Args();
+            $b->buffer($this->w->dScores->buffer);
+            $b->buffer($this->positions->buffer);
+            $b->buffer($bias->grad->buffer);
+            $b->u($rows);
+            $b->u($s);
+            $b->u($this->heads);
+            $b->u($this->relations);
+            $this->gpu->run($this->gpu->kernels->biasGrad, $b, $block);
+        }
+
+        for (usize $h = 0; $h < $this->heads; $h++) {
+            cuda::Operand $ds = cuda::Operand(Gpu::at($this->w->dScores, $h * $square), $s, false, $block);
+            cuda::Operand $dsT = cuda::Operand(Gpu::at($this->w->dScores, $h * $square), $s, true, $block);
+            cuda::Operand $pT = cuda::Operand(Gpu::at($this->w->weights, $h * $square), $s, true, $block);
+            cuda::Operand $q = cuda::Operand(Gpu::at($this->w->queries, $h * $d), $w, false, $s * $w);
+            cuda::Operand $k = cuda::Operand(Gpu::at($this->w->keys, $h * $d), $w, false, $s * $w);
+            cuda::Operand $dm = cuda::Operand(Gpu::at($this->w->dMixed, $h * $d), $w, false, $s * $w);
+            cuda::Operand $dq = cuda::Operand(Gpu::at($this->w->dQueries, $h * $d), $w, false, $s * $w);
+            cuda::Operand $dk = cuda::Operand(Gpu::at($this->w->dKeys, $h * $d), $w, false, $s * $w);
+            cuda::Operand $dv = cuda::Operand(Gpu::at($this->w->dValues, $h * $d), $w, false, $s * $w);
+            $this->gpu->multiply($s, $d, $s, $ds, $k, $dq, $this->scale, 0.0, $rows);
+            $this->gpu->multiply($s, $d, $s, $dsT, $q, $dk, $this->scale, 0.0, $rows);
+            $this->gpu->multiply($s, $d, $s, $pT, $dm, $dv, 1.0, 0.0, $rows);
+        }
+    }
+
+    /**
+     * The softmax kernel's bias and positions, the weights again where
+     * there are no relations (it never reads them then).
+     */
+    private const function bias(cuda::Args& $a) : void
+    {
+        if ($this->relations > 0) {
+            $a->buffer($this->params[8]->value->buffer);
+            $a->buffer($this->positions->buffer);
+            return;
+        }
+
+        $a->buffer($this->w->weights->buffer);
+        $a->buffer($this->w->weights->buffer);
+    }
+
+    /**
+     * `into = from . param[at] + param[at + 1]` over the stacked slots.
+     */
+    private const function project(const Matrix& $from, usize $at, const Matrix& $into, usize $stacked) : void
+    {
+        usize $w = $this->width;
+        $this->gpu->matmul($from, $this->params[$at]->value, $into, $this->params[$at + 1]->value, $stacked, $w, $w, $w, 1, $w, 1, false);
+    }
+
+    /**
+     * The gradients of projection `at` and its bias from the gradient of
+     * what it produced.
+     */
+    private const function learn(const Matrix& $d, usize $at, usize $stacked) : void
+    {
+        usize $w = $this->width;
+        $this->gpu->matmul($this->in, $d, $this->params[$at]->grad, null, $w, $w, $stacked, 1, $w, $w, 1, false);
+        columns($this->gpu, $d, null, $this->params[$at + 1]->grad, null, $stacked, $w);
+    }
+
+    private const function shape(cuda::Args& $a, usize $rows) : void
+    {
+        $a->u($rows);
+        $a->u($this->slots);
+        $a->u($this->width);
+        $a->u($this->heads);
+    }
+}
+
+/**
+ * Codes looked up in a table, plus a row per slot. The codes get no
+ * gradient.
+ */
+internal class EmbedStage : Stage
+{
+    private Gpu $gpu;
+    private usize $slots;
+    private usize $vocabulary;
+    private usize $width;
+    private Slot $table;
+    private Slot $position;
+    private Matrix $in;
+    private Matrix $out;
+    private Matrix $gradOut;
+
+    internal constructor(Gpu $gpu, usize $slots, usize $vocabulary, usize $width, Slot $table, Slot $position, Matrix $in, Matrix $out, Matrix $gradOut)
+    {
+        $this->gpu = $gpu;
+        $this->slots = $slots;
+        $this->vocabulary = $vocabulary;
+        $this->width = $width;
+        $this->table = $table;
+        $this->position = $position;
+        $this->in = $in;
+        $this->out = $out;
+        $this->gradOut = $gradOut;
+    }
+
+    public function forward(usize $rows) : void
+    {
+        cuda::Args $a = cuda::Args();
+        $a->buffer($this->in->buffer);
+        $a->buffer($this->table->value->buffer);
+        $a->buffer($this->position->value->buffer);
+        $a->buffer($this->out->buffer);
+        $a->u($rows);
+        $a->u($this->slots);
+        $a->u($this->width);
+        $this->gpu->run($this->gpu->kernels->embed, $a, $rows * $this->slots * $this->width);
+    }
+
+    public function backward(usize $rows, bool $input) : void
+    {
+        usize $tokens = $rows * $this->slots;
+        usize $chunk = 1024;
+        usize $runs = std::math::max(($tokens + $chunk - 1) / $chunk, 1 as usize);
+        $this->table->grad->fill(0.0);
+        cuda::Args $t = cuda::Args();
+        $t->buffer($this->in->buffer);
+        $t->buffer($this->gradOut->buffer);
+        $t->buffer($this->table->grad->buffer);
+        $t->u($tokens);
+        $t->u($this->width);
+        $t->u($this->vocabulary);
+        $t->u($chunk);
+        usize $across = ($this->width + 63) / 64;
+
+        guard $this->gpu->kernels->embedGrad->launch(cuda::Dim($across as uint32, $runs as uint32), cuda::Dim(64), $t) else ($e) {
+            die("ann::cuda: launching embedGrad: {$e}");
+        }
+
+        cuda::Args $p = cuda::Args();
+        $p->buffer($this->gradOut->buffer);
+        $p->buffer($this->position->grad->buffer);
+        $p->u($rows);
+        $p->u($this->slots);
+        $p->u($this->width);
+        $this->gpu->run($this->gpu->kernels->positionGrad, $p, $this->slots * $this->width);
+    }
+}
+
+/**
+ * Source half against target half for every listed pair of slots.
+ */
+internal class PairStage : Stage
+{
+    private Gpu $gpu;
+    private usize $slots;
+    private usize $width;
+    private usize $pairs;
+    private Matrix $in;
+    private Matrix $out;
+    private Matrix $gradIn;
+    private Matrix $gradOut;
+
+    internal constructor(Gpu $gpu, usize $slots, usize $width, usize $pairs, Matrix $in, Matrix $out, Matrix $gradIn, Matrix $gradOut)
+    {
+        $this->gpu = $gpu;
+        $this->slots = $slots;
+        $this->width = $width;
+        $this->pairs = $pairs;
+        $this->in = $in;
+        $this->out = $out;
+        $this->gradIn = $gradIn;
+        $this->gradOut = $gradOut;
+    }
+
+    public function forward(usize $rows) : void
+    {
+        cuda::Args $a = cuda::Args();
+        $a->buffer($this->in->buffer);
+        $a->buffer($this->out->buffer);
+        $this->shape($a, $rows);
+        $a->f(ann::EMPTY_PAIR);
+        $this->gpu->run($this->gpu->kernels->pairForward, $a, $rows * $this->pairs);
+    }
+
+    public function backward(usize $rows, bool $input) : void
+    {
+        if (!$input) {
+            return;
+        }
+
+        guard $this->gradIn->buffer->fill(0, $rows * $this->in->cols) else ($e) {
+            die("ann::cuda: {$e}");
+        }
+
+        cuda::Args $a = cuda::Args();
+        $a->buffer($this->in->buffer);
+        $a->buffer($this->gradOut->buffer);
+        $a->buffer($this->gradIn->buffer);
+        $a->u($rows);
+        $a->u($this->in->cols);
+        $a->u($this->pairs);
+        $a->u($this->slots);
+        $a->u($this->width);
+        $a->f(1.0 / std::math::sqrt($this->width as float64));
+        $this->gpu->run($this->gpu->kernels->pairBackward, $a, $rows * $this->pairs);
+    }
+
+    private const function shape(cuda::Args& $a, usize $rows) : void
+    {
+        $a->u($rows);
+        $a->u($this->in->cols);
+        $a->u($this->pairs);
+        $a->u($this->slots);
+        $a->u($this->width);
+        $a->f(1.0 / std::math::sqrt($this->width as float64));
+    }
+}
+
+/**
+ * One `Parallel` branch on the device: the columns it reads copied out of
+ * the input (or the input itself when it reads all of it), its stage, and
+ * where its output lands.
+ */
+internal struct Lane
+{
+    internal usize $from;
+    internal usize $count;
+    internal usize $at;
+    internal Stage? $stage;
+    internal Matrix $in;
+    internal Matrix $out;
+    internal Matrix $gradIn;
+    internal Matrix $gradOut;
+    internal bool $whole;
+}
+
+/**
+ * Branches over column ranges of one input, outputs side by side. Every
+ * branch gets the gradient of its own output columns, and the input's
+ * gradient is the sum of what each branch sends back over its range.
+ */
+internal class ParallelStage : Stage
+{
+    private Gpu $gpu;
+    private array<Lane> $lanes;
+    private Matrix $in;
+    private Matrix $out;
+    private Matrix $gradIn;
+    private Matrix $gradOut;
+
+    internal constructor(Gpu $gpu, array<Lane> $lanes, Matrix $in, Matrix $out, Matrix $gradIn, Matrix $gradOut)
+    {
+        $this->gpu = $gpu;
+        $this->lanes = $lanes;
+        $this->in = $in;
+        $this->out = $out;
+        $this->gradIn = $gradIn;
+        $this->gradOut = $gradOut;
+    }
+
+    public function forward(usize $rows) : void
+    {
+        foreach ($this->lanes as $lane) {
+            Stage $stage = guard $lane->stage else {
+                $this->copy($this->in, $lane->from, $this->out, $lane->at, $rows, $lane->count, false);
+                continue;
+            };
+
+            if (!$lane->whole) {
+                $this->copy($this->in, $lane->from, $lane->in, 0, $rows, $lane->count, false);
+            }
+
+            $stage->forward($rows);
+            $this->copy($lane->out, 0, $this->out, $lane->at, $rows, $lane->out->cols, false);
+        }
+    }
+
+    public function backward(usize $rows, bool $input) : void
+    {
+        if ($input) {
+            guard $this->gradIn->buffer->fill(0, $rows * $this->in->cols) else ($e) {
+                die("ann::cuda: {$e}");
+            }
+        }
+
+        foreach ($this->lanes as $lane) {
+            Stage $stage = guard $lane->stage else {
+                if ($input) {
+                    $this->copy($this->gradOut, $lane->at, $this->gradIn, $lane->from, $rows, $lane->count, true);
+                }
+                continue;
+            };
+
+            $this->copy($this->gradOut, $lane->at, $lane->gradOut, 0, $rows, $lane->out->cols, false);
+            $stage->backward($rows, $input);
+
+            if ($input) {
+                $this->copy($lane->gradIn, 0, $this->gradIn, $lane->from, $rows, $lane->count, true);
+            }
+        }
+    }
+
+    /**
+     * `$count` columns of every row from `$src` at `$srcAt` into `$dst` at
+     * `$dstAt`, added on with `$add`.
+     */
+    private const function copy(const Matrix& $src, usize $srcAt, const Matrix& $dst, usize $dstAt, usize $rows, usize $count, bool $add) : void
+    {
+        cuda::Args $a = cuda::Args();
+        $a->buffer($src->buffer);
+        $a->u($src->cols);
+        $a->u($srcAt);
+        $a->buffer($dst->buffer);
+        $a->u($dst->cols);
+        $a->u($dstAt);
+        $a->u($rows);
+        $a->u($count);
+        usize $flag = 0;
+
+        if ($add) {
+            $flag = 1;
+        }
+
+        $a->u($flag);
+        $this->gpu->run($this->gpu->kernels->copyColumns, $a, $rows * $count);
+    }
+}

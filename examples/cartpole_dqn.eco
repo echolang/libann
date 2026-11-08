@@ -66,4 +66,4 @@ Model $loaded = guard Model::load('cartpole-dqn.ann') else ($e) {
 float64 $score = play($loaded, Runner(CartPole($seed: 99)), 10);
 $log->note('cartpole-dqn.ann', "greedy over 10 episodes: mean return {$score:.1f}");
 $log->end('done');
-std::io::remove('cartpole-dqn.ann');
+std::fs::remove('cartpole-dqn.ann');

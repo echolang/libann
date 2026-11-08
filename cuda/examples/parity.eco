@@ -1,0 +1,555 @@
+/*
+ * The GPU and the CPU train the same network from the same seed, and must
+ * agree: every step's loss, then every weight after `sync`, then every
+ * prediction. Plain networks, layer norm, pooling and a whole transformer
+ * stack, with every loss and optimizer. Stops on the first disagreement,
+ * then times a transformer step on both.
+ *
+ *   echoc run --target parity
+ */
+
+use ann::{Act, Adam, BinaryCrossEntropy, CrossEntropy, Dataset, Dense, Embedding, Heads, Huber, LayerNorm, Loss, MeanAbsoluteError, MeanSquaredError, Model, Optimizer, PairLogits, Parallel, PerSlot, Pool, Random, Residual, SelfAttention, Sequential, Sgd, SigmoidCrossEntropy, Tensor};
+use ann::cuda::{Gpu, Objective, Parts, Update};
+use std::time;
+
+internal function noise(Random& $rng, usize $rows, usize $cols, float64 $low, float64 $high) : Tensor
+{
+    array<usize> $shape = [$rows, $cols];
+    $t = Tensor($shape);
+
+    foreach (0 .. $t->data->count() as $i) {
+        $t->data[$i] = $rng->uniform($low, $high);
+    }
+
+    return $t;
+}
+
+internal function onehot(Random& $rng, usize $rows, usize $cols) : Tensor
+{
+    array<usize> $shape = [$rows, $cols];
+    $t = Tensor($shape);
+
+    for (usize $r = 0; $r < $rows; $r++) {
+        $t->data[$r * $cols + $rng->below($cols)] = 1.0;
+    }
+
+    return $t;
+}
+
+/**
+ * A piece-token transformer: embed every slot, `layers` blocks of
+ * attention and a feed-forward branch, each with a residual and a layer
+ * norm, then pool the slots and read a value.
+ */
+internal function tokens(usize $slots, usize $features, usize $width, usize $heads, usize $layers, usize $outputs) : Sequential
+{
+    $net = Sequential()->add(PerSlot($slots, Dense($features, $width, .he)));
+
+    for (usize $l = 0; $l < $layers; $l++) {
+        $ffn = Sequential()->add(Dense($width, 2 * $width, .he))->add(Act(.gelu))->add(Dense(2 * $width, $width));
+        $net->add(Residual(SelfAttention($slots, $width, $heads)));
+        $net->add(PerSlot($slots, LayerNorm($width)));
+        $net->add(Residual(PerSlot($slots, $ffn)));
+        $net->add(PerSlot($slots, LayerNorm($width)));
+    }
+
+    return $net
+        ->add(Pool($slots, .meanMax))
+        ->add(Dense(2 * $width, $width, .he))
+        ->add(Act(.relu))
+        ->add(Dense($width, $outputs));
+}
+
+/**
+ * Offsets on a line of `slots`, the relation of slot i to slot j.
+ */
+internal function line(usize $slots) : array<usize>
+{
+    array<usize> $out = array<usize>();
+
+    foreach (0 .. $slots as $i) {
+        foreach (0 .. $slots as $j) {
+            $out[] = $j + $slots - 1 - $i;
+        }
+    }
+
+    return $out;
+}
+
+/**
+ * A pre-norm transformer over cell codes, with learned relations between
+ * cells: what halmakings plays with.
+ */
+internal function cells(usize $slots, usize $vocabulary, usize $width, usize $heads, usize $layers) : Sequential
+{
+    $net = Sequential()->add(Embedding($slots, $vocabulary, $width));
+
+    for (usize $l = 0; $l < $layers; $l++) {
+        $attend = Sequential()
+            ->add(PerSlot($slots, LayerNorm($width)))
+            ->add(SelfAttention($slots, $width, $heads, line($slots), 2 * $slots - 1));
+        $ffn = Sequential()
+            ->add(PerSlot($slots, LayerNorm($width)))
+            ->add(PerSlot($slots, Sequential()->add(Dense($width, 2 * $width, .he))->add(Act(.gelu))->add(Dense(2 * $width, $width))));
+        $net->add(Residual($attend));
+        $net->add(Residual($ffn));
+    }
+
+    return $net->add(PerSlot($slots, LayerNorm($width)));
+}
+
+/**
+ * Pair codes and cell codes in, move logits and value bins out.
+ */
+internal function policy(usize $pairs, usize $slots, usize $width, usize $heads, usize $layers, usize $bins) : Sequential
+{
+    usize $tokens = $slots * $width;
+    usize $all = $pairs + $tokens;
+    $moves = Sequential()
+        ->add(Parallel()->pass(0, $pairs)->add($pairs, $tokens, PerSlot($slots, Dense($width, 2 * $width))))
+        ->add(PairLogits($slots, $width, $pairs));
+    $value = Sequential()
+        ->add(Pool($slots, .meanMax))
+        ->add(Dense(2 * $width, $width, .he))
+        ->add(Act(.relu))
+        ->add(Dense($width, $bins));
+
+    return Sequential()
+        ->add(Parallel()->pass(0, $pairs)->add($pairs, $slots, cells($slots, 3, $width, $heads, $layers)))
+        ->add(Parallel()->add(0, $all, $moves)->add($pairs, $tokens, $value));
+}
+
+internal function build(const string& $arch, usize $inputs, usize $outputs) : Sequential
+{
+    if ($arch == 'cells') {
+        return Sequential()
+            ->add(cells($inputs, 3, 16, 4, 2))
+            ->add(Pool($inputs, .meanMax))
+            ->add(Dense(32, $outputs));
+    }
+
+    if ($arch == 'wide') {
+        return Sequential()
+            ->add(cells($inputs, 3, 16, 2, 1))
+            ->add(Pool($inputs, .mean))
+            ->add(Dense(16, $outputs));
+    }
+
+    if ($arch == 'tokens') {
+        return tokens(6, $inputs / 6, 16, 4, 2, $outputs);
+    }
+
+    if ($arch == 'norm') {
+        return Sequential()
+            ->add(Dense($inputs, 32, .he))
+            ->add(LayerNorm(32))
+            ->add(Act(.relu))
+            ->add(Dense(32, $outputs));
+    }
+
+    if ($arch == 'pool') {
+        return Sequential()
+            ->add(PerSlot(6, Sequential()->add(Dense($inputs / 6, 8))->add(Act(.tanh))))
+            ->add(Pool(6, .max))
+            ->add(Dense(8, $outputs));
+    }
+
+    if ($arch == 'sigmoid') {
+        return Sequential()
+            ->add(Dense($inputs, 48, .he))
+            ->add(Act(.swish))
+            ->add(Dense(48, $outputs))
+            ->add(Act(.sigmoid));
+    }
+
+    return Sequential()
+        ->add(Dense($inputs, 48, .he))
+        ->add(Act(.relu))
+        ->add(Sequential()->add(Dense(48, 48))->add(Act(.tanh)))
+        ->add(Dense(48, $outputs));
+}
+
+internal function close(float64 $a, float64 $b, float64 $tolerance) : bool
+{
+    $scale = std::math::max(std::math::max(std::math::abs($a), std::math::abs($b)), 1.0);
+    return std::math::abs($a - $b) <= $tolerance * $scale;
+}
+
+internal function check(Gpu $gpu, const string& $name, const string& $arch, Loss $hostLoss, const Objective& $objective, Optimizer $cpuOpt, const Update& $gpuUpdate, float64 $clip, const Dataset& $data, usize $batch) : void
+{
+    usize $inputs = $data->inputs->cols();
+    usize $outputs = $data->targets->cols();
+    $cpu = Model(build($arch, $inputs, $outputs), $seed: 5);
+    $host = Model(build($arch, $inputs, $outputs), $seed: 5);
+    $start = Model(build($arch, $inputs, $outputs), $seed: 5);
+
+    $gnet = guard $gpu->mirror($host, $batch) else ($e) {
+        die("{$name}: {$e}");
+    }
+
+    $worst = 0.0;
+    $moved = 0.0;
+    $lossGap = 0.0;
+
+    for (int32 $step = 0; $step < 20; $step++) {
+        usize $first = (($step as usize) * $batch) % ($data->count() - $batch + 1);
+        array<usize> $rows = arr::room<usize>($batch);
+
+        for (usize $i = 0; $i < $batch; $i++) {
+            $rows[] = $first + $i;
+        }
+
+        $b = $data->batch($rows);
+        $want = $cpu->learn($b, $hostLoss, $cpuOpt, $clip);
+        $got = $gnet->learn($b, $objective, $gpuUpdate, $clip);
+
+        if (!close($want, $got, 0.001)) {
+            die("{$name}: step {$step} loss cpu {$want} gpu {$got}");
+        }
+
+        $lossGap = std::math::max($lossGap, std::math::abs($want - $got));
+    }
+
+    $gnet->sync();
+    $a = $cpu->params();
+    $b = $host->params();
+    $c = $start->params();
+
+    string $worstName = '';
+
+    foreach (0 .. $a->count() as $p) {
+        // a key bias adds the same to every score of a query, which the
+        // softmax ignores: its true gradient is zero, and what is left is
+        // rounding, which Adam blows up into whole steps of either sign
+        if ($a[$p]->name == 'keyBias') {
+            continue;
+        }
+
+        foreach (0 .. $a[$p]->value->data->count() as $i) {
+            $x = $a[$p]->value->data[$i];
+            $y = $b[$p]->value->data[$i];
+
+            if (std::math::abs($x - $y) > $worst) {
+                $worstName = "{$p} {$a[$p]->name}";
+            }
+
+            $worst = std::math::max($worst, std::math::abs($x - $y));
+            $moved = std::math::max($moved, std::math::abs($y - $c[$p]->value->data[$i]));
+
+            if (!close($x, $y, 0.002)) {
+                die("{$name}: param {$p} value {$i} cpu {$x} gpu {$y}");
+            }
+        }
+    }
+
+    if ($moved < 20.0 * $worst) {
+        die("{$name}: weights moved {$moved}, barely more than the gap {$worst} (param {$worstName})");
+    }
+
+    $pc = $cpu->predict($data->inputs);
+    $pg = $gnet->predict($data->inputs);
+
+    foreach (0 .. $pc->data->count() as $i) {
+        if (!close($pc->data[$i], $pg->data[$i], 0.002)) {
+            die("{$name}: predict {$i} cpu {$pc->data[$i]} gpu {$pg->data[$i]}");
+        }
+    }
+
+    echo "ok  {$name}  (loss gap {$lossGap}, weights moved {$moved}, weight gap {$worst})";
+}
+
+// whole fits: shuffling, device gathers, the last short batch, validation
+internal function fits(Gpu $gpu, const Dataset& $data, const Dataset& $held) : void
+{
+    usize $inputs = $data->inputs->cols();
+    $cpu = Model(build('tokens', $inputs, 1), $seed: 8);
+    $host = Model(build('tokens', $inputs, 1), $seed: 8);
+
+    $gnet = guard $gpu->mirror($host, $batch: 64) else ($e) {
+        die("fit: {$e}");
+    }
+
+    $want = ann::Trainer($epochs: 3, $batchSize: 48, $seed: 3, $validation: $held)
+        ->fit($cpu, SigmoidCrossEntropy(), Adam(), $data);
+
+    $got = guard ann::cuda::Trainer($epochs: 3, $batchSize: 48, $seed: 3, $validation: $held)
+        ->fit($gnet, Objective::sigmoidCE(SigmoidCrossEntropy()), Update::adam(Adam()), $data) else ($e) {
+        die("fit: {$e}");
+    }
+
+    foreach (0 .. $want->epochs->count() as $e) {
+        $a = $want->epochs[$e];
+        $b = $got->epochs[$e];
+        $va = guard $a->validation;
+        $vb = guard $b->validation;
+
+        if (!close($a->train->loss, $b->train->loss, 0.001) || !close($va->loss, $vb->loss, 0.001)) {
+            die("fit: epoch {$e} loss cpu {$a->train->loss}/{$va->loss} gpu {$b->train->loss}/{$vb->loss}");
+        }
+    }
+
+    // fit synced the host model on its way out
+    $pc = $cpu->predict($held->inputs);
+    $ph = $host->predict($held->inputs);
+
+    foreach (0 .. $pc->data->count() as $i) {
+        if (!close($pc->data[$i], $ph->data[$i], 0.002)) {
+            die("fit: synced predict {$i} cpu {$pc->data[$i]} gpu {$ph->data[$i]}");
+        }
+    }
+
+    echo 'ok  trainer fit with validation, transformer, sigmoid cross-entropy';
+}
+
+internal function codes(Random& $rng, usize $rows, usize $cols, usize $vocabulary) : Tensor
+{
+    array<usize> $shape = [$rows, $cols];
+    $t = Tensor($shape);
+
+    foreach (0 .. $t->data->count() as $i) {
+        $t->data[$i] = $rng->below($vocabulary) as float64;
+    }
+
+    return $t;
+}
+
+/**
+ * The policy network trained by parts on the GPU and by heads with the
+ * same targets spread out on the CPU.
+ */
+internal function policies(Gpu $gpu, Random& $rng) : void
+{
+    usize $pairs = 12;
+    usize $slots = 9;
+    usize $kept = 4;
+    usize $bins = 16;
+    usize $n = 200;
+    usize $batch = 50;
+    array<usize> $inShape = [$n, $pairs + $slots];
+    Tensor $inputs = Tensor($inShape);
+    array<usize> $denseShape = [$n, $pairs + $bins];
+    Tensor $dense = Tensor($denseShape);
+    array<usize> $compactShape = [$n, $kept + 1];
+    Tensor $compact = Tensor($compactShape);
+
+    for (usize $r = 0; $r < $n; $r++) {
+        usize $used = 6 + $rng->below($pairs - 6);
+        float64 $left = 1.0;
+
+        for (usize $p = 0; $p < $pairs; $p++) {
+            float64 $code = -1.0;
+
+            if ($p < $used) {
+                $code = $rng->below($slots * $slots) as float64;
+            }
+
+            $inputs->data[$r * ($pairs + $slots) + $p] = $code;
+
+            // the first moves take the target mass, the rest none
+            if ($p < $kept) {
+                float64 $share = $left * 0.6;
+
+                if ($p + 1 == $kept) {
+                    $share = $left;
+                }
+
+                $left = $left - $share;
+                $dense->data[$r * ($pairs + $bins) + $p] = $share;
+                $compact->data[$r * ($kept + 1) + $p] = $share;
+            }
+        }
+
+        for (usize $s = 0; $s < $slots; $s++) {
+            $inputs->data[$r * ($pairs + $slots) + $pairs + $s] = $rng->below(3) as float64;
+        }
+
+        float64 $value = $rng->uniform(-6.0, 6.0);
+        $compact->data[$r * ($kept + 1) + $kept] = $value;
+        array<float64> $spread = ann::cuda::bins($value, $bins, -8.0, 8.0, 0.75);
+
+        foreach (0 .. $bins as $b) {
+            $dense->data[$r * ($pairs + $bins) + $pairs + $b] = $spread[$b];
+        }
+    }
+
+    $cpuData = Dataset($inputs, $dense);
+    $gpuData = Dataset($inputs, $compact);
+    $cpu = Model(policy($pairs, $slots, 16, 4, 2, $bins), $seed: 9);
+    $host = Model(policy($pairs, $slots, 16, 4, 2, $bins), $seed: 9);
+    $heads = Heads()->add($pairs, CrossEntropy())->add($bins, CrossEntropy());
+    $parts = Parts()->add($pairs, .softmax($kept))->add($bins, .gauss(-8.0, 8.0, 0.75));
+
+    $gnet = guard $gpu->mirror($host, $batch) else ($e) {
+        die("policy: {$e}");
+    }
+
+    $adam = Adam($rate: 0.003);
+    $update = Update::adam(Adam($rate: 0.003));
+
+    for (usize $step = 0; $step < 20; $step++) {
+        usize $first = ($step * $batch) % ($n - $batch + 1);
+        array<usize> $rows = arr::room<usize>($batch);
+
+        for (usize $i = 0; $i < $batch; $i++) {
+            $rows[] = $first + $i;
+        }
+
+        $want = $cpu->learn($cpuData->batch($rows), $heads, $adam);
+        $got = $gnet->learn($gpuData->batch($rows), $parts, $update);
+
+        if (!close($want, $got, 0.001)) {
+            die("policy: step {$step} loss cpu {$want} gpu {$got}");
+        }
+    }
+
+    $gnet->sync();
+    $pc = $cpu->predict($inputs);
+    $pg = $gnet->predict($inputs);
+
+    foreach (0 .. $pc->data->count() as $i) {
+        if (!close($pc->data[$i], $pg->data[$i], 0.002)) {
+            die("policy: predict {$i} cpu {$pc->data[$i]} gpu {$pg->data[$i]}");
+        }
+    }
+
+    array<float64> $measured = $gnet->measure($gpuData, $parts);
+    $cpuLoss = $cpu->evaluate($cpuData, $heads)->loss;
+    float64 $sum = $measured[0] + $measured[1];
+
+    if (!close($cpuLoss, $sum, 0.001)) {
+        die("policy: measured {$measured[0]} + {$measured[1]}, cpu {$cpuLoss}");
+    }
+
+    echo "ok  policy and value by parts, pair logits, parallel, embedding, relations (policy {$measured[0]:.4f}, value {$measured[1]:.4f})";
+}
+
+/**
+ * One training step of a board-sized policy network, full float32 and
+ * through TF32 tensor cores.
+ */
+internal function boards(Random& $rng) : void
+{
+    usize $pairs = 160;
+    usize $slots = 123;
+    usize $batch = 256;
+    usize $bins = 64;
+    array<usize> $shape = [$batch, $pairs + $slots];
+    Tensor $inputs = Tensor($shape);
+
+    for (usize $r = 0; $r < $batch; $r++) {
+        for (usize $p = 0; $p < $pairs; $p++) {
+            $inputs->data[$r * ($pairs + $slots) + $p] = $rng->below($slots * $slots) as float64;
+        }
+        for (usize $s = 0; $s < $slots; $s++) {
+            $inputs->data[$r * ($pairs + $slots) + $pairs + $s] = $rng->below(3) as float64;
+        }
+    }
+
+    $targets = noise($rng, $batch, 17, 0.0, 0.1);
+    $data = Dataset($inputs, $targets);
+    $parts = Parts()->add($pairs, .softmax(16))->add($bins, .gauss(-32.0, 32.0, 0.75));
+
+    foreach ([false, true] as $tensor) {
+        bool $tf32 = $tensor;
+        $gpu = guard Gpu::open(0, $tf32) else ($e) {
+            die("{$e}");
+        }
+        $model = Model(policy($pairs, $slots, 256, 8, 8, $bins), $seed: 4);
+
+        $gnet = guard $gpu->mirror($model, $batch) else ($e) {
+            die("boards: {$e}");
+        }
+
+        $update = Update::adam(Adam());
+        $gnet->learn($data, $parts, $update);
+        $began = time::instant::now();
+
+        for (int32 $i = 0; $i < 10; $i++) {
+            $gnet->learn($data, $parts, $update);
+        }
+
+        float64 $ms = $began->elapsed()->as_float_secs() * 100.0;
+        float64 $rate = ($batch as float64) * 1000.0 / $ms;
+        echo "bench: board policy net, {$model->parameterCount()} params, batch {$batch}, tf32 {$tf32}: {$ms:.1f} ms a step, {$rate:.0f} positions/s";
+        $began = time::instant::now();
+        $gnet->predict($inputs);
+        float64 $inferMs = $began->elapsed()->as_float_secs() * 1000.0;
+        echo "bench: predict {$batch} positions {$inferMs:.1f} ms";
+    }
+}
+
+// one transformer step on both, the size halmakings trains
+internal function bench(Gpu $gpu, Random& $rng) : void
+{
+    usize $slots = 20;
+    usize $features = 12;
+    usize $batch = 512;
+    $data = Dataset(noise($rng, $batch, $slots * $features, -1.0, 1.0), noise($rng, $batch, 1, 0.0, 1.0));
+    $cpu = Model(tokens($slots, $features, 64, 4, 4, 1), $seed: 2);
+    $host = Model(tokens($slots, $features, 64, 4, 4, 1), $seed: 2);
+
+    $gnet = guard $gpu->mirror($host, $batch) else ($e) {
+        die("bench: {$e}");
+    }
+
+    $adam = Adam();
+    $began = time::instant::now();
+    $cpu->learn($data, SigmoidCrossEntropy(), $adam);
+    float64 $cpuSeconds = $began->elapsed()->as_float_secs();
+
+    $objective = Objective::sigmoidCE(SigmoidCrossEntropy());
+    $update = Update::adam(Adam());
+    $gnet->learn($data, $objective, $update);
+    $began = time::instant::now();
+
+    for (int32 $i = 0; $i < 20; $i++) {
+        $gnet->learn($data, $objective, $update);
+    }
+
+    float64 $gpuSeconds = $began->elapsed()->as_float_secs() / 20.0;
+    float64 $cpuMs = $cpuSeconds * 1000.0;
+    float64 $gpuMs = $gpuSeconds * 1000.0;
+    float64 $speedup = $cpuSeconds / $gpuSeconds;
+    echo "bench: transformer step, batch {$batch}, {$host->parameterCount()} params: cpu {$cpuMs:.1f} ms, gpu {$gpuMs:.2f} ms ({$speedup:.0f}x)";
+}
+
+// full float32 products, so the GPU can be held to the CPU
+$gpu = guard Gpu::open(0, false) else ($e) {
+    die("{$e}");
+}
+
+echo "device: {$gpu->name()}, cuBLAS {$gpu->accelerated()}";
+
+$rng = Random(11);
+usize $n = 300;
+$x = noise($rng, $n, 13, -1.0, 1.0);
+$regression = Dataset($x, noise($rng, $n, 3, -1.0, 1.0), weights: noise($rng, $n, 1, 0.5, 1.5));
+$binary = Dataset($x, noise($rng, $n, 3, 0.0, 1.0));
+$classes = Dataset($x, onehot($rng, $n, 5));
+$slotted = noise($rng, $n, 30, -1.0, 1.0);
+$valued = Dataset($slotted, noise($rng, $n, 1, 0.0, 1.0));
+$pooled = Dataset($slotted, noise($rng, $n, 2, -1.0, 1.0));
+
+check($gpu, 'mse adam', 'mlp', MeanSquaredError(), Objective::mse(MeanSquaredError()), Adam(), Update::adam(Adam()), 0.0, $regression, 64);
+check($gpu, 'mse adamw clip', 'mlp', MeanSquaredError(), Objective::mse(MeanSquaredError()), Adam($rate: 0.003, $weightDecay: 0.01), Update::adam(Adam($rate: 0.003, $weightDecay: 0.01)), 0.5, $regression, 64);
+check($gpu, 'mae sgd', 'mlp', MeanAbsoluteError(), Objective::mae(MeanAbsoluteError()), Sgd($rate: 0.05), Update::sgd(Sgd($rate: 0.05)), 0.0, $regression, 50);
+check($gpu, 'huber nesterov', 'mlp', Huber($delta: 0.3), Objective::huber(Huber($delta: 0.3)), Sgd($rate: 0.02, $momentum: 0.9, $nesterov: true), Update::sgd(Sgd($rate: 0.02, $momentum: 0.9, $nesterov: true)), 1.0, $regression, 37);
+check($gpu, 'bce adam', 'sigmoid', BinaryCrossEntropy(), Objective::bce(BinaryCrossEntropy()), Adam(), Update::adam(Adam()), 0.0, $binary, 64);
+check($gpu, 'sigmoid cross-entropy', 'mlp', SigmoidCrossEntropy(), Objective::sigmoidCE(SigmoidCrossEntropy()), Adam(), Update::adam(Adam()), 0.0, $binary, 64);
+check($gpu, 'cross-entropy adam', 'mlp', CrossEntropy($smoothing: 0.1), Objective::crossEntropy(CrossEntropy($smoothing: 0.1)), Adam(), Update::adam(Adam()), 0.0, $classes, 100);
+check($gpu, 'layer norm', 'norm', MeanSquaredError(), Objective::mse(MeanSquaredError()), Adam(), Update::adam(Adam()), 0.0, $regression, 64);
+check($gpu, 'per slot, max pool', 'pool', MeanSquaredError(), Objective::mse(MeanSquaredError()), Adam(), Update::adam(Adam()), 0.0, $pooled, 64);
+check($gpu, 'transformer', 'tokens', SigmoidCrossEntropy(), Objective::sigmoidCE(SigmoidCrossEntropy()), Adam(), Update::adam(Adam()), 0.0, $valued, 64);
+check($gpu, 'transformer clip one row', 'tokens', SigmoidCrossEntropy(), Objective::sigmoidCE(SigmoidCrossEntropy()), Adam(), Update::adam(Adam()), 0.5, $valued, 1);
+
+$cellCodes = codes($rng, $n, 9, 3);
+check($gpu, 'cells, relations', 'cells', SigmoidCrossEntropy(), Objective::sigmoidCE(SigmoidCrossEntropy()), Adam(), Update::adam(Adam()), 0.0, Dataset($cellCodes, noise($rng, $n, 1, 0.0, 1.0)), 64);
+$wideCodes = codes($rng, $n, 70, 3);
+check($gpu, 'cells past the kernel slots', 'wide', MeanSquaredError(), Objective::mse(MeanSquaredError()), Adam(), Update::adam(Adam()), 0.0, Dataset($wideCodes, noise($rng, $n, 2, -1.0, 1.0)), 32);
+policies($gpu, $rng);
+
+fits($gpu, $valued, Dataset(noise($rng, 40, 30, -1.0, 1.0), noise($rng, 40, 1, 0.0, 1.0)));
+bench($gpu, $rng);
+boards($rng);
+
+echo 'all agree';

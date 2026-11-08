@@ -1,0 +1,299 @@
+/**
+ * The CUDA device and the compiled kernels. Open one per program, on the
+ * thread that trains; every `Network` mirrored from it shares the kernels.
+ *
+ *     $gpu = guard ann::cuda::Gpu::open() else ($e) {
+ *         die("{$e}");
+ *     }
+ *
+ * Matrix products go through cuBLAS where the machine has it, rounding
+ * through TF32 tensor cores unless `tensor` is false, and through the
+ * kernels' own product otherwise. Attention over more than `MAX_SLOTS`
+ * slots, or with relations, needs cuBLAS.
+ */
+
+namespace ann::cuda;
+
+use ann::Model;
+
+public class Gpu
+{
+    internal cuda::Device $device;
+    internal Kernels $kernels;
+    internal cuda::Blas? $blas;
+
+    private constructor(cuda::Device $device, Kernels $kernels, cuda::Blas? $blas)
+    {
+        $this->device = $device;
+        $this->kernels = $kernels;
+        $this->blas = $blas;
+    }
+
+    /**
+     * Device `$ordinal` with the kernels compiled. Compiling takes a
+     * moment; do it once. `$tensor` lets cuBLAS round products through
+     * TF32, which is several times faster and about three digits exact.
+     */
+    public static function open(int32 $ordinal = 0, bool $tensor = true) : result<Gpu, GpuError>
+    {
+        cuda::Device $device = guard cuda::Device::open($ordinal) else ($e) {
+            return .error(.unavailable($e->message()));
+        }
+
+        Kernels $kernels = guard compile($device) else ($e) {
+            return .error($e);
+        }
+
+        return .ok(Gpu($device, $kernels, blas($device, $tensor)));
+    }
+
+    /**
+     * Whether cuBLAS runs the matrix products.
+     */
+    public const function accelerated() : bool
+    {
+        return $this->blas != null;
+    }
+
+    /**
+     * What the driver calls the device.
+     */
+    public function name() : string
+    {
+        return $this->device->name;
+    }
+
+    /**
+     * Copy `$model` to the device, ready to train on batches of up to
+     * `$batch` rows. Fails on a layer the GPU does not run.
+     */
+    public function mirror(Model $model, usize $batch = 256) : result<Network, GpuError>
+    {
+        return Network::build($this, $model, $batch);
+    }
+
+    /**
+     * `$rows` x `$cols` floats, zeroed.
+     */
+    internal function matrix(usize $rows, usize $cols) : result<Matrix, GpuError>
+    {
+        usize $one = 1;
+        usize $bytes = std::math::max($rows * $cols, $one) * 4;
+
+        cuda::Buffer $buffer = guard $this->device->alloc($bytes) else ($e) {
+            return .error(.device($e->message()));
+        }
+
+        Matrix $m = Matrix($buffer, $rows, $cols);
+        $m->fill(0.0);
+        return .ok($m);
+    }
+
+    /**
+     * One thread per element, in blocks of 256.
+     */
+    internal const function run(const cuda::Kernel& $kernel, const cuda::Args& $args, usize $threads) : void
+    {
+        usize $blocks = ($threads + 255) / 256;
+        launched($kernel->launch(cuda::Dim($blocks as uint32), cuda::Dim(256), $args), $kernel);
+    }
+
+    /**
+     * One thread per element of a `$width` x `$height` grid, 16 x 16 a block.
+     */
+    internal const function grid(const cuda::Kernel& $kernel, const cuda::Args& $args, usize $width, usize $height) : void
+    {
+        usize $across = ($width + 15) / 16;
+        usize $down = ($height + 15) / 16;
+        launched($kernel->launch(cuda::Dim($across as uint32, $down as uint32), cuda::Dim(16, 16), $args), $kernel);
+    }
+
+    /**
+     * `$blocks` blocks of `$threads` along x.
+     */
+    internal const function blocks(const cuda::Kernel& $kernel, const cuda::Args& $args, usize $blocks, usize $threads) : void
+    {
+        launched($kernel->launch(cuda::Dim($blocks as uint32), cuda::Dim($threads as uint32), $args), $kernel);
+    }
+
+    /**
+     * `C = A . B` over an `$m` x `$n` result with the strides given: A's
+     * along m and k, B's along k and n. `$bias` adds a row; `$accumulate`
+     * adds into C instead of overwriting it.
+     */
+    internal const function matmul(const Matrix& $a, const Matrix& $b, const Matrix& $c, const Matrix? $bias, usize $m, usize $n, usize $k, usize $sam, usize $sak, usize $sbk, usize $sbn, bool $accumulate) : void
+    {
+        if ($this->blas != null) {
+            $this->product($a, $b, $c, $bias, $m, $n, $k, $sam, $sak, $sbk, $sbn, $accumulate);
+            return;
+        }
+
+        cuda::Args $args = cuda::Args();
+        $args->buffer($a->buffer);
+        $args->buffer($b->buffer);
+        $args->buffer($c->buffer);
+        usize $flags = 0;
+
+        if ($bias != null) {
+            Matrix $row = guard $bias else {
+                return;
+            }
+            $args->buffer($row->buffer);
+            $flags = 1;
+        } else {
+            $args->buffer($c->buffer);
+        }
+
+        if ($accumulate) {
+            $flags = $flags + 2;
+        }
+
+        usize $across = ($n + 63) / 64;
+        usize $down = ($m + 63) / 64;
+        usize $splits = splits($across * $down, $k);
+        usize $chunk = $k;
+
+        if ($splits > 1) {
+            // every split adds its part, so the result starts from zero
+            if (!$accumulate) {
+                guard $c->buffer->fill(0, $m * $n) else ($e) {
+                    die("ann::cuda: {$e}");
+                }
+            }
+            $flags = $flags + 4;
+            $chunk = ((($k + $splits - 1) / $splits) + 15) / 16 * 16;
+            $splits = ($k + $chunk - 1) / $chunk;
+        }
+
+        $args->u($m);
+        $args->u($n);
+        $args->u($k);
+        $args->u($sam);
+        $args->u($sak);
+        $args->u($sbk);
+        $args->u($sbn);
+        $args->u($flags);
+        $args->u($chunk);
+        launched($this->kernels->matmul->launch(cuda::Dim($across as uint32, $down as uint32, $splits as uint32), cuda::Dim(16, 16), $args), $this->kernels->matmul);
+    }
+
+    /**
+     * `matmul` through cuBLAS: a bias is written into C first and the
+     * product added onto it.
+     */
+    private const function product(const Matrix& $a, const Matrix& $b, const Matrix& $c, const Matrix? $bias, usize $m, usize $n, usize $k, usize $sam, usize $sak, usize $sbk, usize $sbn, bool $accumulate) : void
+    {
+        if ($m == 0 || $n == 0) {
+            return;
+        }
+
+        float64 $beta = 0.0;
+
+        if ($accumulate) {
+            $beta = 1.0;
+        }
+
+        if ($bias != null) {
+            Matrix $row = guard $bias else {
+                return;
+            }
+            cuda::Args $set = cuda::Args();
+            $set->buffer($row->buffer);
+            $set->buffer($c->buffer);
+            $set->u($m);
+            $set->u($n);
+            $set->u($beta as usize);
+            $this->run($this->kernels->setBias, $set, $m * $n);
+            $beta = 1.0;
+        }
+
+        // a side of length one leaves both strides 1; the distance between
+        // rows then only has to be legal, never walked
+        cuda::Operand $left = cuda::Operand($a->buffer->address(), std::math::max($sam, $k));
+
+        if ($sak != 1) {
+            $left = cuda::Operand($a->buffer->address(), std::math::max($sak, $m), true);
+        }
+
+        cuda::Operand $right = cuda::Operand($b->buffer->address(), std::math::max($sbk, $n));
+
+        if ($sbn != 1) {
+            $right = cuda::Operand($b->buffer->address(), std::math::max($sbn, $k), true);
+        }
+
+        cuda::Operand $out = cuda::Operand($c->buffer->address(), $n);
+        $this->multiply($m, $n, $k, $left, $right, $out, 1.0, $beta, 1);
+    }
+
+    /**
+     * `C = alpha * op(A) . op(B) + beta * C` through cuBLAS, `$batch` times
+     * with every operand moving on by its step. Needs cuBLAS.
+     */
+    internal const function multiply(usize $m, usize $n, usize $k, const cuda::Operand& $a, const cuda::Operand& $b, const cuda::Operand& $c, float64 $alpha, float64 $beta, usize $batch) : void
+    {
+        cuda::Blas $blas = guard $this->blas else {
+            die('ann::cuda: a batched product needs cuBLAS');
+        }
+
+        guard $blas->gemm($m, $n, $k, $a, $b, $c, $alpha, $beta, $batch) else ($e) {
+            die("ann::cuda: {$e}");
+        }
+    }
+
+    /**
+     * Where float `$at` of `$m` lies on the device, for an operand.
+     */
+    internal static function at(const Matrix& $m, usize $at) : uint64
+    {
+        return $m->buffer->address() + (($at * 4) as uint64);
+    }
+
+    /**
+     * Wait for every queued launch.
+     */
+    internal const function finish() : void
+    {
+        guard $this->device->synchronize() else ($e) {
+            die("ann::cuda: {$e}");
+        }
+    }
+}
+
+/**
+ * A cuBLAS handle, or null where cuBLAS does not load.
+ */
+private function blas(const cuda::Device& $device, bool $tensor) : cuda::Blas?
+{
+    cuda::Blas $opened = guard cuda::Blas::open($device, $tensor) else ($e) {
+        return null;
+    }
+
+    return $opened;
+}
+
+/**
+ * How many parts a matmul's k is split into: enough blocks to keep the
+ * device busy when the result has few tiles, never parts under 512 long.
+ */
+internal function splits(usize $tiles, usize $k) : usize
+{
+    if ($tiles >= 128 || $k < 1024) {
+        return 1;
+    }
+
+    usize $want = 256 / $tiles;
+    usize $most = $k / 512;
+    usize $one = 1;
+    return std::math::max(std::math::min($want, $most), $one);
+}
+
+/**
+ * A launch that could not be queued is a bug or a lost device; neither is
+ * something a training loop can carry on from.
+ */
+private function launched(status<cuda::Error> $done, const cuda::Kernel& $kernel) : void
+{
+    guard $done else ($e) {
+        die("ann::cuda: launching {$kernel->name}: {$e}");
+    }
+}

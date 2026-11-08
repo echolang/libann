@@ -1,0 +1,194 @@
+/**
+ * Looks codes up in a table. The input is `[rows, slots]`, one small whole
+ * number per slot stored as a float, below `vocabulary`. The output is
+ * `[rows, slots * width]`: every slot gets the table row its code names
+ * plus a learned row of its own. A board turns into tokens this way, the
+ * code saying what stands on a cell and the slot row which cell it is.
+ *
+ *     Sequential()
+ *         ->add(Embedding(121, 3, 64))                  // empty, mine, theirs
+ *         ->add(Residual(SelfAttention(121, 64, $heads: 4)));
+ *
+ * Codes carry no gradient, so it belongs first in a network.
+ */
+
+namespace ann;
+
+public class Embedding : Layer
+{
+    /**
+     * Codes per row, and tokens out.
+     */
+    public const usize $slots;
+
+    /**
+     * How many different codes there are; every code is below it.
+     */
+    public const usize $vocabulary;
+
+    /**
+     * Values per token.
+     */
+    public const usize $width;
+
+    /**
+     * `[vocabulary, width]`, one row per code.
+     */
+    public Param $table;
+
+    /**
+     * `[slots, width]`, one row per slot.
+     */
+    public Param $position;
+
+    private Tensor $codes;
+
+    init
+    {
+        if ($this->slots == 0 || $this->vocabulary == 0 || $this->width == 0) {
+            die('ann::Embedding: needs slots, codes and values per token');
+        }
+
+        array<usize> $tableShape = [$this->vocabulary, $this->width];
+        array<usize> $positionShape = [$this->slots, $this->width];
+        array<usize> $empty = [0, $this->slots];
+        $this->table = Param('table', $tableShape);
+        $this->position = Param('position', $positionShape);
+        $this->codes = Tensor($empty);
+    }
+
+    public static function decode(Decoder $in, Registry $registry) : result<Layer, ModelError>
+    {
+        usize $slots = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        usize $vocabulary = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        usize $width = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        if ($slots == 0 || $vocabulary == 0 || $width == 0) {
+            return .error(.badValue($width as uint64));
+        }
+
+        Layer $layer = Embedding($slots, $vocabulary, $width);
+        return .ok($layer);
+    }
+
+    /**
+     * Values per output sample: `slots * width`.
+     */
+    public const function outputs() : usize
+    {
+        return $this->slots * $this->width;
+    }
+
+    public function forward(const Tensor& $input, Mode $mode) : Tensor
+    {
+        if ($input->cols() != $this->slots) {
+            die("ann::Embedding: expected {$this->slots} codes per sample, got {$input->cols()}");
+        }
+
+        usize $rows = $input->rows();
+        array<usize> $shape = [$rows, $this->outputs()];
+        Tensor $out = Tensor($shape);
+
+        for (usize $r = 0; $r < $rows; $r++) {
+            for (usize $s = 0; $s < $this->slots; $s++) {
+                usize $code = $this->code($input, $r, $s);
+                usize $to = ($r * $this->slots + $s) * $this->width;
+                usize $row = $code * $this->width;
+                usize $own = $s * $this->width;
+
+                for (usize $k = 0; $k < $this->width; $k++) {
+                    $out->data[$to + $k] = $this->table->value->data[$row + $k] + $this->position->value->data[$own + $k];
+                }
+            }
+        }
+
+        if ($mode == Mode::train) {
+            $this->codes = $input;
+        }
+
+        return $out;
+    }
+
+    public function backward(const Tensor& $gradient) : Tensor
+    {
+        usize $rows = $this->codes->rows();
+
+        for (usize $r = 0; $r < $rows; $r++) {
+            for (usize $s = 0; $s < $this->slots; $s++) {
+                usize $code = $this->code($this->codes, $r, $s);
+                usize $from = ($r * $this->slots + $s) * $this->width;
+                usize $row = $code * $this->width;
+                usize $own = $s * $this->width;
+
+                for (usize $k = 0; $k < $this->width; $k++) {
+                    float64 $g = $gradient->data[$from + $k];
+                    $this->table->grad->data[$row + $k] = $this->table->grad->data[$row + $k] + $g;
+                    $this->position->grad->data[$own + $k] = $this->position->grad->data[$own + $k] + $g;
+                }
+            }
+        }
+
+        // codes are not something to descend on
+        return Tensor($this->codes->shape);
+    }
+
+    public const function params() : array<Param>
+    {
+        array<Param> $all = [$this->table, $this->position];
+        return $all;
+    }
+
+    public function initialize(Random& $rng) : void
+    {
+        // each token starts near unit length
+        float64 $spread = std::math::sqrt(3.0 / ($this->width as float64));
+
+        foreach (0 .. $this->table->value->data->count() as $i) {
+            $this->table->value->data[$i] = $rng->uniform(-$spread, $spread);
+        }
+
+        foreach (0 .. $this->position->value->data->count() as $i) {
+            $this->position->value->data[$i] = $rng->uniform(-$spread, $spread);
+        }
+    }
+
+    public const function kind() : string
+    {
+        return 'embedding';
+    }
+
+    public const function encode(Encoder $out) : void
+    {
+        $out->size($this->slots);
+        $out->size($this->vocabulary);
+        $out->size($this->width);
+    }
+
+    public const function summary() : string
+    {
+        usize $count = ($this->vocabulary + $this->slots) * $this->width;
+        return "embedding {$this->slots} slots, {$this->vocabulary} codes -> {$this->width} ({$count} params)";
+    }
+
+    /**
+     * The code at slot `$s` of row `$r`, checked against the vocabulary.
+     */
+    private const function code(const Tensor& $codes, usize $r, usize $s) : usize
+    {
+        float64 $raw = $codes->data[$r * $this->slots + $s];
+
+        if ($raw < 0.0 || $raw >= ($this->vocabulary as float64)) {
+            die("ann::Embedding: code {$raw} at slot {$s} is outside 0 ..< {$this->vocabulary}");
+        }
+
+        return $raw as usize;
+    }
+}

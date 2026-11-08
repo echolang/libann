@@ -1,0 +1,976 @@
+/**
+ * An `ann::Model` mirrored on the GPU. A training step queues forward,
+ * loss, backward, clip and the optimizer, and waits once, when it reads the
+ * loss back. Weights stay on the device until `sync` writes them back into
+ * the host model, so save, load and CPU predict see the trained network
+ * only after that.
+ *
+ *     $net = guard $gpu->mirror($model, $batch: 512) else ($e) {
+ *         die("{$e}");
+ *     }
+ *
+ *     $loss = $net->learn($batch, Objective::sigmoidCE(SigmoidCrossEntropy()), Update::adam($adam));
+ *     $net->sync();
+ *
+ * Runs Dense, Act, LayerNorm, Pool, SelfAttention (with relations too),
+ * Embedding and PairLogits, and Sequential, Residual, PerSlot and
+ * Parallel around them, nested any way. Batches are at most
+ * `capacity` rows; `predict` takes any number and walks them in pieces of
+ * that size.
+ */
+
+namespace ann::cuda;
+
+use ann::{Act, Dataset, Dense, Embedding, Evaluation, Layer, LayerNorm, Metric, Model, PairLogits, Parallel, PerSlot, Pool, PoolMode, Residual, SelfAttention, Sequential, Tensor};
+
+/**
+ * Buffers for the loss, clipping and gathering. Sized once for `capacity`
+ * rows.
+ */
+internal struct Head
+{
+    internal Matrix $targets;
+    internal Matrix $weights;
+    internal Matrix $losses;
+    internal Matrix $partials;
+    internal Matrix $scale;
+    internal Matrix $indices;
+}
+
+/**
+ * A dataset uploaded once, for `Trainer` to gather batches from without
+ * leaving the device.
+ */
+internal struct Resident
+{
+    internal Matrix $inputs;
+    internal Matrix $targets;
+    internal Matrix $weights;
+}
+
+/**
+ * One layer opened as a stage, with the matrices it writes.
+ */
+internal struct Opened
+{
+    internal Stage $stage;
+    internal Matrix $out;
+    internal Matrix $gradOut;
+}
+
+public class Network
+{
+    /**
+     * The host model. Its params catch up on `sync`.
+     */
+    public Model $model;
+
+    /**
+     * Most rows one step takes.
+     */
+    public const usize $capacity;
+
+    /**
+     * Values per input sample, and per output.
+     */
+    public const usize $inputs;
+    public const usize $outputs;
+
+    private Gpu $gpu;
+    private Stage $stage;
+    private array<Slot> $slots;
+    private Matrix $input;
+    private Matrix $output;
+    private Matrix $gradient;
+    private Head $head;
+    private uint64 $steps = 0;
+
+    private constructor(Gpu $gpu, Model $model, usize $capacity, Stage $stage, array<Slot> $slots, Matrix $input, Matrix $output, Matrix $gradient, Head $head)
+    {
+        $this->gpu = $gpu;
+        $this->model = $model;
+        $this->capacity = $capacity;
+        $this->stage = $stage;
+        $this->slots = $slots;
+        $this->input = $input;
+        $this->output = $output;
+        $this->gradient = $gradient;
+        $this->inputs = $input->cols;
+        $this->outputs = $output->cols;
+        $this->head = $head;
+    }
+
+    internal static function build(Gpu $gpu, Model $model, usize $capacity) : result<Network, GpuError>
+    {
+        if ($capacity == 0) {
+            die('ann::cuda: a network needs room for at least one row');
+        }
+
+        usize $inputs = guard width($model->root) else {
+            return .error(.shape('the input width cannot be told from the first layer; start with a Dense, LayerNorm, SelfAttention or PerSlot of one'));
+        }
+
+        Matrix $input = guard $gpu->matrix($capacity, $inputs) else ($e) {
+            return .error($e);
+        }
+
+        // nothing reads it, but nested views need it to have the input's shape
+        Matrix $gradIn = guard $gpu->matrix($capacity, $inputs) else ($e) {
+            return .error($e);
+        }
+
+        array<Slot> $slots = array<Slot>();
+        usize $partials = 0;
+
+        Opened $top = guard open($gpu, $model->root, 'root', $input, $gradIn, $capacity, $slots, $partials) else ($e) {
+            return .error($e);
+        }
+
+        // a ranked part reads three target columns for its one output
+        usize $targetCols = std::math::max($top->out->cols as uint64, 3 as uint64) as usize;
+        Head $head = guard head($gpu, $capacity, $targetCols, $partials) else ($e) {
+            return .error($e);
+        }
+
+        return .ok(Network($gpu, $model, $capacity, $top->stage, $slots, $input, $top->out, $top->gradOut, $head));
+    }
+
+    /**
+     * One supervised step on `$batch`, the GPU twin of `Model::learn`:
+     * forward, weighted loss, backward, clip to global L2 `$clip` when
+     * above zero, optimizer. Returns the batch's loss before the step.
+     */
+    public function learn(const Dataset& $batch, const Objective& $objective, const Update& $update, float64 $clip = 0.0) : float64
+    {
+        usize $rows = $batch->count();
+        $this->expect($batch->inputs, $batch->targets, $rows);
+        $this->input->load($batch->inputs, 0, $rows);
+        $this->head->targets->view($this->capacity, $this->outputs)->load($batch->targets, 0, $rows);
+        $this->head->weights->load($batch->weights, 0, $rows);
+        return $this->train($rows, $objective, $update, $clip);
+    }
+
+    /**
+     * Raw network output for every row of `$inputs`, in pieces of
+     * `capacity` rows. Pass it through `Objective::loss()->predict` for
+     * what the loss means by it (a sigmoid, for sigmoid cross-entropy).
+     */
+    public function predict(const Tensor& $inputs) : Tensor
+    {
+        if ($inputs->cols() != $this->inputs) {
+            die("ann::cuda: expected {$this->inputs} values per sample, got {$inputs->cols()}");
+        }
+
+        usize $total = $inputs->rows();
+        array<usize> $shape = [$total, $this->outputs];
+        Tensor $out = Tensor($shape);
+        usize $first = 0;
+
+        while ($first < $total) {
+            usize $rows = std::math::min($this->capacity, $total - $first);
+            $this->input->load($inputs, $first, $rows);
+            $this->stage->forward($rows);
+            $this->output->read($out, $first, $rows);
+            $first = $first + $rows;
+        }
+
+        return $out;
+    }
+
+    /**
+     * Loss and metric over `$data`, like `Model::evaluate`. The network
+     * runs on the GPU; scoring runs on the CPU with the host loss.
+     */
+    public function evaluate(const Dataset& $data, const Objective& $objective, Metric $metric = .none) : Evaluation
+    {
+        Tensor $output = $this->predict($data->inputs);
+        float64 $loss = $data->loss($objective->loss(), $output);
+        float64 $score = 0.0;
+
+        if ($metric != Metric::none) {
+            $score = $metric->score($objective->loss()->predict($output), $data->targets);
+        }
+
+        return Evaluation($loss, $score);
+    }
+
+    /**
+     * Device weights into the host model's params. Save, load and CPU
+     * `predict` see the trained network after this.
+     */
+    public function sync() : void
+    {
+        foreach ($this->slots as $slot) {
+            $slot->sync();
+        }
+    }
+
+    /**
+     * Host params onto the device, after changing them on the CPU (a
+     * `restore`, a `copy`). Optimizer state is kept.
+     */
+    public function reload() : void
+    {
+        foreach ($this->slots as $slot) {
+            $slot->reload();
+        }
+    }
+
+    /**
+     * Upload `$data` for `Trainer` to gather from.
+     */
+    internal function upload(const Dataset& $data) : result<Resident, GpuError>
+    {
+        usize $rows = $data->count();
+        $this->expect($data->inputs, $data->targets, std::math::min($rows, $this->capacity));
+
+        Matrix $inputs = guard $this->gpu->matrix($rows, $this->inputs) else ($e) {
+            return .error($e);
+        }
+
+        Matrix $targets = guard $this->gpu->matrix($rows, $this->outputs) else ($e) {
+            return .error($e);
+        }
+
+        Matrix $weights = guard $this->gpu->matrix($rows, 1) else ($e) {
+            return .error($e);
+        }
+
+        $inputs->load($data->inputs, 0, $rows);
+        $targets->load($data->targets, 0, $rows);
+        $weights->load($data->weights, 0, $rows);
+        return .ok(Resident($inputs, $targets, $weights));
+    }
+
+    /**
+     * One step on the named rows of `$data`, gathered on the device.
+     */
+    internal function learn(resident: const Resident& $data, const array<usize>& $indices, const Objective& $objective, const Update& $update, float64 $clip) : float64
+    {
+        usize $rows = $indices->count();
+
+        if ($rows > $this->capacity) {
+            die("ann::cuda: a batch of {$rows} rows, but the network was mirrored for {$this->capacity}");
+        }
+
+        $this->head->indices->indices($indices, $rows);
+        $this->gather($data->inputs, $this->input, $rows);
+        $this->gather($data->targets, $this->head->targets->view($this->capacity, $this->outputs), $rows);
+        $this->gather($data->weights, $this->head->weights, $rows);
+        return $this->train($rows, $objective, $update, $clip);
+    }
+
+    private const function gather(const Matrix& $source, const Matrix& $into, usize $rows) : void
+    {
+        cuda::Args $a = cuda::Args();
+        $a->buffer($source->buffer);
+        $a->buffer($this->head->indices->buffer);
+        $a->buffer($into->buffer);
+        $a->u($rows);
+        $a->u($into->cols);
+        $this->gpu->grid($this->gpu->kernels->gather, $a, $into->cols, $rows);
+    }
+
+    private function train(usize $rows, const Objective& $objective, const Update& $update, float64 $clip) : float64
+    {
+        $this->stage->forward($rows);
+
+        Head& $head = $this->head;
+        cuda::Args $loss = cuda::Args();
+        $loss->buffer($this->output->buffer);
+        $loss->buffer($head->targets->buffer);
+        $loss->buffer($head->weights->buffer);
+        $loss->buffer($head->losses->buffer);
+        $loss->buffer($this->gradient->buffer);
+        $loss->u($rows);
+        $loss->u($this->outputs);
+        $loss->u($objective->kind());
+        $loss->f($objective->param());
+        $loss->f(1.0 / std::math::max($rows as float64, 1.0));
+        $this->gpu->run($this->gpu->kernels->loss, $loss, $rows);
+        return $this->step($rows, $update, $clip);
+    }
+
+    /**
+     * Backward from the output gradient the loss left, clipping, the
+     * optimizer, and the batch's mean loss read back.
+     */
+    private function step(usize $rows, const Update& $update, float64 $clip) : float64
+    {
+        Head& $head = $this->head;
+        $this->stage->backward($rows, false);
+
+        if ($clip > 0.0) {
+            foreach ($this->slots as $slot) {
+                $slot->squares($this->gpu, $head->partials);
+            }
+
+            cuda::Args $c = cuda::Args();
+            $c->buffer($head->partials->buffer);
+            $c->buffer($head->scale->buffer);
+            $c->u($head->partials->cols);
+            $c->f($clip);
+            $this->gpu->blocks($this->gpu->kernels->clip, $c, 1, 1);
+        } else {
+            $head->scale->fill(1.0);
+        }
+
+        $this->steps = $this->steps + 1;
+
+        foreach ($this->slots as $slot) {
+            $update->encode($this->gpu, $slot, $head->scale, $this->steps);
+        }
+
+        // reading the losses back waits for everything queued before it
+        return $head->losses->total($rows) / std::math::max($rows as float64, 1.0);
+    }
+
+    /**
+     * One supervised step on `$batch` with the output scored in parts.
+     * The batch's targets hold `parts->targets()` columns.
+     */
+    public function learn(const Dataset& $batch, const Parts& $parts, const Update& $update, float64 $clip = 0.0) : float64
+    {
+        usize $rows = $batch->count();
+        Matrix $targets = $this->split($batch, $parts, $rows);
+        $this->input->load($batch->inputs, 0, $rows);
+        $targets->load($batch->targets, 0, $rows);
+        $this->head->weights->load($batch->weights, 0, $rows);
+        $this->stage->forward($rows);
+        $this->score($rows, $parts, $targets, 0, false);
+        return $this->step($rows, $update, $clip);
+    }
+
+    /**
+     * The mean loss of every part over `$data`, in `add` order, without
+     * training: a validation set's numbers.
+     */
+    public function measure(const Dataset& $data, const Parts& $parts) : array<float64>
+    {
+        usize $total = $data->count();
+        array<float64> $sums = arr::room<float64>($parts->parts->count());
+
+        foreach (0 .. $parts->parts->count() as $i) {
+            $sums[] = 0.0;
+        }
+
+        usize $first = 0;
+
+        while ($first < $total) {
+            usize $rows = std::math::min($this->capacity, $total - $first);
+            Matrix $targets = $this->split($data, $parts, $rows);
+            $this->input->load($data->inputs, $first, $rows);
+            $targets->load($data->targets, $first, $rows);
+            $this->head->weights->load($data->weights, $first, $rows);
+            $this->stage->forward($rows);
+
+            foreach (0 .. $parts->parts->count() as $i) {
+                $this->score($rows, $parts, $targets, $i, true);
+                $sums[$i] = $sums[$i] + $this->head->losses->total($rows);
+            }
+
+            $first = $first + $rows;
+        }
+
+        foreach (0 .. $sums->count() as $i) {
+            $sums[$i] = $sums[$i] / std::math::max($total as float64, 1.0);
+        }
+
+        return $sums;
+    }
+
+    /**
+     * The targets matrix seen as `parts->targets()` columns, after checking
+     * the batch fits.
+     */
+    private const function split(const Dataset& $batch, const Parts& $parts, usize $rows) : Matrix
+    {
+        if ($rows > $this->capacity) {
+            die("ann::cuda: a batch of {$rows} rows, but the network was mirrored for {$this->capacity}");
+        }
+
+        if ($batch->inputs->cols() != $this->inputs) {
+            die("ann::cuda: expected {$this->inputs} values per sample, got {$batch->inputs->cols()}");
+        }
+
+        if ($parts->outputs() != $this->outputs) {
+            die("ann::cuda: the parts cover {$parts->outputs()} outputs, the network has {$this->outputs}");
+        }
+
+        if ($batch->targets->cols() != $parts->targets()) {
+            die("ann::cuda: the parts read {$parts->targets()} target columns, the batch has {$batch->targets->cols()}");
+        }
+
+        return $this->head->targets->view($this->capacity, $parts->targets());
+    }
+
+    /**
+     * Run the parts kernel: every part with `$only` false, or part `$which`
+     * alone into a fresh losses column with it true.
+     */
+    private const function score(usize $rows, const Parts& $parts, const Matrix& $targets, usize $which, bool $only) : void
+    {
+        usize $outAt = 0;
+        usize $targetAt = 0;
+        usize $done = 0;
+
+        foreach ($parts->parts as $i => $part) {
+            usize $wants = $part->score->targets($part->outputs);
+
+            if (!$only || $i == $which) {
+                float64 $a = 0.0;
+                float64 $b = 0.0;
+                float64 $c = 0.0;
+                usize $count = $wants;
+
+                match ($part->score) {
+                    .gauss($low, $high, $sigma) => {
+                        $a = $low;
+                        $b = $high;
+                        $c = $sigma;
+                    }
+                    .ranked($temperature, $weight) => {
+                        $a = $temperature;
+                        $b = $weight;
+                    }
+                    else => {}
+                };
+
+                cuda::Args $k = cuda::Args();
+                $k->buffer($this->output->buffer);
+                $k->buffer($targets->buffer);
+                $k->buffer($this->head->weights->buffer);
+                $k->buffer($this->head->losses->buffer);
+                $k->buffer($this->gradient->buffer);
+                $k->u($rows);
+                $k->u($this->outputs);
+                $k->u($outAt);
+                $k->u($part->outputs);
+                $k->u($targets->cols);
+                $k->u($targetAt);
+                $k->u($count);
+                $k->u($part->score->code());
+                $k->f($a);
+                $k->f($b);
+                $k->f($c);
+                $k->f($part->weight);
+                $k->f(1.0 / std::math::max($rows as float64, 1.0));
+                $k->u($done);
+                $this->gpu->run($this->gpu->kernels->parts, $k, $rows);
+                $done = 1;
+            }
+
+            $outAt = $outAt + $part->outputs;
+            $targetAt = $targetAt + $wants;
+        }
+    }
+
+    private const function expect(const Tensor& $inputs, const Tensor& $targets, usize $rows) : void
+    {
+        if ($rows > $this->capacity) {
+            die("ann::cuda: a batch of {$rows} rows, but the network was mirrored for {$this->capacity}");
+        }
+
+        if ($inputs->cols() != $this->inputs) {
+            die("ann::cuda: expected {$this->inputs} values per sample, got {$inputs->cols()}");
+        }
+
+        if ($targets->cols() != $this->outputs) {
+            die("ann::cuda: expected {$this->outputs} values per target, got {$targets->cols()}");
+        }
+    }
+}
+
+/**
+ * The input width a layer takes, when the layer itself says. Containers
+ * ask their first layer.
+ */
+internal function width(Layer $layer) : usize?
+{
+    string $kind = $layer->kind();
+
+    if ($kind == 'dense') {
+        Dense $dense = $layer as Dense;
+        return $dense->inputs;
+    }
+
+    if ($kind == 'layernorm') {
+        LayerNorm $norm = $layer as LayerNorm;
+        return $norm->features;
+    }
+
+    if ($kind == 'attention' || $kind == 'relattention') {
+        SelfAttention $attention = $layer as SelfAttention;
+        return $attention->slots * $attention->width;
+    }
+
+    if ($kind == 'embedding') {
+        Embedding $embedding = $layer as Embedding;
+        return $embedding->slots;
+    }
+
+    if ($kind == 'pairlogits') {
+        PairLogits $pairs = $layer as PairLogits;
+        return $pairs->inputs();
+    }
+
+    if ($kind == 'parallel') {
+        Parallel $parallel = $layer as Parallel;
+        usize $most = 0;
+
+        foreach ($parallel->branches as $branch) {
+            $most = std::math::max($most, $branch->from + $branch->count);
+        }
+
+        if ($most == 0) {
+            return null;
+        }
+
+        return $most;
+    }
+
+    if ($kind == 'residual') {
+        Residual $residual = $layer as Residual;
+        return width($residual->inner);
+    }
+
+    if ($kind == 'perslot') {
+        PerSlot $per = $layer as PerSlot;
+        usize $inner = guard width($per->inner) else {
+            return null;
+        }
+        return $per->slots * $inner;
+    }
+
+    if ($kind == 'sequential') {
+        Sequential $sequence = $layer as Sequential;
+
+        if ($sequence->layers->empty()) {
+            return null;
+        }
+
+        return width($sequence->layers[0]);
+    }
+
+    return null;
+}
+
+/**
+ * `$layer` as a stage reading `$in` (`$rows` rows of capacity) and writing
+ * its gradient into `$gradIn`. Params are appended to `$slots`, their
+ * squares partials counted in `$partials`.
+ */
+internal function open(Gpu $gpu, Layer $layer, const string& $where, Matrix $in, Matrix $gradIn, usize $rows, array<Slot>& $slots, usize& $partials) : result<Opened, GpuError>
+{
+    string $kind = $layer->kind();
+
+    if ($kind == 'sequential') {
+        Sequential $sequence = $layer as Sequential;
+        array<Stage> $children = array<Stage>();
+        Matrix $at = $in;
+        Matrix $gradAt = $gradIn;
+        usize $i = 0;
+
+        foreach ($sequence->layers as $child) {
+            string $path = "{$where}.{$i}";
+            Opened $opened = guard open($gpu, $child, $path, $at, $gradAt, $rows, $slots, $partials) else ($e) {
+                return .error($e);
+            }
+            $children[] = $opened->stage;
+            $at = $opened->out;
+            $gradAt = $opened->gradOut;
+            $i = $i + 1;
+        }
+
+        Stage $stage = SequenceStage($children);
+        return .ok(Opened($stage, $at, $gradAt));
+    }
+
+    if ($kind == 'dense') {
+        Dense $dense = $layer as Dense;
+
+        if ($dense->inputs != $in->cols) {
+            return .error(.shape("layer {$where} takes {$dense->inputs} values but gets {$in->cols}"));
+        }
+
+        Matrix $out = guard $gpu->matrix($rows, $dense->outputs) else ($e) {
+            return .error($e);
+        }
+
+        Matrix $gradOut = guard $gpu->matrix($rows, $dense->outputs) else ($e) {
+            return .error($e);
+        }
+
+        Slot $weight = guard slot($gpu, $dense->weight, $slots, $partials) else ($e) {
+            return .error($e);
+        }
+
+        Slot $bias = guard slot($gpu, $dense->bias, $slots, $partials) else ($e) {
+            return .error($e);
+        }
+
+        Stage $stage = DenseStage($gpu, $dense->inputs, $dense->outputs, $weight, $bias, $in, $out, $gradIn, $gradOut);
+        return .ok(Opened($stage, $out, $gradOut));
+    }
+
+    if ($kind == 'act') {
+        Act $act = $layer as Act;
+
+        Matrix $out = guard $gpu->matrix($rows, $in->cols) else ($e) {
+            return .error($e);
+        }
+
+        Matrix $gradOut = guard $gpu->matrix($rows, $in->cols) else ($e) {
+            return .error($e);
+        }
+
+        usize $code = $act->activation->value() as usize;
+        Stage $stage = ActStage($gpu, $code, $in->cols, $in, $out, $gradIn, $gradOut);
+        return .ok(Opened($stage, $out, $gradOut));
+    }
+
+    if ($kind == 'residual') {
+        Residual $residual = $layer as Residual;
+
+        Matrix $branchGradIn = guard $gpu->matrix($rows, $in->cols) else ($e) {
+            return .error($e);
+        }
+
+        string $path = "{$where}.inner";
+        Opened $inner = guard open($gpu, $residual->inner, $path, $in, $branchGradIn, $rows, $slots, $partials) else ($e) {
+            return .error($e);
+        }
+
+        if ($inner->out->cols != $in->cols) {
+            return .error(.shape("the branch of residual {$where} turns {$in->cols} values into {$inner->out->cols}"));
+        }
+
+        Matrix $out = guard $gpu->matrix($rows, $in->cols) else ($e) {
+            return .error($e);
+        }
+
+        Stage $stage = ResidualStage($gpu, $inner->stage, $in->cols, $in, $inner->out, $out, $inner->gradOut, $branchGradIn, $gradIn);
+        return .ok(Opened($stage, $out, $inner->gradOut));
+    }
+
+    if ($kind == 'perslot') {
+        PerSlot $per = $layer as PerSlot;
+
+        if ($in->cols % $per->slots != 0) {
+            return .error(.shape("per-slot layer {$where} gets {$in->cols} values, not a multiple of {$per->slots} slots"));
+        }
+
+        usize $each = $in->cols / $per->slots;
+        usize $stacked = $rows * $per->slots;
+        Matrix $inView = $in->view($stacked, $each);
+        Matrix $gradView = $gradIn->view($stacked, $each);
+        string $path = "{$where}.inner";
+
+        Opened $inner = guard open($gpu, $per->inner, $path, $inView, $gradView, $stacked, $slots, $partials) else ($e) {
+            return .error($e);
+        }
+
+        usize $outs = $inner->out->cols * $per->slots;
+        Stage $stage = PerSlotStage($inner->stage, $per->slots);
+        return .ok(Opened($stage, $inner->out->view($rows, $outs), $inner->gradOut->view($rows, $outs)));
+    }
+
+    if ($kind == 'layernorm') {
+        LayerNorm $norm = $layer as LayerNorm;
+
+        if ($norm->features != $in->cols) {
+            return .error(.shape("layer norm {$where} takes {$norm->features} values but gets {$in->cols}"));
+        }
+
+        Matrix $out = guard $gpu->matrix($rows, $in->cols) else ($e) {
+            return .error($e);
+        }
+
+        Matrix $gradOut = guard $gpu->matrix($rows, $in->cols) else ($e) {
+            return .error($e);
+        }
+
+        Matrix $normalized = guard $gpu->matrix($rows, $in->cols) else ($e) {
+            return .error($e);
+        }
+
+        Matrix $inverse = guard $gpu->matrix($rows, 1) else ($e) {
+            return .error($e);
+        }
+
+        Slot $gamma = guard slot($gpu, $norm->gamma, $slots, $partials) else ($e) {
+            return .error($e);
+        }
+
+        Slot $beta = guard slot($gpu, $norm->beta, $slots, $partials) else ($e) {
+            return .error($e);
+        }
+
+        Stage $stage = NormStage($gpu, $norm->features, $norm->epsilon, $gamma, $beta, $in, $out, $gradIn, $gradOut, $normalized, $inverse);
+        return .ok(Opened($stage, $out, $gradOut));
+    }
+
+    if ($kind == 'pool') {
+        Pool $pool = $layer as Pool;
+
+        if ($in->cols % $pool->slots != 0) {
+            return .error(.shape("pool {$where} gets {$in->cols} values, not a multiple of {$pool->slots} slots"));
+        }
+
+        usize $h = $in->cols / $pool->slots;
+        usize $width = $h * $pool->mode->blocks();
+        usize $mode = 0;
+
+        if ($pool->mode == PoolMode::max) {
+            $mode = 1;
+        } else if ($pool->mode == PoolMode::meanMax) {
+            $mode = 2;
+        }
+
+        Matrix $out = guard $gpu->matrix($rows, $width) else ($e) {
+            return .error($e);
+        }
+
+        Matrix $gradOut = guard $gpu->matrix($rows, $width) else ($e) {
+            return .error($e);
+        }
+
+        Matrix $winners = guard $gpu->matrix($rows, $h) else ($e) {
+            return .error($e);
+        }
+
+        Stage $stage = PoolStage($gpu, $pool->slots, $h, $mode, $in, $out, $gradIn, $gradOut, $winners);
+        return .ok(Opened($stage, $out, $gradOut));
+    }
+
+    if ($kind == 'attention' || $kind == 'relattention') {
+        SelfAttention $attention = $layer as SelfAttention;
+        usize $s = $attention->slots;
+        usize $w = $attention->width;
+
+        if ($s * $w != $in->cols) {
+            return .error(.shape("attention {$where} takes {$s} slots of {$w} but gets {$in->cols} values"));
+        }
+
+        if (!$gpu->accelerated() && ($s > MAX_SLOTS || $attention->relations > 0)) {
+            usize $most = MAX_SLOTS;
+            return .error(.shape("attention {$where} has {$s} slots or relations; without cuBLAS the GPU kernels take at most {$most} slots and no relations"));
+        }
+
+        usize $stacked = $rows * $s;
+        array<Matrix> $m = array<Matrix>();
+
+        for (int32 $i = 0; $i < 10; $i++) {
+            Matrix $each = guard $gpu->matrix($stacked, $w) else ($e) {
+                return .error($e);
+            }
+            $m[] = $each;
+        }
+
+        Matrix $weights = guard $gpu->matrix($stacked * $attention->heads, $s) else ($e) {
+            return .error($e);
+        }
+
+        Matrix $dScores = guard $gpu->matrix($stacked * $attention->heads, $s) else ($e) {
+            return .error($e);
+        }
+
+        Matrix $positions = guard $gpu->matrix(1, std::math::max($attention->positions->count(), 1 as usize)) else ($e) {
+            return .error($e);
+        }
+
+        $positions->indices($attention->positions, $attention->positions->count());
+        array<Slot> $params = array<Slot>();
+
+        foreach ($attention->params() as $p) {
+            Slot $one = guard slot($gpu, $p, $slots, $partials) else ($e) {
+                return .error($e);
+            }
+            $params[] = $one;
+        }
+
+        Workspace $work = Workspace($m[0], $m[1], $m[2], $m[3], $m[4], $m[5], $m[6], $m[7], $weights, $dScores);
+        Matrix $out = $m[8];
+        Matrix $gradOut = $m[9];
+        Stage $stage = AttentionStage($gpu, $s, $w, $attention->heads, $attention->relations, $params, $positions, $in, $out, $gradIn, $gradOut, $work);
+        return .ok(Opened($stage, $out->view($rows, $s * $w), $gradOut->view($rows, $s * $w)));
+    }
+
+    if ($kind == 'embedding') {
+        Embedding $embedding = $layer as Embedding;
+
+        if ($embedding->slots != $in->cols) {
+            return .error(.shape("embedding {$where} takes {$embedding->slots} codes but gets {$in->cols} values"));
+        }
+
+        if ($embedding->vocabulary > MAX_CODES) {
+            usize $most = MAX_CODES;
+            return .error(.shape("embedding {$where} has {$embedding->vocabulary} codes; the GPU takes at most {$most}"));
+        }
+
+        usize $outs = $embedding->outputs();
+
+        Matrix $out = guard $gpu->matrix($rows, $outs) else ($e) {
+            return .error($e);
+        }
+
+        Matrix $gradOut = guard $gpu->matrix($rows, $outs) else ($e) {
+            return .error($e);
+        }
+
+        Slot $table = guard slot($gpu, $embedding->table, $slots, $partials) else ($e) {
+            return .error($e);
+        }
+
+        Slot $position = guard slot($gpu, $embedding->position, $slots, $partials) else ($e) {
+            return .error($e);
+        }
+
+        Stage $stage = EmbedStage($gpu, $embedding->slots, $embedding->vocabulary, $embedding->width, $table, $position, $in, $out, $gradOut);
+        return .ok(Opened($stage, $out, $gradOut));
+    }
+
+    if ($kind == 'pairlogits') {
+        PairLogits $pairs = $layer as PairLogits;
+
+        if ($pairs->inputs() != $in->cols) {
+            return .error(.shape("pair logits {$where} take {$pairs->inputs()} values but get {$in->cols}"));
+        }
+
+        Matrix $out = guard $gpu->matrix($rows, $pairs->pairs) else ($e) {
+            return .error($e);
+        }
+
+        Matrix $gradOut = guard $gpu->matrix($rows, $pairs->pairs) else ($e) {
+            return .error($e);
+        }
+
+        Stage $stage = PairStage($gpu, $pairs->slots, $pairs->width, $pairs->pairs, $in, $out, $gradIn, $gradOut);
+        return .ok(Opened($stage, $out, $gradOut));
+    }
+
+    if ($kind == 'parallel') {
+        Parallel $parallel = $layer as Parallel;
+        array<Lane> $lanes = array<Lane>();
+        usize $total = 0;
+        usize $i = 0;
+
+        // every lane's output width first, to size the joined output
+        array<Opened?> $opened = array<Opened?>();
+        array<Matrix> $ins = array<Matrix>();
+        array<Matrix> $gradIns = array<Matrix>();
+
+        foreach ($parallel->branches as $branch) {
+            if ($branch->from + $branch->count > $in->cols) {
+                usize $to = $branch->from + $branch->count;
+                return .error(.shape("branch {$i} of parallel {$where} reads columns {$branch->from}..{$to} of {$in->cols}"));
+            }
+
+            Layer $child = guard $branch->layer else {
+                $opened[] = null;
+                $ins[] = $in;
+                $gradIns[] = $gradIn;
+                $total = $total + $branch->count;
+                $i = $i + 1;
+                continue;
+            };
+
+            bool $whole = $branch->from == 0 && $branch->count == $in->cols;
+            Matrix $laneIn = $in;
+
+            if (!$whole) {
+                Matrix $own = guard $gpu->matrix($rows, $branch->count) else ($e) {
+                    return .error($e);
+                }
+                $laneIn = $own;
+            }
+
+            Matrix $laneGradIn = guard $gpu->matrix($rows, $branch->count) else ($e) {
+                return .error($e);
+            }
+
+            string $path = "{$where}.{$i}";
+            Opened $inner = guard open($gpu, $child, $path, $laneIn, $laneGradIn, $rows, $slots, $partials) else ($e) {
+                return .error($e);
+            }
+
+            $opened[] = $inner;
+            $ins[] = $laneIn;
+            $gradIns[] = $laneGradIn;
+            $total = $total + $inner->out->cols;
+            $i = $i + 1;
+        }
+
+        Matrix $out = guard $gpu->matrix($rows, $total) else ($e) {
+            return .error($e);
+        }
+
+        Matrix $gradOut = guard $gpu->matrix($rows, $total) else ($e) {
+            return .error($e);
+        }
+
+        usize $at = 0;
+
+        foreach ($parallel->branches as $k => $branch) {
+            bool $whole = $branch->from == 0 && $branch->count == $in->cols;
+
+            if ($opened[$k] == null) {
+                $lanes[] = Lane($branch->from, $branch->count, $at, null, $in, $out, $gradIn, $gradOut, $whole);
+                $at = $at + $branch->count;
+                continue;
+            }
+
+            Opened $inner = guard $opened[$k] else {
+                continue;
+            };
+
+            $lanes[] = Lane($branch->from, $branch->count, $at, $inner->stage, $ins[$k], $inner->out, $gradIns[$k], $inner->gradOut, $whole);
+            $at = $at + $inner->out->cols;
+        }
+
+        Stage $stage = ParallelStage($gpu, $lanes, $in, $out, $gradIn, $gradOut);
+        return .ok(Opened($stage, $out, $gradOut));
+    }
+
+    return .error(.unsupported($where->clone(), $kind));
+}
+
+private function slot(Gpu $gpu, ann::Param $param, array<Slot>& $slots, usize& $partials) : result<Slot, GpuError>
+{
+    Slot $s = guard Slot::make($gpu, $param, $partials) else ($e) {
+        return .error($e);
+    }
+
+    $partials = $partials + $s->groups;
+    $slots[] = $s;
+    return .ok($s);
+}
+
+private function head(Gpu $gpu, usize $capacity, usize $width, usize $partials) : result<Head, GpuError>
+{
+    Matrix $targets = guard $gpu->matrix($capacity, $width) else ($e) {
+        return .error($e);
+    }
+
+    Matrix $weights = guard $gpu->matrix($capacity, 1) else ($e) {
+        return .error($e);
+    }
+
+    Matrix $losses = guard $gpu->matrix($capacity, 1) else ($e) {
+        return .error($e);
+    }
+
+    Matrix $sums = guard $gpu->matrix(1, $partials) else ($e) {
+        return .error($e);
+    }
+
+    Matrix $scale = guard $gpu->matrix(1, 1) else ($e) {
+        return .error($e);
+    }
+
+    Matrix $indices = guard $gpu->matrix($capacity, 1) else ($e) {
+        return .error($e);
+    }
+
+    return .ok(Head($targets, $weights, $losses, $sums, $scale, $indices));
+}

@@ -1,0 +1,368 @@
+/**
+ * TD3 (twin delayed deep deterministic policy gradient): continuous
+ * actions. An actor maps observations to an action vector in [-1, 1]; two
+ * critics value an observation and action side by side, and learn from
+ * replay towards reward plus the smaller of their two target values, which
+ * keeps them from talking themselves into optimism. The actor climbs the
+ * first critic's gradient, every `delay` critic updates.
+ *
+ *     $td3 = Td3(Model(actor(), $seed: 1), Model(critic(), $seed: 2), Model(critic(), $seed: 3),
+ *                Adam(0.001), Adam(0.001), Adam(0.001));
+ *     Tensor $a = $td3->explore($state, 0.2, $rng);
+ *     Report $r = $td3->update($moves->sample(128, $rng), $rng);
+ *
+ * The actor must end in `Act(.tanh)` so its actions stay in [-1, 1]. A
+ * critic takes `[observation, action]` as one row and ends in one output.
+ */
+
+namespace ann::rl;
+
+use ann::{Dataset, Loss, MeanSquaredError, Model, Optimizer, Random, Tensor};
+
+/**
+ * One step with a continuous action.
+ */
+public struct Move
+{
+    /**
+     * `[1, features]`.
+     */
+    public Tensor $state;
+
+    /**
+     * `[1, actions]`, each in [-1, 1].
+     */
+    public Tensor $action;
+
+    public float64 $reward;
+
+    /**
+     * `[1, features]`.
+     */
+    public Tensor $next;
+
+    public Outcome $outcome;
+}
+
+/**
+ * Many moves as batch tensors.
+ */
+public struct Moves
+{
+    /**
+     * `[n, features]`.
+     */
+    public Tensor $states;
+
+    /**
+     * `[n, actions]`.
+     */
+    public Tensor $actions;
+
+    /**
+     * `[n, 1]`.
+     */
+    public Tensor $rewards;
+
+    /**
+     * `[n, features]`.
+     */
+    public Tensor $next;
+
+    /**
+     * `[n, 1]`: 1 where the step terminated, 0 elsewhere (truncation
+     * included).
+     */
+    public Tensor $terminal;
+
+    /**
+     * Stack `$items` in order. There must be at least one.
+     */
+    public constructor(const array<Move>& $items)
+    {
+        usize $n = $items->count();
+        array<Tensor> $states = arr::room<Tensor>($n);
+        array<Tensor> $actions = arr::room<Tensor>($n);
+        array<Tensor> $next = arr::room<Tensor>($n);
+        array<float64> $rewards = arr::room<float64>($n);
+        array<float64> $terminal = arr::room<float64>($n);
+
+        foreach ($items as $m) {
+            $states[] = $m->state;
+            $actions[] = $m->action;
+            $next[] = $m->next;
+            $rewards[] = $m->reward;
+
+            if ($m->outcome == Outcome::terminated) {
+                $terminal[] = 1.0;
+            } else {
+                $terminal[] = 0.0;
+            }
+        }
+
+        $this->states = Tensor(stack: $states);
+        $this->actions = Tensor(stack: $actions);
+        $this->rewards = Tensor(column: $rewards);
+        $this->next = Tensor(stack: $next);
+        $this->terminal = Tensor(column: $terminal);
+    }
+
+    public const function count() : usize
+    {
+        return $this->states->rows();
+    }
+}
+
+/**
+ * The last `capacity` moves, sampled uniformly.
+ */
+public class MoveReplay
+{
+    public const usize $capacity;
+    private array<Move> $items;
+    private usize $next;
+
+    init
+    {
+        if ($this->capacity == 0) {
+            die('ann::rl::MoveReplay: the capacity must be at least one');
+        }
+
+        $this->items = arr::room<Move>($this->capacity);
+        $this->next = 0;
+    }
+
+    public function add(const Move& $m) : void
+    {
+        if ($this->items->count() < $this->capacity) {
+            $this->items[] = $m;
+        } else {
+            $this->items[$this->next] = $m;
+        }
+
+        $this->next = ($this->next + 1) % $this->capacity;
+    }
+
+    public const function count() : usize
+    {
+        return $this->items->count();
+    }
+
+    /**
+     * `$n` moves drawn uniformly, with replacement. Must not be empty.
+     */
+    public const function sample(usize $n, Random& $rng) : Moves
+    {
+        if ($this->items->count() == 0) {
+            die('ann::rl::MoveReplay: cannot sample from an empty buffer');
+        }
+
+        array<Move> $picked = arr::room<Move>($n);
+
+        for (usize $i = 0; $i < $n; $i++) {
+            $picked[] = $this->items[$rng->below($this->items->count())];
+        }
+
+        return Moves($picked);
+    }
+}
+
+public class Td3
+{
+    /**
+     * Observations in, actions in [-1, 1] out.
+     */
+    public Model $actor;
+
+    /**
+     * `[observation, action]` in, one value out. Two of them, trained the
+     * same way from different starting weights.
+     */
+    public Model $critic;
+    public Model $twin;
+
+    /**
+     * One optimizer per network: an optimizer's state belongs to the
+     * params it first stepped.
+     */
+    public Optimizer $actorOptimizer;
+    public Optimizer $criticOptimizer;
+    public Optimizer $twinOptimizer;
+
+    public float64 $gamma = 0.99;
+
+    /**
+     * Fraction of each network blended into its target after every actor
+     * update.
+     */
+    public float64 $tau = 0.005;
+
+    /**
+     * Noise on the target actor's next action, and its clip: smooths the
+     * critics' targets over nearby actions.
+     */
+    public float64 $policyNoise = 0.2;
+    public float64 $noiseClip = 0.5;
+
+    /**
+     * Critic updates per actor (and target) update.
+     */
+    public usize $delay = 2;
+
+    /**
+     * Global gradient-norm cap per network. 0 is none.
+     */
+    public float64 $clip = 10.0;
+
+    public Loss $loss = MeanSquaredError();
+
+    private Model $actorTarget;
+    private Model $criticTarget;
+    private Model $twinTarget;
+    private usize $updates;
+
+    init
+    {
+        $this->actorTarget = Td3::copyOf($this->actor);
+        $this->criticTarget = Td3::copyOf($this->critic);
+        $this->twinTarget = Td3::copyOf($this->twin);
+        $this->updates = 0;
+    }
+
+    private static function copyOf(const Model& $m) : Model
+    {
+        Model $out = guard $m->clone() else ($e) {
+            die("ann::rl::Td3: cannot clone a network for its target: {$e}");
+        }
+
+        return $out;
+    }
+
+    /**
+     * The actor's action for each of `$states`.
+     */
+    public function act(const Tensor& $states) : Tensor
+    {
+        return $this->actor->predict($states);
+    }
+
+    /**
+     * The actor's action for `$state` plus gaussian noise of `$deviation`,
+     * clamped to [-1, 1].
+     */
+    public function explore(const Tensor& $state, float64 $deviation, Random& $rng) : Tensor
+    {
+        Tensor $a = $this->actor->predict($state);
+
+        for (usize $i = 0; $i < $a->data->count(); $i++) {
+            $a->data[$i] = std::math::clamp($a->data[$i] + $rng->normal(0.0, $deviation), -1.0, 1.0);
+        }
+
+        return $a;
+    }
+
+    /**
+     * The first critic's value of `$actions` in `$states`.
+     */
+    public function value(const Tensor& $states, const Tensor& $actions) : Tensor
+    {
+        return $this->critic->predict(Td3::join($states, $actions));
+    }
+
+    /**
+     * One critic step on `$batch`, and every `delay` steps an actor step and
+     * the target blends. The report's `value` is the mean critic loss,
+     * `policy` the actor's objective (mean value of its actions, negated)
+     * when it stepped.
+     */
+    public function update(const Moves& $batch, Random& $rng) : Report
+    {
+        // the critics' target: reward plus the smaller twin value of what
+        // the (smoothed) target actor would do next
+        Tensor $nextAction = $this->actorTarget->predict($batch->next);
+
+        for (usize $i = 0; $i < $nextAction->data->count(); $i++) {
+            float64 $noise = std::math::clamp($rng->normal(0.0, $this->policyNoise), 0.0 - $this->noiseClip, $this->noiseClip);
+            $nextAction->data[$i] = std::math::clamp($nextAction->data[$i] + $noise, -1.0, 1.0);
+        }
+
+        Tensor $nextJoined = Td3::join($batch->next, $nextAction);
+        Tensor $q1 = $this->criticTarget->predict($nextJoined);
+        Tensor $q2 = $this->twinTarget->predict($nextJoined);
+        Tensor $y = $batch->rewards;
+
+        for (usize $i = 0; $i < $y->data->count(); $i++) {
+            float64 $bootstrap = std::math::min($q1->data[$i], $q2->data[$i]);
+            $y->data[$i] = $y->data[$i] + $this->gamma * (1.0 - $batch->terminal->data[$i]) * $bootstrap;
+        }
+
+        Tensor $joined = Td3::join($batch->states, $batch->actions);
+        Report $report = Report();
+        $report->value = (Td3::regress($this->critic, $this->criticOptimizer, $joined, $y, $this->loss, $this->clip)
+            + Td3::regress($this->twin, $this->twinOptimizer, $joined, $y, $this->loss, $this->clip)) / 2.0;
+        $this->updates = $this->updates + 1;
+
+        if ($this->updates % $this->delay != 0) {
+            return $report;
+        }
+
+        // the actor climbs the first critic: d(-mean Q)/d(action), through
+        // the critic, into the actor; the critic's own gradients are dropped
+        usize $n = $batch->count();
+        usize $features = $batch->states->cols();
+        Tensor $actions = $this->actor->forward($batch->states, .train);
+        Tensor $q = $this->critic->forward(Td3::join($batch->states, $actions), .train);
+        array<usize> $shape = [$n, 1];
+        Tensor $down = Tensor($shape, fill: -1.0 / ($n as float64));
+        Tensor $through = $this->critic->backward($down);
+        $this->critic->zeroGrad();
+        $this->actor->backward($through->columns($features, $actions->cols()));
+        $this->actor->step($this->actorOptimizer, $this->clip);
+        $report->policy = 0.0 - $q->mean();
+
+        Td3::follow($this->actorTarget, $this->actor, $this->tau);
+        Td3::follow($this->criticTarget, $this->critic, $this->tau);
+        Td3::follow($this->twinTarget, $this->twin, $this->tau);
+        return $report;
+    }
+
+    /**
+     * Restore the targets from the current networks, as after loading saved
+     * ones.
+     */
+    public function sync() : void
+    {
+        Td3::follow($this->actorTarget, $this->actor, 1.0);
+        Td3::follow($this->criticTarget, $this->critic, 1.0);
+        Td3::follow($this->twinTarget, $this->twin, 1.0);
+    }
+
+    private static function regress(Model $m, Optimizer $opt, const Tensor& $x, const Tensor& $y, Loss $loss, float64 $clip) : float64
+    {
+        Tensor $out = $m->forward($x, .train);
+        $data = Dataset($x, $y);
+        float64 $value = $data->loss($loss, $out);
+        $m->backward($data->gradient($loss, $out));
+        $m->step($opt, $clip);
+        return $value;
+    }
+
+    private static function follow(Model $target, const Model& $from, float64 $rate) : void
+    {
+        guard $target->blend($from, $rate) else ($e) {
+            die("ann::rl::Td3: {$e}");
+        }
+    }
+
+    /**
+     * `[a, b]` side by side, row by row.
+     */
+    public static function join(const Tensor& $a, const Tensor& $b) : Tensor
+    {
+        array<usize> $shape = [$a->rows(), $a->cols() + $b->cols()];
+        Tensor $out = Tensor($shape);
+        $out->put(columns: 0, $a);
+        $out->put(columns: $a->cols(), $b);
+        return $out;
+    }
+}

@@ -113,14 +113,103 @@ test vision_network_round_trips_through_a_file
     }
 
     Model $loaded = guard Model::load($path) else ($e) {
-        std::io::remove($path);
+        std::fs::remove($path);
         assert(false, 'load failed');
         return;
     }
 
-    std::io::remove($path);
+    std::fs::remove($path);
     $x = noise(shape(4, 36), 77);
     assert(identical($model->predict($x), $loaded->predict($x)));
     assert($loaded->summary() == $model->summary());
+    assert($loaded->encode() == $model->encode());
+}
+
+// relation of query slot i to key slot j on a line of slots: the signed distance, shifted to start at 0
+internal function line(usize $slots) : array<usize>
+{
+    array<usize> $out = array<usize>();
+
+    foreach (0 .. $slots as $i) {
+        foreach (0 .. $slots as $j) {
+            $out[] = $j + $slots - 1 - $i;
+        }
+    }
+
+    return $out;
+}
+
+internal function related(usize $slots, usize $width, usize $heads) : SelfAttention
+{
+    $layer = SelfAttention($slots, $width, $heads, line($slots), 2 * $slots - 1);
+    initialized($layer);
+    Tensor $bias = noise(shape($heads, 2 * $slots - 1), 78);
+
+    foreach (0 .. $bias->data->count() as $i) {
+        $layer->bias->value->data[$i] = $bias->data[$i];
+    }
+
+    return $layer;
+}
+
+#[group: "attention"]
+test relative_attention_gradients_match_finite_differences
+{
+    Layer $one = related(3, 4, 1);
+    assert(gradientError($one, noise(shape(2, 12), 79)) < ATTENTION_TOLERANCE);
+
+    Layer $heads = related(4, 6, 3);
+    assert(gradientError($heads, noise(shape(2, 24), 80)) < ATTENTION_TOLERANCE);
+}
+
+#[group: "attention"]
+test a_strong_bias_attends_to_the_named_relation
+{
+    $layer = SelfAttention(3, 2, 1, line(3), 5);
+    initialized($layer);
+    // relation 3 is "the next slot"; nothing else gets a say
+    $layer->bias->value->data[3] = 50.0;
+    assert($layer->params()->count() == 9);
+    assert($layer->kind() == 'relattention');
+
+    $x = noise(shape(1, 6), 81);
+    $out = $layer->forward($x, .infer);
+    assert($out->rows() == 1 && $out->cols() == 6);
+
+    // slot 0 reads slot 1 alone: its own input no longer matters, slot 1's does
+    Tensor $own = $x;
+    $own->data[0] = $own->data[0] + 1.0;
+    $own->data[1] = $own->data[1] - 1.0;
+    Tensor $moved = $layer->forward($own, .infer);
+    assert(std::math::abs($moved->data[0] - $out->data[0]) < 0.000001);
+
+    Tensor $next = $x;
+    $next->data[2] = $next->data[2] + 1.0;
+    Tensor $changed = $layer->forward($next, .infer);
+    assert(std::math::abs($changed->data[0] - $out->data[0]) > 0.000001 || std::math::abs($changed->data[1] - $out->data[1]) > 0.000001);
+}
+
+#[group: "attention"]
+test relative_attention_round_trips_through_a_file
+{
+    $dir = std::env::tmp();
+    $path = "{$dir}/libann-test-relattention.ann";
+    $net = Sequential()->add(Residual(related(4, 6, 2)))->add(Pool(4, .mean))->add(Dense(6, 1));
+    $model = Model($net, $seed: 7);
+
+    guard $model->save($path) else ($e) {
+        assert(false, 'save failed');
+        return;
+    }
+
+    Model $loaded = guard Model::load($path) else ($e) {
+        std::fs::remove($path);
+        assert(false, 'load failed');
+        return;
+    }
+
+    std::fs::remove($path);
+    $x = noise(shape(3, 24), 82);
+    assert(identical($model->predict($x), $loaded->predict($x)));
     assert($loaded->encode() == $model->encode());
 }

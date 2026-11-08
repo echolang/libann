@@ -41,13 +41,13 @@ internal function line() : Dataset
 
 internal function scratch(string $name) : string
 {
-    return std::env::join(std::env::tmp(), $name);
+    return std::fs::join(std::env::tmp(), $name)->string();
 }
 
 // the file's lines, the empty one after the last newline dropped
 internal function lines(const string& $path) : array<string>
 {
-    string $text = guard std::io::readfile($path);
+    string $text = guard std::fs::readfile($path);
     array<string> $out = array<string>();
 
     foreach (str::split($text, "\n")->owned() as $l) {
@@ -147,7 +147,7 @@ test file_log_writes_json_lines
     assert($got[8]->contains('"epochs":5'));
     assert($got[9]->contains('"message":"done"'));
     assert(count($got, '"event":"progress"') == 0);
-    std::io::remove($path);
+    std::fs::remove($path);
 }
 
 #[group: "log"]
@@ -166,7 +166,7 @@ test file_log_escapes_json_strings
     assert($got[0]->contains('"title":"say \\"hi\\""'));
     assert($got[0]->contains('"rows":["back\\\\slash","tab\\there"]'));
     assert($got[1]->contains('"headers":["x","y"],"rows":[["1","2"]]'));
-    std::io::remove($path);
+    std::fs::remove($path);
 }
 
 #[group: "log"]
@@ -195,7 +195,7 @@ test file_log_writes_logfmt
     // one line per table row, a cell under each header
     assert(count($got, 'event=table ') == 2);
     assert($got[$got->count() - 1]->contains(' title=probe x=2 val_loss=0.25'));
-    std::io::remove($path);
+    std::fs::remove($path);
 }
 
 #[group: "log"]
@@ -217,5 +217,5 @@ test file_log_heartbeat_and_spacing
     assert($got[1]->contains('"epoch":1,"epochs":5,"batch":1,"batches":3,"loss":'));
     // every 2: epochs 1, 2, 4 and the last
     assert(count($got, '"event":"epoch"') == 4);
-    std::io::remove($path);
+    std::fs::remove($path);
 }

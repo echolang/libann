@@ -150,4 +150,4 @@ $table->row(['loaded', "{$loaded->predict($x)->data[0]:.4f}", '1.0']);
 $log->note('gate.ann', $table);
 $log->end('done');
 
-std::io::remove('gate.ann');
+std::fs::remove('gate.ann');

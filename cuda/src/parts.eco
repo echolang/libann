@@ -1,0 +1,200 @@
+/**
+ * An output cut into slices, each scored its own way, for a network that
+ * answers several things at once: a policy over listed moves and a value,
+ * say. Targets are narrower than outputs where a part says so, which keeps
+ * a large dataset small.
+ *
+ *     $parts = Parts()
+ *         ->add(128, .softmax(16))                       // 128 move logits, targets for the first 16
+ *         ->add(64, .gauss(-32.0, 32.0, 0.75))           // 64 value bins, one target number
+ *         ->add(64, .gauss(-32.0, 32.0, 0.75), 0.25);    // a second value, weighted down
+ *
+ *     float64 $loss = $net->learn($batch, $parts, Update::adam($adam));
+ *
+ * The targets of a batch hold every part's target columns in `add` order:
+ * `targets()` of them per row.
+ */
+
+namespace ann::cuda;
+
+/**
+ * How one part of the output is scored.
+ */
+public enum Score
+{
+    /**
+     * Softmax cross-entropy over the part's columns. Targets come for the
+     * first `$targets` columns; every column past them has target 0. Sort
+     * a policy's moves by target and keep the head of the list.
+     */
+    case softmax(usize $targets);
+
+    /**
+     * Softmax cross-entropy against one target number spread over the
+     * part's columns as bins between `$low` and `$high`: the mass a normal
+     * curve of width `$sigma` (in bin widths) around the target puts into
+     * each bin. A value head that predicts a distribution.
+     */
+    case gauss(float64 $low, float64 $high, float64 $sigma);
+
+    /**
+     * Sigmoid cross-entropy per column, a target per column.
+     */
+    case sigmoid;
+
+    /**
+     * Squared error per column, a target per column.
+     */
+    case squares;
+
+    /**
+     * One logit column scored twice: sigmoid cross-entropy against a target
+     * chance, plus `$weight` times a softmax cross-entropy across the rows
+     * of a group, between the logits and the targets' own logits, both
+     * over `$temperature`. That teaches which row of a group is best, the
+     * question a player that picks among them asks. Three target columns:
+     * the chance, how many rows before this one its group starts, and the
+     * group's size. Groups must lie whole in a batch; a group of one
+     * row is only the sigmoid term.
+     */
+    case ranked(float64 $temperature, float64 $weight);
+
+    /**
+     * Target columns this score reads for a part of `$outputs` columns.
+     */
+    public const function targets(usize $outputs) : usize
+    {
+        return match ($this) {
+            .softmax($targets) => $targets,
+            .gauss($low, $high, $sigma) => 1,
+            .ranked($temperature, $weight) => 3,
+            else => $outputs,
+        };
+    }
+
+    /**
+     * The `parts` kernel's code.
+     */
+    internal const function code() : usize
+    {
+        return match ($this) {
+            .softmax($targets) => 0,
+            .gauss($low, $high, $sigma) => 1,
+            .sigmoid => 2,
+            .squares => 3,
+            .ranked($temperature, $weight) => 4,
+        };
+    }
+}
+
+/**
+ * One slice of the output.
+ */
+public struct Part
+{
+    public usize $outputs;
+    public Score $score;
+    public float64 $weight = 1.0;
+}
+
+public class Parts
+{
+    /**
+     * In output order.
+     */
+    public array<Part> $parts = array<Part>();
+
+    /**
+     * Append a part of `$outputs` columns. Returns `$this` so calls chain.
+     */
+    public function add(usize $outputs, Score $score, float64 $weight = 1.0) : Parts
+    {
+        if ($outputs == 0) {
+            die('ann::cuda::Parts: a part needs at least one column');
+        }
+
+        if ($score->code() == 4 && $outputs != 1) {
+            die('ann::cuda::Parts: a ranked part scores one column');
+        }
+
+        if ($score->code() != 4 && $score->targets($outputs) > $outputs) {
+            die("ann::cuda::Parts: a part of {$outputs} columns cannot take more targets than that");
+        }
+
+        $this->parts[] = Part($outputs, $score, $weight);
+        return $this;
+    }
+
+    /**
+     * Output columns of all parts together.
+     */
+    public const function outputs() : usize
+    {
+        usize $n = 0;
+
+        foreach ($this->parts as $p) {
+            $n = $n + $p->outputs;
+        }
+
+        return $n;
+    }
+
+    /**
+     * Target columns of all parts together.
+     */
+    public const function targets() : usize
+    {
+        usize $n = 0;
+
+        foreach ($this->parts as $p) {
+            $n = $n + $p->score->targets($p->outputs);
+        }
+
+        return $n;
+    }
+}
+
+/**
+ * The bin probabilities `Score::gauss` trains towards, on the host: for
+ * reading a value head's bins back, and for tests.
+ */
+public function bins(float64 $target, usize $count, float64 $low, float64 $high, float64 $sigma) : array<float64>
+{
+    float64 $width = ($high - $low) / ($count as float64);
+    float64 $spread = $sigma * $width * std::math::sqrt(2.0);
+    array<float64> $out = arr::room<float64>($count);
+    float64 $total = 0.0;
+
+    for (usize $i = 0; $i < $count; $i++) {
+        float64 $left = $low + ($i as float64) * $width;
+        float64 $p = 0.5 * (erf(($left + $width - $target) / $spread) - erf(($left - $target) / $spread));
+        $out[] = $p;
+        $total = $total + $p;
+    }
+
+    for (usize $i = 0; $i < $count; $i++) {
+        if ($total > 0.0) {
+            $out[$i] = $out[$i] / $total;
+        }
+    }
+
+    return $out;
+}
+
+/**
+ * The error function, to within about 1e-7 (Abramowitz and Stegun 7.1.26),
+ * close enough to the device's `erff` for reading bins back.
+ */
+internal function erf(float64 $x) : float64
+{
+    float64 $sign = 1.0;
+
+    if ($x < 0.0) {
+        $sign = -1.0;
+    }
+
+    float64 $a = std::math::abs($x);
+    float64 $t = 1.0 / (1.0 + 0.3275911 * $a);
+    float64 $poly = (((((1.061405429 * $t) - 1.453152027) * $t + 1.421413741) * $t - 0.284496736) * $t + 0.254829592) * $t;
+    return $sign * (1.0 - $poly * std::math::exp(-$a * $a));
+}

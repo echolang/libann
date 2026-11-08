@@ -62,4 +62,4 @@ while ($check->episodes->count() < 10) {
 
 $log->note('cartpole-a2c.ann', "greedy over 10 episodes: mean return {$check->mean(10):.1f}");
 $log->end('done');
-std::io::remove('cartpole-a2c.ann');
+std::fs::remove('cartpole-a2c.ann');

@@ -1,0 +1,74 @@
+/**
+ * A libann optimizer the GPU knows how to run. Holds the host optimizer and
+ * reads its settings on every step, so a schedule that sets `rate` in
+ * `onEpoch` works the same as on the CPU. The running state (Adam's
+ * moments, SGD's velocity) lives on the device, with the network.
+ *
+ *     $u = Update::adam(Adam($rate: 0.001));
+ */
+
+namespace ann::cuda;
+
+use ann::{Adam, Sgd};
+
+public enum Update
+{
+    case adam(Adam $adam);
+    case sgd(Sgd $sgd);
+
+    /**
+     * Queue step `$t` (from 1) for one param. `$scale` holds the clip
+     * factor, 1 when nothing is clipped.
+     */
+    internal const function encode(const Gpu& $gpu, Slot $slot, const Matrix& $scale, uint64 $t) : void
+    {
+        match ($this) {
+            .adam($adam) => {
+                Update::adamStep($gpu, $slot, $scale, $t, $adam);
+            }
+            .sgd($sgd) => {
+                Update::sgdStep($gpu, $slot, $scale, $sgd);
+            }
+        };
+    }
+
+    private static function adamStep(const Gpu& $gpu, Slot $slot, const Matrix& $scale, uint64 $t, Adam $adam) : void
+    {
+        float64 $steps = $t as float64;
+        cuda::Args $a = cuda::Args();
+        $a->buffer($slot->value->buffer);
+        $a->buffer($slot->grad->buffer);
+        $a->buffer($slot->first->buffer);
+        $a->buffer($slot->second->buffer);
+        $a->buffer($scale->buffer);
+        $a->u($slot->size);
+        $a->f($adam->beta1);
+        $a->f($adam->beta2);
+        $a->f($adam->rate);
+        $a->f($adam->epsilon);
+        $a->f($adam->weightDecay);
+        $a->f(1.0 - std::math::pow($adam->beta1, $steps));
+        $a->f(1.0 - std::math::pow($adam->beta2, $steps));
+        $gpu->run($gpu->kernels->adam, $a, $slot->size);
+    }
+
+    private static function sgdStep(const Gpu& $gpu, Slot $slot, const Matrix& $scale, Sgd $sgd) : void
+    {
+        usize $nesterov = 0;
+
+        if ($sgd->nesterov) {
+            $nesterov = 1;
+        }
+
+        cuda::Args $a = cuda::Args();
+        $a->buffer($slot->value->buffer);
+        $a->buffer($slot->grad->buffer);
+        $a->buffer($slot->first->buffer);
+        $a->buffer($scale->buffer);
+        $a->u($slot->size);
+        $a->f($sgd->rate);
+        $a->f($sgd->momentum);
+        $a->u($nesterov);
+        $gpu->run($gpu->kernels->sgd, $a, $slot->size);
+    }
+}

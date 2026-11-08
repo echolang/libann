@@ -1,0 +1,5 @@
+#[module: "libann-cuda-examples"]
+#[depends: ".."]
+#[sources: ["parity.eco"]]
+
+#[target: exe { name: "parity", entry: "parity.eco" }]

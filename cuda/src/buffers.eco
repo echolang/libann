@@ -1,0 +1,162 @@
+/**
+ * Device matrices and the copies between them and host tensors. The GPU
+ * works in float32; libann's tensors are float64, so every copy converts,
+ * a slice at a time through a host staging array.
+ */
+
+namespace ann::cuda;
+
+use ann::Tensor;
+
+/**
+ * Floats converted per copy, so a large upload never needs a staging array
+ * the size of the dataset.
+ */
+internal const usize CHUNK = 4194304;
+
+/**
+ * A float32 row-major matrix on the device. `rows` is a capacity: a smaller
+ * batch uses the top rows and leaves the rest alone. Views share the buffer
+ * and read it with another shape, the way `PerSlot` stacks slots as rows.
+ */
+internal class Matrix
+{
+    internal cuda::Buffer $buffer;
+    internal usize $rows;
+    internal usize $cols;
+
+    internal constructor(cuda::Buffer $buffer, usize $rows, usize $cols)
+    {
+        $this->buffer = $buffer;
+        $this->rows = $rows;
+        $this->cols = $cols;
+    }
+
+    /**
+     * The same memory as `$rows` x `$cols`.
+     */
+    internal const function view(usize $rows, usize $cols) : Matrix
+    {
+        if ($rows * $cols > $this->rows * $this->cols) {
+            die("ann::cuda: a {$rows} x {$cols} view of a {$this->rows} x {$this->cols} matrix");
+        }
+
+        return Matrix($this->buffer, $rows, $cols);
+    }
+
+    /**
+     * Rows `$first ..< $first + $count` of `$t` into the top `$count` rows.
+     */
+    internal function load(const Tensor& $t, usize $first, usize $count) : void
+    {
+        usize $start = $first * $this->cols;
+        usize $n = $count * $this->cols;
+        array<float32> $stage = arr::room<float32>(std::math::min($n, CHUNK));
+        usize $done = 0;
+
+        while ($done < $n) {
+            usize $take = std::math::min($n - $done, CHUNK);
+            $stage->clear();
+
+            for (usize $i = 0; $i < $take; $i++) {
+                $stage[] = $t->data[$start + $done + $i] as float32;
+            }
+
+            guard $this->buffer->upload($stage->data() as ptr<const uint8>, $take * 4, $done * 4) else ($e) {
+                die("ann::cuda: {$e}");
+            }
+
+            $done = $done + $take;
+        }
+    }
+
+    /**
+     * The top `$count` rows into rows `$first ..< $first + $count` of `$t`.
+     */
+    internal function read(Tensor& $t, usize $first, usize $count) : void
+    {
+        usize $start = $first * $this->cols;
+        usize $n = $count * $this->cols;
+        array<float32> $stage = $this->staged($n);
+
+        for (usize $i = 0; $i < $n; $i++) {
+            $t->data[$start + $i] = $stage[$i] as float64;
+        }
+    }
+
+    /**
+     * Sum of the first `$n` values, in float64.
+     */
+    internal function total(usize $n) : float64
+    {
+        array<float32> $stage = $this->staged($n);
+        float64 $sum = 0.0;
+
+        for (usize $i = 0; $i < $n; $i++) {
+            float32 $v = $stage[$i];
+            $sum = $sum + ($v as float64);
+        }
+
+        return $sum;
+    }
+
+    /**
+     * The first `$n` values as host floats.
+     */
+    internal function staged(usize $n) : array<float32>
+    {
+        array<float32> $stage = arr::room<float32>($n);
+
+        for (usize $i = 0; $i < $n; $i++) {
+            $stage[] = 0.0 as float32;
+        }
+
+        if ($n > 0) {
+            guard $this->buffer->download($stage->data() as ptr<uint8>, $n * 4) else ($e) {
+                die("ann::cuda: {$e}");
+            }
+        }
+
+        return $stage;
+    }
+
+    /**
+     * Every value of the whole capacity set to `$value`.
+     */
+    internal function fill(float64 $value) : void
+    {
+        guard $this->buffer->fill(bits($value), $this->rows * $this->cols) else ($e) {
+            die("ann::cuda: {$e}");
+        }
+    }
+
+    /**
+     * The first `$count` entries set to unsigned ints, for an index list.
+     */
+    internal function indices(const array<usize>& $indices, usize $count) : void
+    {
+        array<uint32> $stage = arr::room<uint32>($count);
+
+        for (usize $i = 0; $i < $count; $i++) {
+            $stage[] = $indices[$i] as uint32;
+        }
+
+        if ($count > 0) {
+            guard $this->buffer->upload($stage->data() as ptr<const uint8>, $count * 4) else ($e) {
+                die("ann::cuda: {$e}");
+            }
+        }
+    }
+}
+
+/**
+ * The bits of a float32.
+ */
+internal function bits(float64 $value) : uint32
+{
+    float32 $v = $value as float32;
+    ptr<float32> $p = &$v;
+    ptr<uint32> $raw = $p:$ as ptr<uint32>;
+    uint32 $out = $raw;
+    return $out;
+}

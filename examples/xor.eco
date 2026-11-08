@@ -47,4 +47,4 @@ foreach (0 .. $classes->count() as $i) {
 
 $log->note('loaded from xor.ann', $truth);
 $log->end('done');
-std::io::remove('xor.ann');
+std::fs::remove('xor.ann');

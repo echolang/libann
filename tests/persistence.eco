@@ -87,8 +87,8 @@ test files_round_trip
     assert(samePredictions($model, $loaded, $x));
     assert(samePredictions($model, $other, $x));
 
-    std::io::remove($modelPath);
-    std::io::remove($weightsPath);
+    std::fs::remove($modelPath);
+    std::fs::remove($weightsPath);
 }
 
 #[group: "persistence"]

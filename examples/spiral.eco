@@ -87,4 +87,4 @@ $table->row(['after loadWeights', "{$after->metric:.3f}"]);
 $log->note($path, $table);
 $log->end('done');
 
-std::io::remove($path);
+std::fs::remove($path);

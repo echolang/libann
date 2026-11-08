@@ -1,0 +1,12 @@
+#[module: "libann-cuda"]
+#[version: "0.1.0"]
+#[epm::license: "MIT"]
+#[epm::description: "CUDA GPU training for libann models, transformers included."]
+
+#[depends: ".."]
+#[depends: "../../libcuda"]
+#[sources: "src/*.eco"]
+
+#[target: test] {
+    #[sources: "tests/*.eco"]
+}

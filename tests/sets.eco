@@ -208,12 +208,12 @@ test set_network_round_trips_through_a_file
     }
 
     Model $loaded = guard Model::load($path) else ($e) {
-        std::io::remove($path);
+        std::fs::remove($path);
         assert(false, 'load failed');
         return;
     }
 
-    std::io::remove($path);
+    std::fs::remove($path);
     $x = noise(shape(5, 12), 41);
     assert(identical($model->predict($x), $loaded->predict($x)));
     assert($loaded->summary() == $model->summary());

@@ -1,0 +1,155 @@
+use ann::{Act, Dense, Embedding, Layer, Model, PairLogits, Parallel, PerSlot, Pool, Residual, SelfAttention, Sequential, Tensor};
+
+const TOKENS_TOLERANCE = 0.000001;
+
+// codes sit half way between whole numbers, so a finite-difference nudge never crosses one
+internal function codes(usize $rows, usize $slots, usize $vocabulary, uint64 $seed) : Tensor
+{
+    Tensor $t = noise(shape($rows, $slots), $seed);
+
+    foreach (0 .. $t->data->count() as $i) {
+        float64 $u = ($t->data[$i] + 1.0) * 0.5 * ($vocabulary as float64);
+        usize $whole = std::math::min($u as usize, $vocabulary - 1);
+        $t->data[$i] = ($whole as float64) + 0.5;
+    }
+
+    return $t;
+}
+
+// a pair input: codes first, then noise for every slot's halves; no unused place, whose
+// huge negative score would drown a finite difference
+internal function pairsInput(usize $rows, usize $slots, usize $width, usize $pairs, uint64 $seed) : Tensor
+{
+    usize $cols = $pairs + $slots * 2 * $width;
+    Tensor $t = noise(shape($rows, $cols), $seed);
+
+    foreach (0 .. $rows as $r) {
+        foreach (0 .. $pairs as $p) {
+            usize $code = ($r * 7 + $p * 5) % ($slots * $slots);
+            $t->data[$r * $cols + $p] = ($code as float64) + 0.5;
+        }
+    }
+
+    return $t;
+}
+
+// cells as codes, attend with a learned offset bias, then a policy over listed pairs and a value
+internal function policyNet(usize $slots, usize $pairs, usize $width) : Sequential
+{
+    array<usize> $offsets = array<usize>();
+
+    foreach (0 .. $slots as $i) {
+        foreach (0 .. $slots as $j) {
+            $offsets[] = $j + $slots - 1 - $i;
+        }
+    }
+
+    $trunk = Sequential()
+        ->add(Embedding($slots, 3, $width))
+        ->add(Residual(SelfAttention($slots, $width, 2, $offsets, 2 * $slots - 1)));
+    $policy = Sequential()
+        ->add(Parallel()->pass(0, $pairs)->add($pairs, $slots * $width, PerSlot($slots, Dense($width, 2 * $width))))
+        ->add(PairLogits($slots, $width, $pairs));
+    $value = Sequential()->add(Pool($slots, .mean))->add(Dense($width, 1));
+    usize $all = $pairs + $slots * $width;
+
+    return Sequential()
+        ->add(Parallel()->pass(0, $pairs)->add($pairs, $slots, $trunk))
+        ->add(Parallel()->add(0, $all, $policy)->add($pairs, $slots * $width, $value));
+}
+
+#[group: "tokens"]
+test embedding_gradients_match_finite_differences
+{
+    Layer $layer = initialized(Embedding(4, 3, 5));
+    assert(gradientError($layer, codes(3, 4, 3, 90)) < TOKENS_TOLERANCE);
+}
+
+#[group: "tokens"]
+test embedding_adds_the_code_row_to_the_slot_row
+{
+    $layer = Embedding(2, 3, 2);
+    initialized($layer);
+    Tensor $x = Tensor(shape(1, 2));
+    $x->data[0] = 2.0;
+    $x->data[1] = 0.0;
+    $out = $layer->forward($x, .infer);
+    assert($out->cols() == 4);
+    assert($out->data[0] == $layer->table->value->data[4] + $layer->position->value->data[0]);
+    assert($out->data[3] == $layer->table->value->data[1] + $layer->position->value->data[3]);
+}
+
+#[group: "tokens"]
+test pair_logits_gradients_match_finite_differences
+{
+    Layer $layer = PairLogits(3, 2, 4);
+    assert(gradientError($layer, pairsInput(2, 3, 2, 4, 91)) < TOKENS_TOLERANCE);
+}
+
+#[group: "tokens"]
+test pair_logits_score_source_against_target
+{
+    $layer = PairLogits(2, 1, 2);
+    // pair 0 is slot 1 -> slot 0, pair 1 unused; halves: slot 0 (3, 5), slot 1 (7, 11)
+    Tensor $x = Tensor(shape(1, 6));
+    $x->data[0] = 2.0;
+    $x->data[1] = -1.0;
+    $x->data[2] = 3.0;
+    $x->data[3] = 5.0;
+    $x->data[4] = 7.0;
+    $x->data[5] = 11.0;
+    $out = $layer->forward($x, .infer);
+    // source half of slot 1 times target half of slot 0
+    assert($out->data[0] == 35.0);
+    assert($out->data[1] == ann::EMPTY_PAIR);
+}
+
+#[group: "tokens"]
+test a_policy_network_trains_end_to_end
+{
+    Layer $net = initialized(policyNet(3, 4, 4));
+    Tensor $x = Tensor(shape(2, 7));
+
+    foreach (0 .. 2 as $r) {
+        foreach (0 .. 4 as $p) {
+            $x->data[$r * 7 + $p] = ((($r + $p * 2) % 9) as float64) + 0.5;
+        }
+        foreach (0 .. 3 as $s) {
+            $x->data[$r * 7 + 4 + $s] = ((($r + $s) % 3) as float64) + 0.5;
+        }
+    }
+
+    $out = $net->forward($x, .infer);
+    assert($out->cols() == 5);
+    assert(gradientError($net, $x) < TOKENS_TOLERANCE);
+}
+
+#[group: "tokens"]
+test a_policy_network_round_trips_through_a_file
+{
+    $dir = std::env::tmp();
+    $path = "{$dir}/libann-test-policy.ann";
+    $model = Model(policyNet(3, 4, 4), $seed: 8);
+
+    guard $model->save($path) else ($e) {
+        assert(false, 'save failed');
+        return;
+    }
+
+    Model $loaded = guard Model::load($path) else ($e) {
+        std::fs::remove($path);
+        assert(false, 'load failed');
+        return;
+    }
+
+    std::fs::remove($path);
+    Tensor $x = Tensor(shape(1, 7));
+
+    foreach (0 .. 4 as $p) {
+        $x->data[$p] = ($p * 2) as float64;
+    }
+
+    $x->data[3] = -1.0;
+    assert(identical($model->predict($x), $loaded->predict($x)));
+    assert($loaded->encode() == $model->encode());
+}

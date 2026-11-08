@@ -106,7 +106,7 @@ $loaded = guard Model::load($path) else ($e) {
     die("load failed: {$e}");
 }
 
-std::io::remove($path);
+std::fs::remove($path);
 $onCpu = $loaded->evaluate($split->holdout, CrossEntropy(), .accuracy);
 
 $table = $log->table(['', 'validation loss', 'validation accuracy']);

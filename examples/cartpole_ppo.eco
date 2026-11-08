@@ -66,4 +66,4 @@ while ($check->episodes->count() < 10) {
 
 $log->note('cartpole-ppo.ann', "greedy over 10 episodes: mean return {$check->mean(10):.1f}");
 $log->end('done, every round is in cartpole-ppo.log');
-std::io::remove('cartpole-ppo.ann');
+std::fs::remove('cartpole-ppo.ann');

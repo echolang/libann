@@ -4,7 +4,7 @@ You want a neural net in Echo. A small trainer, a runner, a file you can save an
 
 Tensors, layers, losses, optimizers, a trainer. A binary format for the whole model or for the weights alone. Pure Echo, no C. Layers, losses and optimizers are interfaces, so a new architecture is a type you write.
 
-`ann::rl` sits on top: environments, replay and rollout buffers, and DQN, REINFORCE, actor-critic and PPO.
+`ann::rl` sits on top: environments, replay and rollout buffers, and DQN, REINFORCE, actor-critic and PPO for discrete actions, TD3 for continuous ones.
 
 ```bash
 epm install
@@ -356,6 +356,29 @@ $rollout->clear();
 ```
 
 `examples/cartpole_dqn.eco`, `examples/cartpole_a2c.eco`, `examples/cartpole_ppo.eco` are the three loops in full.
+
+### Continuous actions: TD3
+
+When the action is a number (a steering angle, a throttle) rather than a choice, `Td3` learns a deterministic actor: observations in, an action vector in [-1, 1] out, so the actor ends in `Act(.tanh)`. Two critics take `[observation, action]` as one row and learn from replay towards reward plus the smaller of their two target values, which keeps them from talking themselves into optimism. The actor climbs the first critic's gradient every `delay` critic updates, and only then do the targets blend in by `tau`.
+
+`Environment` speaks discrete actions, so a continuous loop keeps its own `Move`s in a `MoveReplay`:
+
+```echo
+use ann::rl::{Move, MoveReplay, Td3};
+
+$td3 = Td3(Model(actor(), $seed: 1), Model(critic(), $seed: 2), Model(critic(), $seed: 3),
+           Adam(0.001), Adam(0.001), Adam(0.001), $gamma: 0.9);
+$replay = MoveReplay(20000);
+
+Tensor $a = $td3->explore($state, 0.3, $rng);          // gaussian exploration, clamped
+$replay->add(Move($state, $a, $reward, $next, .running));
+
+if ($replay->count() >= 256) {
+    Report $r = $td3->update($replay->sample(64, $rng), $rng);
+}
+```
+
+One optimizer per network: an optimizer's state belongs to the params it first stepped. `sync` copies the networks into their targets, for after loading saved weights.
 
 A game, a simulator or a business process plugs in by implementing four methods on `Environment`. Randomness belongs to the environment: seed it on construction so runs reproduce.
 

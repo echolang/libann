@@ -1,0 +1,16 @@
+{
+  "lockVersion": 2,
+  "packages": [
+    {
+      "name": "echolang/libcommand",
+      "version": "0.1.4",
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/echolang/libcommand"
+      },
+      "rev": "86ea4b9ab49483647776214f4d9e0cb8da1207cc",
+      "sha256": "4304f9f807ec254b3c9bf31c43fb5351687fe5c49b17602fd8164016ba6493e9",
+      "requires": []
+    }
+  ]
+}

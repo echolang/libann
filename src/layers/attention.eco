@@ -12,6 +12,14 @@
  * follow it with `PerSlot(LayerNorm)` for a transformer block. Nothing
  * marks a slot's position, so shuffling the slots shuffles the output
  * the same way.
+ *
+ * Unless `positions` says how slots relate. It names a relation for every
+ * query and key slot, `positions[i * slots + j]` below `relations`, and
+ * every head learns one score bias per relation, added before the
+ * softmax. On a board the relation is the offset between two cells, so
+ * attention can learn that a piece two steps away along a line matters.
+ *
+ *     SelfAttention(121, 64, $heads: 4, $positions: offsets, $relations: 289)
  */
 
 namespace ann;
@@ -33,6 +41,17 @@ public class SelfAttention : Layer
      * every slot.
      */
     public const usize $heads = 1;
+
+    /**
+     * The relation of every query slot to every key slot, `slots * slots`
+     * values below `relations`, or empty for none.
+     */
+    public array<usize> $positions = array<usize>();
+
+    /**
+     * How many relations `positions` tells apart, 0 without positions.
+     */
+    public const usize $relations = 0;
 
     /**
      * `[width, width]` query projection.
@@ -74,6 +93,11 @@ public class SelfAttention : Layer
      */
     public Param $outputBias;
 
+    /**
+     * `[heads, relations]` score bias per head and relation.
+     */
+    public Param $bias;
+
     // the last .train forward, one row per slot: input, projections, attention weights, mixed heads
     private Tensor $input;
     private Tensor $queries;
@@ -93,6 +117,18 @@ public class SelfAttention : Layer
             die("ann::SelfAttention: a width of {$this->width} does not split into {$this->heads} heads");
         }
 
+        if ($this->relations > 0 && $this->positions->count() != $this->slots * $this->slots) {
+            die("ann::SelfAttention: positions need {$this->slots} x {$this->slots} relations, got {$this->positions->count()}");
+        }
+
+        foreach ($this->positions as $p) {
+            usize $named = $p;
+
+            if ($named >= $this->relations) {
+                die("ann::SelfAttention: relation {$named} is not below {$this->relations}");
+            }
+        }
+
         array<usize> $square = [$this->width, $this->width];
         array<usize> $row = [1, $this->width];
         array<usize> $empty = [0, $this->width];
@@ -105,6 +141,8 @@ public class SelfAttention : Layer
         $this->valueBias = Param('valueBias', $row);
         $this->output = Param('output', $square);
         $this->outputBias = Param('outputBias', $row);
+        array<usize> $table = [$this->heads, $this->relations];
+        $this->bias = Param('bias', $table);
         $this->input = Tensor($empty);
         $this->queries = Tensor($empty);
         $this->keys = Tensor($empty);
@@ -133,6 +171,50 @@ public class SelfAttention : Layer
         }
 
         Layer $layer = SelfAttention($slots, $width, $heads);
+        return .ok($layer);
+    }
+
+    /**
+     * The `relattention` kind: the plain fields, then the relation count
+     * and every position.
+     */
+    public static function relative(Decoder $in, Registry $registry) : result<Layer, ModelError>
+    {
+        usize $slots = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        usize $width = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        usize $heads = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        usize $relations = guard $in->size() else ($e) {
+            return .error($e);
+        }
+
+        if ($slots == 0 || $width == 0 || $heads == 0 || $width % $heads != 0 || $relations == 0) {
+            return .error(.badValue($heads as uint64));
+        }
+
+        array<usize> $positions = arr::room<usize>($slots * $slots);
+
+        for (usize $i = 0; $i < $slots * $slots; $i++) {
+            usize $p = guard $in->size() else ($e) {
+                return .error($e);
+            }
+
+            if ($p >= $relations) {
+                return .error(.badValue($p as uint64));
+            }
+
+            $positions[] = $p;
+        }
+
+        Layer $layer = SelfAttention($slots, $width, $heads, $positions, $relations);
         return .ok($layer);
     }
 
@@ -215,6 +297,11 @@ public class SelfAttention : Layer
     public const function params() : array<Param>
     {
         array<Param> $all = [$this->query, $this->queryBias, $this->key, $this->keyBias, $this->value, $this->valueBias, $this->output, $this->outputBias];
+
+        if ($this->relations > 0) {
+            $all[] = $this->bias;
+        }
+
         return $all;
     }
 
@@ -229,10 +316,15 @@ public class SelfAttention : Layer
         $this->keyBias->value->fill(0.0);
         $this->valueBias->value->fill(0.0);
         $this->outputBias->value->fill(0.0);
+        $this->bias->value->fill(0.0);
     }
 
     public const function kind() : string
     {
+        if ($this->relations > 0) {
+            return 'relattention';
+        }
+
         return 'attention';
     }
 
@@ -241,12 +333,40 @@ public class SelfAttention : Layer
         $out->size($this->slots);
         $out->size($this->width);
         $out->size($this->heads);
+
+        if ($this->relations == 0) {
+            return;
+        }
+
+        $out->size($this->relations);
+
+        foreach ($this->positions as $p) {
+            $out->size($p);
+        }
     }
 
     public const function summary() : string
     {
-        usize $count = 4 * ($this->width * $this->width + $this->width);
+        usize $count = 4 * ($this->width * $this->width + $this->width) + $this->heads * $this->relations;
+
+        if ($this->relations > 0) {
+            return "attention {$this->slots} slots of {$this->width}, {$this->heads} heads, {$this->relations} relations ({$count} params)";
+        }
+
         return "attention {$this->slots} slots of {$this->width}, {$this->heads} heads ({$count} params)";
+    }
+
+    /**
+     * The learned score bias of head `$h` between query slot `$i` and key
+     * slot `$j`, 0 without positions.
+     */
+    private const function lean(usize $h, usize $i, usize $j) : float64
+    {
+        if ($this->relations == 0) {
+            return 0.0;
+        }
+
+        return $this->bias->value->data[$h * $this->relations + $this->positions[$i * $this->slots + $j]];
     }
 
     /**
@@ -274,7 +394,7 @@ public class SelfAttention : Layer
                     $score = $score + $q->data[$qi + $t] * $k->data[$kj + $t];
                 }
 
-                $score = $score * $scale;
+                $score = $score * $scale + $this->lean($h, $i, $j);
 
                 if ($j == 0 || $score > $peak) {
                     $peak = $score;
@@ -309,7 +429,7 @@ public class SelfAttention : Layer
      * the mixed heads, add the gradients of that head's queries, keys and
      * values into `$dq`, `$dk` and `$dv`.
      */
-    private const function unattend(const Tensor& $dMixed, usize $r, usize $h, Tensor& $dq, Tensor& $dk, Tensor& $dv) : void
+    private function unattend(const Tensor& $dMixed, usize $r, usize $h, Tensor& $dq, Tensor& $dk, Tensor& $dv) : void
     {
         usize $d = $this->width / $this->heads;
         float64 $scale = 1.0 / std::math::sqrt($d as float64);
@@ -339,10 +459,17 @@ public class SelfAttention : Layer
                 $expected = $expected + $a * $da;
             }
 
-            // through the softmax, then the scaled dot product
+            // through the softmax to the bias, then the scaled dot product
             for (usize $j = 0; $j < $this->slots; $j++) {
                 usize $kj = ($first + $j) * $this->width + $offset;
-                float64 $ds = $this->weights[$row + $j] * ($dWeights[$j] - $expected) * $scale;
+                float64 $raw = $this->weights[$row + $j] * ($dWeights[$j] - $expected);
+
+                if ($this->relations > 0) {
+                    usize $at = $h * $this->relations + $this->positions[$i * $this->slots + $j];
+                    $this->bias->grad->data[$at] = $this->bias->grad->data[$at] + $raw;
+                }
+
+                float64 $ds = $raw * $scale;
 
                 for (usize $t = 0; $t < $d; $t++) {
                     $dq->data[$qi + $t] = $dq->data[$qi + $t] + $ds * $this->keys->data[$kj + $t];

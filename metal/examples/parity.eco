@@ -186,16 +186,16 @@ $classes = Dataset($x, onehot($rng, $n, 5));
 // big enough that the fast tanh would return NaN inside a GELU
 $loud = Dataset(noise($rng, $n, 13, -30.0, 30.0), noise($rng, $n, 3, -1.0, 1.0));
 
-check($gpu, 'mse adam', .relu, .linear, MeanSquaredError(), Objective::mse(MeanSquaredError())), Adam(), Update::adam(Adam()), 0.0, $regression, 64);
-check($gpu, 'mse adamw clip', .gelu, .linear, MeanSquaredError(), Objective::mse(MeanSquaredError())), Adam($rate: 0.003, $weightDecay: 0.01), Update::adam(Adam($rate: 0.003, $weightDecay: 0.01)), 0.5, $regression, 64);
+check($gpu, 'mse adam', .relu, .linear, MeanSquaredError(), Objective::mse(MeanSquaredError()), Adam(), Update::adam(Adam()), 0.0, $regression, 64);
+check($gpu, 'mse adamw clip', .gelu, .linear, MeanSquaredError(), Objective::mse(MeanSquaredError()), Adam($rate: 0.003, $weightDecay: 0.01), Update::adam(Adam($rate: 0.003, $weightDecay: 0.01)), 0.5, $regression, 64);
 check($gpu, 'mae sgd', .leakyRelu, .linear, MeanAbsoluteError(), Objective::mae(MeanAbsoluteError()), Sgd($rate: 0.05), Update::sgd(Sgd($rate: 0.05)), 0.0, $regression, 50);
 check($gpu, 'huber nesterov', .elu, .linear, Huber($delta: 0.3), Objective::huber(Huber($delta: 0.3)), Sgd($rate: 0.02, $momentum: 0.9, $nesterov: true), Update::sgd(Sgd($rate: 0.02, $momentum: 0.9, $nesterov: true)), 1.0, $regression, 37);
 check($gpu, 'bce adam', .swish, .sigmoid, BinaryCrossEntropy(), Objective::bce(BinaryCrossEntropy()), Adam(), Update::adam(Adam()), 0.0, $binary, 64);
 check($gpu, 'cross-entropy adam', .softplus, .linear, CrossEntropy($smoothing: 0.1), Objective::crossEntropy(CrossEntropy($smoothing: 0.1)), Adam(), Update::adam(Adam()), 0.0, $classes, 100);
 check($gpu, 'cross-entropy one row', .relu, .linear, CrossEntropy(), Objective::crossEntropy(CrossEntropy()), Adam(), Update::adam(Adam()), 0.0, $classes, 1);
-check($gpu, 'large inputs gelu', .gelu, .linear, MeanSquaredError(), Objective::mse(MeanSquaredError())), Adam(), Update::adam(Adam()), 0.0, $loud, 64);
-check($gpu, 'large inputs softplus', .softplus, .tanh, MeanSquaredError(), Objective::mse(MeanSquaredError())), Adam(), Update::adam(Adam()), 0.0, $loud, 64);
-check($gpu, 'sigmoid-hidden mse', .sigmoid, .tanh, MeanSquaredError(), Objective::mse(MeanSquaredError())), Adam(), Update::adam(Adam()), 0.0, $regression, 128);
+check($gpu, 'large inputs gelu', .gelu, .linear, MeanSquaredError(), Objective::mse(MeanSquaredError()), Adam(), Update::adam(Adam()), 0.0, $loud, 64);
+check($gpu, 'large inputs softplus', .softplus, .tanh, MeanSquaredError(), Objective::mse(MeanSquaredError()), Adam(), Update::adam(Adam()), 0.0, $loud, 64);
+check($gpu, 'sigmoid-hidden mse', .sigmoid, .tanh, MeanSquaredError(), Objective::mse(MeanSquaredError()), Adam(), Update::adam(Adam()), 0.0, $regression, 128);
 
 fits($gpu, $classes, Dataset(noise($rng, 40, 13, -1.0, 1.0), onehot($rng, 40, 5)));
 

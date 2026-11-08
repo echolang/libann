@@ -1,0 +1,28 @@
+use ann::{Act, Dense, LayerNorm, PerSlot, Pool, Residual, SelfAttention, Sequential};
+use ann::cuda::{width};
+
+test the_input_width_comes_from_the_first_layer
+{
+    $mlp = Sequential()->add(Dense(10, 4))->add(Act(.relu));
+    assert((width($mlp) ?? 0) == 10);
+
+    $tokens = Sequential()
+        ->add(PerSlot(5, Dense(3, 8)))
+        ->add(Residual(SelfAttention(5, 8, $heads: 2)))
+        ->add(Pool(5, .mean));
+    assert((width($tokens) ?? 0) == 15);
+
+    $norm = Sequential()->add(LayerNorm(6));
+    assert((width($norm) ?? 0) == 6);
+
+    $unknown = Sequential()->add(Act(.relu));
+    assert(width($unknown) == null);
+}
+
+test without_a_device_nothing_opens
+{
+    if (ann::cuda::available()) {
+        return;
+    }
+    assert(ann::cuda::Gpu::open()->failed());
+}

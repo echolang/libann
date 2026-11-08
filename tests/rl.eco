@@ -320,3 +320,72 @@ test ppo_learns_the_corridor
 
     assert(worstRight($policy, $env) > 0.9);
 }
+
+// a point on a line, pushed by the action; reward is closeness to zero
+internal function pointStep(float64 $x, float64 $a) : float64
+{
+    return std::math::clamp($x + 0.3 * $a, -1.0, 1.0);
+}
+
+internal function td3Net(usize $inputs, usize $outputs, bool $squash) : ann::Sequential
+{
+    ann::Sequential $s = ann::Sequential()
+        ->add(ann::Dense($inputs, 32, .he))
+        ->add(ann::Act(.relu))
+        ->add(ann::Dense(32, 32, .he))
+        ->add(ann::Act(.relu))
+        ->add(ann::Dense(32, $outputs));
+
+    if ($squash) {
+        $s->add(ann::Act(.tanh));
+    }
+
+    return $s;
+}
+
+#[group: "td3"]
+test td3_learns_to_push_a_point_home
+{
+    ann::rl::Td3 $td3 = ann::rl::Td3(
+        ann::Model(td3Net(1, 1, true), 1),
+        ann::Model(td3Net(2, 1, false), 2),
+        ann::Model(td3Net(2, 1, false), 3),
+        ann::Adam(0.001),
+        ann::Adam(0.001),
+        ann::Adam(0.001),
+        $gamma: 0.9
+    );
+    ann::rl::MoveReplay $replay = ann::rl::MoveReplay(20000);
+    ann::Random $rng = ann::Random(5);
+
+    for (usize $episode = 0; $episode < 150; $episode++) {
+        float64 $x = $rng->uniform(-1.0, 1.0);
+
+        for (usize $t = 0; $t < 20; $t++) {
+            array<usize> $shape = [1, 1];
+            ann::Tensor $state = ann::Tensor($shape, fill: $x);
+            ann::Tensor $a = $td3->explore($state, 0.3, $rng);
+            float64 $next = pointStep($x, $a->at(0, 0));
+            ann::rl::Outcome $o = .running;
+
+            if ($t == 19) {
+                $o = .truncated;
+            }
+
+            ann::Tensor $after = ann::Tensor($shape, fill: $next);
+            $replay->add(ann::rl::Move($state, $a, 0.0 - std::math::abs($next), $after, $o));
+            $x = $next;
+
+            if ($replay->count() >= 256) {
+                ann::rl::Report $r = $td3->update($replay->sample(64, $rng), $rng);
+            }
+        }
+    }
+
+    array<usize> $shape = [1, 1];
+    float64 $right = $td3->act(ann::Tensor($shape, fill: 0.8))->at(0, 0);
+    float64 $left = $td3->act(ann::Tensor($shape, fill: -0.8))->at(0, 0);
+    std::io::println("td3 point: action {$right:.2f} at 0.8, {$left:.2f} at -0.8");
+    assert($right < -0.3, 'push left from the right');
+    assert($left > 0.3, 'push right from the left');
+}
